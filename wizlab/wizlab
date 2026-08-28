@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""wizlab: the TE lab runtime. Owns every Wiz fact; content decides which fact means success.
+
+Exit codes are the contract (te-labkit-v2/PRD.md rock 1):
+  0 condition satisfied | 1 learner state not satisfied | 2 invocation error | 3 environment error
+
+In learner-facing check scripts, never let 2/3 reach the platform: an exit code outside the
+declared success/failure lists lands in a terminal validating_error state that bricks the
+session (probe-verified 2026-08-28). Wrap: `wizlab ... ; case $? in 0) exit 0;; *) exit 1;; esac`
+with the env-health check as its own leading `check` block. In CI, consume 2/3 directly.
+
+Queries and auth are mined from te-labkit/bricks/connector.py (proven on live leases), not invented.
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+
+AUTH_URL = "https://auth.app.wiz.io/oauth/token"
+
+FIND = """query FindConnector($ids: [String!]) {
+  connectors(filterBy: { cloudAccountExternalId: $ids }, first: 10) {
+    nodes {
+      id name enabled status
+      type { id }
+      config {
+        ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
+        ... on ConnectorConfigGCP { projectId: project_id }
+        ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
+      }
+    }
+    totalCount
+  }
+}"""
+
+CREATE = """mutation CreateConnector($input: CreateConnectorInput!) {
+  createConnector(input: $input) { connector { id name status } }
+}"""
+
+DELETE = """mutation DeleteConnector($input: DeleteConnectorInput!) {
+  deleteConnector(input: $input) { _stub }
+}"""
+
+
+def die(code, msg):
+    print(f"wizlab: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _claims(tok):
+    pad = tok.split(".")[1]
+    pad += "=" * (-len(pad) % 4)
+    import base64
+    return json.loads(base64.urlsafe_b64decode(pad))
+
+
+def _post(url, data, headers):
+    req = urllib.request.Request(url, data=data.encode() if isinstance(data, str) else json.dumps(data).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        die(3, f"HTTP {e.code} from {url}: {body}")
+    except Exception as e:
+        die(3, f"transport failure to {url}: {type(e).__name__}: {e}")
+
+
+def token_and_dc():
+    tenant = os.getenv("WIZ_TENANT", "TBCMP")
+    cid = os.getenv(f"WIZ_{tenant}_CLIENT_ID") or os.getenv("WIZ_CLIENT_ID")
+    sec = os.getenv(f"WIZ_{tenant}_CLIENT_SECRET") or os.getenv("WIZ_CLIENT_SECRET")
+    if not cid or not sec:
+        die(3, f"WIZ_{tenant}_CLIENT_ID / _CLIENT_SECRET not in environment")
+    payload = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "audience": "wiz-api",
+        "client_id": cid,
+        "client_secret": sec,
+    })
+    res = _post(AUTH_URL, payload, {"Content-Type": "application/x-www-form-urlencoded"})
+    tok = res.get("access_token")
+    if not tok:
+        die(3, f"no token returned: {res.get('message') or res}")
+    claims = _claims(tok)
+    return tok, claims["dc"], claims.get("tid")
+
+
+def api(query, variables):
+    tok, dc, tid = token_and_dc()
+    res = _post(
+        f"https://api.{dc}.app.wiz.io/graphql",
+        {"query": query, "variables": variables},
+        {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+    )
+    errors = res.get("errors") or []
+    data = res.get("data")
+    if errors and not any((data or {}).get(k) is not None for k in (data or {})):
+        die(3, "; ".join(e.get("message", "?") for e in errors))
+    return data or {}, tid
+
+
+def _targets(node, account_id):
+    cfg = node.get("config") or {}
+    if cfg.get("projectId") == account_id or cfg.get("subscriptionId") == account_id:
+        return True
+    arn = cfg.get("customerRoleARN") or ""
+    return f"::{account_id}:" in arn
+
+
+def find_connector(account_id):
+    data, _ = api(FIND, {"ids": [account_id]})
+    nodes = (data.get("connectors") or {}).get("nodes") or []
+    return [n for n in nodes if _targets(n, account_id)]
+
+
+def cmd_session_verify(args):
+    tok, dc, tid = token_and_dc()
+    data, _ = api("query { viewer { id } }", {})
+    print(f"ok: authenticated to dc={dc} tenant={tid}")
+    sys.exit(0)
+
+
+def cmd_connector_inspect(args):
+    account = _flag(args, "--account-id") or die(2, "connector inspect needs --account-id")
+    require = _flag(args, "--require") or "exists"
+    if require not in ("exists", "healthy"):
+        die(2, f"--require must be exists|healthy, got {require}")
+    matches = find_connector(account)
+    if not matches:
+        print(f"no connector targets {account}")
+        sys.exit(1)
+    node = matches[0]
+    print(f"connector {node['name']} ({node['id']}): enabled={node['enabled']} status={node['status']}")
+    if require == "exists":
+        sys.exit(0)
+    # healthy: v1 measured INITIAL_SCANNING -> ERROR(CONNECTION_ERROR) before the role exists.
+    # TODO(measure): confirm the post-role healthy enum on a live lease before pilot playtest.
+    sys.exit(0 if node["enabled"] and node["status"] not in ("ERROR",) else 1)
+
+
+def cmd_connector_ensure(args):
+    account = _flag(args, "--account-id") or die(2, "connector ensure needs --account-id")
+    role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/WizAccess-Role"
+    if find_connector(account):
+        print(f"a connector already targets {account}; nothing to create")
+        sys.exit(0)
+    # Naming lives HERE and nowhere else: <session-prefix>-<account>. The learner is told the
+    # same convention, so a portal-created connector and this one produce the same string.
+    name = f"{os.getenv('WIZLAB_SESSION_PREFIX', 'telab')}-{account}"
+    _, tid = api("query { viewer { id } }", {})
+    data, _ = api(CREATE, {"input": {
+        "name": name,
+        "type": "aws",
+        "enabled": True,
+        "extraConfig": {
+            "customerRoleARN": role_arn,
+            "skipOrganizationScan": True,
+            "diskAnalyzer": {"scanning": {"skip": True}},
+            "auditLogMonitorEnabled": False,
+        },
+    }})
+    c = ((data.get("createConnector") or {}).get("connector") or {})
+    if not c:
+        die(3, "createConnector returned no connector")
+    print(f"created connector {c['name']} ({c['id']}) status={c['status']}")
+    sys.exit(0)
+
+
+def cmd_connector_delete(args):
+    account = _flag(args, "--account-id") or die(2, "connector delete needs --account-id")
+    matches = find_connector(account)
+    if not matches:
+        print(f"no connector targets {account}; nothing to delete")
+        sys.exit(0)
+    for n in matches:
+        api(DELETE, {"input": {"id": n["id"]}})
+        print(f"deleted connector {n['name']} ({n['id']})")
+    sys.exit(0)
+
+
+def _flag(args, name):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+
+
+VERBS = {
+    ("session", "verify"): cmd_session_verify,
+    ("connector", "inspect"): cmd_connector_inspect,
+    ("connector", "ensure"): cmd_connector_ensure,
+    ("connector", "delete"): cmd_connector_delete,
+}
+
+
+def main():
+    if len(sys.argv) < 3 or (sys.argv[1], sys.argv[2]) not in VERBS:
+        die(2, f"usage: wizlab {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
+    VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
+
+
+if __name__ == "__main__":
+    main()

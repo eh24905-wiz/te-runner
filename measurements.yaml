@@ -1,0 +1,1229 @@
+# What Wiz sees, how long it takes, and what a check must compare against.
+#
+# This file exists so a track author stops counting seconds. Every figure below was measured on one
+# apply of the whole menu -- 73 AWS resources, one connector, three planes polled from a single
+# connector-created timestamp -- so the numbers are mutually consistent rather than gathered per track
+# and silently incomparable. The failure it replaces: a plan asserting "expect ~7 minutes" for a bucket
+# that arrives at 12.5, written the same night the 12.5 was measured.
+#
+# HOW TO USE IT. Find the kind a check asserts on, take `solver_budget_min` for the plane that check
+# queries, and use it. Do not re-derive from `graph_min`/`crv2_min` -- the margin is already in it, and
+# the reason for the margin is recorded beside it.
+#
+# WHAT IT IS NOT. Every number is n=1. It is a reference, not an SLA, and this repo's own note is that
+# successive runs here keep getting slower. `verify` on each section is the command that re-establishes
+# the figure; a fact nobody can re-check is a fact nobody can ever delete, which is how a sheet like
+# this fills with things that used to be true. When a verify run disagrees, change the number -- do not
+# annotate it, because `git log` holds what it said and a reader who finds two versions trusts neither.
+
+meta:
+  n: 1
+  clouds: [aws, gcp, azure]   # a cloud appears here only once its rows AND its plane timings exist
+  resources_measured:
+    aws: 73
+    gcp: 53
+    # azure is the connector-101 essentials only -- one VM plus the connector and discovery plane --
+    # not a kitchen-sink sweep. The Entra lock (bricks/azure/NOTES.md) blocks the identity-scanning
+    # legs that would surface IAM/policy kinds, so the id-shape catalogue aws/gcp have is not yet
+    # possible on azure. What is here was measured on one apply; see the azure `verify` below.
+    azure: 1
+  # Not a date. A date says a figure is old without saying whether it is wrong; the command says which.
+  verify: |
+    cd research/kitchen-sink && terraform apply
+    python3 -m labkit tf-apply --cloud aws --dir bricks/aws     # the Wiz identity
+    python3 bricks/connector.py --cloud aws create --account-id <acct>
+    # then poll both planes from the connector-created timestamp; see research/kitchen-sink/wiz-sweep.md
+
+# ---------------------------------------------------------------------------------------------------
+# The planes. Which one a check queries is worth more than any per-kind figure: the same resource is
+# ~5 minutes cheaper on the graph than on the inventory table.
+# ---------------------------------------------------------------------------------------------------
+planes:
+  aws:
+    graph_search:
+      first_entity_min: 5.8
+      plateau_min: 9.5
+      solver_budget_min: 16
+      # `firstSeen` is a field ON the entity here, never a key inside `properties` -- `properties.firstSeen`
+      # is null on every entity of every kind. Selecting only `properties` makes a populated field read as
+      # absent, which is the expensive direction: it looks like "not indexed yet" rather than a query bug.
+      time_field: firstSeen
+      filterable_on_time: false     # every `where` attempt on a time field returned an internal error
+      supports_include_deleted: false
+      reads_tags_back: false        # filters on tags correctly, but `properties.tags` is null
+    cloud_resources_v2:
+      # Two discrete waves with nothing between them, not a trickle. Which wave a kind lands in is per-kind
+      # below, and it is the difference between a 10-minute budget working and timing out.
+      wave_one_min: 7.5             # IAM, ECS/ECR, KMS, policies
+      wave_two_min: 12.5            # every VM, VPC, subnet, SG, bucket, RDS, Lambda, ALB, gateway
+      solver_budget_min: 20
+      time_fields: [firstSeen, createdAt, updatedAt]
+      filterable_on_time: true      # firstSeen: {after: <ts>} returned exactly one run's resources
+      supports_include_deleted: true    # and excludes deleted by default
+    configuration_findings:
+      # The fastest plane, and it beats the resource it describes onto the inventory table.
+      first_finding_min: 5.1
+      solver_budget_min: 12
+      scope_note: >
+        Scope nests under `resource`; there is no top-level cloudAccount filter. Needs the
+        read:cloud_configuration scope, which is distinct from read:resources.
+
+  gcp:
+    graph_search:
+      first_entity_min: 1.2
+      plateau_min: 17.4
+      solver_budget_min: 24
+      time_field: firstSeen
+      filterable_on_time: false
+      supports_include_deleted: false
+      reads_tags_back: true
+      project_scope_filter: reverse CONTAINS from SUBSCRIPTION; a top-level subscriptionId matches only the SUBSCRIPTION
+        entity and returns 1 node for a project holding 563
+    cloud_resources_v2:
+      wave_one_min: 8.8
+      wave_two_min: 15.2
+      wave_three_min: 21.9
+      solver_budget_min: 28
+      time_fields:
+      - firstSeen
+      - createdAt
+      - updatedAt
+      filterable_on_time: true
+      supports_include_deleted: true
+      project_scope_filter: cloudAccountV2.externalId.equals; misses ACCESS_ROLE entirely
+    configuration_findings:
+      first_finding_min: 3.2
+      first_queryable_min: 13.0
+      solver_budget_min: 20
+      scope_note: 'resource.subscriptionId rejects a GCP project id in every shape with an internal error, not an empty
+        page. resource.tag.containsAll and resource.cloudPlatform work. resource.externalId works and takes the
+        gs://<bucket> shape; the bare bucket name returns totalCount=0 rather than an error. Re-establish with
+        configurationFindings(filterBy: {resource: {externalId: {equals: ["gs://<bucket>"]}}}) against any indexed
+        GCS bucket.
+
+        '
+
+  # Azure: n=1, ONE kind (a Standard_D2as_v5 VM in centralus). Not the multi-kind sweep aws/gcp got,
+  # so there is no wave structure to record -- one entity cannot show waves. Measured from a single
+  # connector-created timestamp (16:50:05Z) on Azure lease yhdc2hteibde, Wiz TBCMP/us100.
+  azure:
+    connector_health:
+      # Connector left INITIAL_SCANNING and reached CONNECTED between +4.1m and +5.4m of create. The
+      # RBAC role assignment (WizCustomRole + Reader) MUST exist first, or it goes ERROR instead --
+      # so a challenge that grades "registered" must grade existence, not health (the --assert-exists
+      # split). CONNECTED is Azure's healthy status; --assert-ok passes it.
+      connected_min: 5.4
+    graph_search:
+      first_entity_min: 6.6       # the VM; connector virtualMachineCount went 0->1 by +7.2m
+      solver_budget_min: 16       # VM at ~7m + margin; matches the aws graph budget. n=1, slower over time.
+      # `firstSeen` is null ON the graph entity (as on aws/gcp); read the crv2 firstSeen for arrival.
+      time_field: firstSeen
+      external_id_case: >
+        graphSearch externalId {EQUALS} is CASE-SENSITIVE and stores the fully LOWERCASED ARM resource
+        path. The mixed-case path Terraform's azurerm_*.id emits does NOT match the graph leg -- emit
+        lower(azurerm_linux_virtual_machine.<x>.id) so the fast graph plane hits. cloudResourcesV2
+        equality IS case-insensitive, so the mixed-case path still matches there (the slower fallback).
+    cloud_resources_v2:
+      first_seen_min: 6.6         # crv2 firstSeen field = 16:56:39Z, +6.6m after create
+      solver_budget_min: 16
+      time_fields: [firstSeen]
+    verify: |
+      cd /tmp/az-measure && terraform apply   # vendor identity module (use_existing_service_principal
+                                              # =true + wiz_app_object_id) + one centralus VM
+      python3 bricks/connector.py --cloud azure create --account-id <sub> --tenant-id <arm-tenant>
+      # then poll status (CONNECTED) and `resource --external-id <lower(vm-arm-id)>` from create time
+
+# ---------------------------------------------------------------------------------------------------
+# Per entity kind. `external_id` is the column that decides whether an equality test can work at all:
+# it is NOT uniform, and a check that assumes one shape misses silently rather than erroring.
+#
+#   aws_id     -- i-…, vol-…, vpc-…, sg-…, rtb-…, igw-…, nat-…
+#   bare_name  -- the bucket name, the API id, the IP address itself
+#   arn        -- the full ARN
+#   composite  -- `##`-joined, e.g. <role-arn>##<policy-name>, <registry>##<repo>@sha256:…
+#
+# `instruqt_service` is what the dev track's `services:` list must contain for the resource to be creatable
+# AT ALL, and it is the FIRST thing to check: a timing is worthless if the resource cannot exist. Instruqt
+# implements that list as an org policy on the account, so an omission denies the API and the denial looks
+# identical to a hard organizational one. Every service named below is present in tracks/aws-dev/config.yml
+# today; `dev_lab_service_gaps` at the foot of this file records what is not, and which of the three kinds
+# of gap it is. A resource needs its OWNING service too, not only the one that models it -- a bucket
+# resource policy is an `iam` concept that cannot exist without `s3`.
+# ---------------------------------------------------------------------------------------------------
+entity_types:
+  - cloud: aws
+    wiz_type: VIRTUAL_MACHINE
+    native_type: virtualMachine
+    instruqt_service: [ec2]
+    resource: aws_instance
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: VOLUME
+    native_type: volume
+    instruqt_service: [ec2, ebs]
+    resource: aws_ebs_volume
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: SNAPSHOT
+    native_type: ec2#encryptedsnapshot
+    instruqt_service: [ec2, ebs]
+    resource: aws_ebs_snapshot
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: VIRTUAL_NETWORK
+    native_type: vpc
+    instruqt_service: [ec2]
+    resource: aws_vpc
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: SUBNET
+    native_type: subnet
+    instruqt_service: [ec2]
+    resource: aws_subnet
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: FIREWALL
+    native_type: securityGroup
+    instruqt_service: [ec2]
+    resource: aws_security_group
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: ROUTE_TABLE
+    native_type: routetable
+    instruqt_service: [ec2]
+    resource: aws_route_table
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: GATEWAY
+    native_type: internetGateway
+    instruqt_service: [ec2]
+    resource: aws_internet_gateway
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: GATEWAY
+    native_type: natGateway
+    instruqt_service: [ec2]
+    resource: aws_nat_gateway
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: aws_id
+  - cloud: aws
+    wiz_type: NETWORK_ADDRESS
+    native_type: elasticIP
+    instruqt_service: [ec2]
+    resource: aws_eip
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: bare_name        # the IP address itself
+  - cloud: aws
+    wiz_type: LOAD_BALANCER
+    native_type: loadBalancerv2/application
+    instruqt_service: [elasticloadbalancing]
+    resource: aws_lb
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: TARGET_GROUP
+    native_type: elasticloadbalancing#targetgroup
+    instruqt_service: [elasticloadbalancing]
+    resource: aws_lb_target_group
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: arn
+  - cloud: aws
+    wiz_type: DB_SERVER
+    native_type: rds/PostgreSQL/instance
+    instruqt_service: [rds]
+    resource: aws_db_instance
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: DATABASE
+    native_type: dynamoDB/table
+    instruqt_service: [dynamodb]
+    resource: aws_dynamodb_table
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: BUCKET
+    native_type: bucket
+    instruqt_service: [s3]
+    resource: aws_s3_bucket
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true             # the PROVIDER's clock: measured 12 min BEFORE the connector existed
+    external_id: bare_name
+  - cloud: aws
+    wiz_type: SERVERLESS
+    native_type: lambda
+    instruqt_service: [lambda]
+    resource: aws_lambda_function
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: arn
+  - cloud: aws
+    wiz_type: API_GATEWAY
+    native_type: apiGatewayv2
+    instruqt_service: [apigateway]
+    resource: aws_apigatewayv2_api
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: bare_name        # the API id, not the display name
+  - cloud: aws
+    wiz_type: MESSAGING_SERVICE
+    native_type: sqs
+    instruqt_service: [sqs]
+    resource: aws_sqs_queue
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: MESSAGING_SERVICE
+    native_type: sns
+    instruqt_service: [sns]
+    resource: aws_sns_topic
+    graph_min: 5.8
+    crv2_min: 12.5
+    first_seen: true
+    created_at: false
+    external_id: arn
+  - cloud: aws
+    wiz_type: ENCRYPTION_KEY
+    native_type: encryptionKey
+    instruqt_service: [kms]
+    resource: aws_kms_key
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+    # The only kind whose `status` reflects real state after deletion, because AWS itself holds the key
+    # in PendingDeletion for a 7-day minimum. Every other kind reads Active long after it is gone.
+  - cloud: aws
+    wiz_type: CLOUD_LOG_CONFIGURATION
+    native_type: logs#loggroup
+    instruqt_service: [logs]
+    resource: aws_cloudwatch_log_group
+    graph_min: 7.0
+    crv2_min: 12.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: SERVICE_ACCOUNT
+    native_type: role
+    instruqt_service: [iam]
+    resource: aws_iam_role
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: RAW_ACCESS_POLICY
+    native_type: customerManagedPolicy
+    instruqt_service: [iam]
+    resource: aws_iam_policy
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: RAW_ACCESS_POLICY
+    native_type: resourcePolicy
+    instruqt_service: [iam, s3, sns, kms, lambda]
+    resource: bucket / SNS / KMS / Lambda resource policy
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: composite        # CloudPlatform/Bucket##<bucket>##ResourcePolicy
+  - cloud: aws
+    wiz_type: RAW_ACCESS_POLICY
+    native_type: assumeRolePolicy
+    instruqt_service: [iam]
+    resource: role trust policy
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: composite        # <role-arn>##AssumeRole**
+  - cloud: aws
+    wiz_type: RAW_ACCESS_POLICY
+    native_type: inlinePolicy
+    instruqt_service: [iam]
+    resource: aws_iam_role_policy
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: composite        # <role-arn>##<policy-name>
+  - cloud: aws
+    wiz_type: CONTAINER_SERVICE
+    native_type: ecs
+    instruqt_service: [ecs]
+    resource: aws_ecs_cluster
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: arn
+  - cloud: aws
+    wiz_type: COMPUTE_INSTANCE_GROUP
+    native_type: ecs#service
+    instruqt_service: [ecs]
+    resource: aws_ecs_service
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: SERVICE_CONFIGURATION
+    native_type: taskDefinition
+    instruqt_service: [ecs]
+    resource: aws_ecs_task_definition
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: arn              # carries the :1 revision suffix
+  - cloud: aws
+    wiz_type: CONTAINER_GROUP
+    native_type: task
+    instruqt_service: [ecs]
+    resource: running ECS/Fargate task
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: arn
+  - cloud: aws
+    wiz_type: CONTAINER
+    native_type: ecs#containerinstance
+    instruqt_service: [ecs]
+    resource: Fargate container
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: arn
+  - cloud: aws
+    wiz_type: CONTAINER_IMAGE
+    native_type: image
+    instruqt_service: [ecr]
+    resource: ECR image
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: false
+    external_id: composite        # <registry>##<repo>@sha256:…
+  - cloud: aws
+    wiz_type: CONTAINER_REPOSITORY
+    native_type: repository
+    instruqt_service: [ecr]
+    resource: aws_ecr_repository
+    graph_min: 5.8
+    crv2_min: 7.5
+    first_seen: true
+    created_at: true
+    external_id: composite        # <registry>##<repo-name>
+  - cloud: aws
+    wiz_type: SUBSCRIPTION
+    native_type: account
+    instruqt_service: [sts]
+    resource: the AWS account itself
+    graph_min: null               # never returned by graphSearch
+    crv2_min: 3.8
+    first_seen: true
+    created_at: false
+    external_id: aws_account_id
+
+  # ---- GCP. Eleven id shapes against AWS's five, and eight rows the connector surfaces about a
+  # project rather than anything a track creates -- marked `created_by_track: false`, because an
+  # arrival time for something you cannot create is background, not a wait budget.
+  - cloud: gcp
+    wiz_type: VIRTUAL_MACHINE
+    native_type: compute#instance
+    resource: google_compute_instance
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 3.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: partial
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: VOLUME
+    native_type: compute#disk
+    resource: google_compute_disk
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 4.0
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: SNAPSHOT
+    native_type: compute#snapshot
+    resource: google_compute_snapshot
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 8.3
+    crv2_min: 15.2
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: VIRTUAL_NETWORK
+    native_type: compute#network
+    resource: google_compute_network
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 8.3
+    crv2_min: 15.2
+    first_seen: true
+    created_at: true
+    external_id: self_link
+  - cloud: gcp
+    wiz_type: SUBNET
+    native_type: compute#subnetwork
+    resource: google_compute_subnetwork
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: true
+    external_id: self_link
+  - cloud: gcp
+    wiz_type: FIREWALL
+    native_type: compute#firewall
+    resource: google_compute_firewall
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 3.2
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: GATEWAY
+    native_type: compute#router
+    resource: google_compute_router
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 4.0
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: GATEWAY
+    native_type: compute#natGateway
+    resource: google_compute_router_nat
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 4.0
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: composite_us
+  - cloud: gcp
+    wiz_type: GATEWAY
+    native_type: compute#route
+    resource: implicit default route
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 8.3
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: composite_us
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: NETWORK_ADDRESS
+    native_type: compute#address
+    resource: google_compute_address
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 3.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: LOAD_BALANCER
+    native_type: compute#forwardingRule
+    resource: google_compute_global_forwarding_rule
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 4.7
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: LOAD_BALANCER
+    native_type: compute#backendService
+    resource: google_compute_backend_service
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 4.7
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: COMPUTE_INSTANCE_GROUP
+    native_type: compute#unmanagedInstanceGroup
+    resource: google_compute_instance_group
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: true
+    external_id: numeric_id
+  - cloud: gcp
+    wiz_type: BUCKET
+    native_type: storage#bucket
+    resource: google_storage_bucket
+    instruqt_service:
+    - storage.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: true
+    external_id: gs_uri
+  - cloud: gcp
+    wiz_type: BUCKET
+    native_type: logging#bucket
+    resource: project log bucket
+    instruqt_service:
+    - logging.googleapis.com
+    graph_min: 8.3
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: CLOUD_LOG_CONFIGURATION
+    native_type: logging#sink
+    resource: google_logging_project_sink
+    instruqt_service:
+    - logging.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: partial
+    external_id: composite_us
+  - cloud: gcp
+    wiz_type: MESSAGING_SERVICE
+    native_type: pubsub#topic
+    resource: google_pubsub_topic
+    instruqt_service:
+    - pubsub.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: MESSAGING_SERVICE
+    native_type: pubsub#subscription
+    resource: google_pubsub_subscription
+    instruqt_service:
+    - pubsub.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: ENCRYPTION_KEY
+    native_type: kms#instance
+    resource: google_kms_crypto_key
+    instruqt_service:
+    - cloudkms.googleapis.com
+    graph_min: 3.7
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: SECRET_CONTAINER
+    native_type: keyring#instance
+    resource: google_kms_key_ring
+    instruqt_service:
+    - cloudkms.googleapis.com
+    graph_min: 3.7
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: SERVICE_ACCOUNT
+    native_type: serviceaccount#instance
+    resource: google_service_account
+    instruqt_service:
+    - iam.googleapis.com
+    graph_min: 2.6
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: email
+  - cloud: gcp
+    wiz_type: SERVICE_ACCOUNT
+    native_type: serviceaccount#serviceAgent
+    resource: Google-managed service agent
+    instruqt_service:
+    - iam.googleapis.com
+    graph_min: 3.0
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: email
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: ACCESS_KEY
+    native_type: credentials#serviceAccountKey
+    resource: the LEASE's own SA keys
+    instruqt_service:
+    - iam.googleapis.com
+    graph_min: 3.0
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: relative_path
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: ACCESS_ROLE
+    native_type: AccessRole
+    resource: google_project_iam_custom_role
+    instruqt_service:
+    - iam.googleapis.com
+    graph_min: 8.2
+    crv2_min: 8.2
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: GROUP
+    native_type: group#legacy
+    resource: project legacy groups
+    instruqt_service:
+    - iam.googleapis.com
+    graph_min: 4.7
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: bare_name
+    created_by_track: false
+  # The three registry-plane rows below are the ONE part of this sheet whose figures do not describe a
+  # track's own registry. They were measured on a registry that existed before the connector; a registry
+  # created with the scenario, or an image pushed after the connector was healthy, behaves differently
+  # and is recorded per-row. Two leases: the project's incidental `gcf-artifacts` registry (a by-product
+  # of a 1st-gen Cloud Function) indexed within minutes, while the track's own registry lagged far
+  # behind it and its IMAGES did not arrive at all inside a working session. Anything asserting on this
+  # plane must therefore name the registry it means -- an unnamed type query passes on `gcf-artifacts`.
+  - cloud: gcp
+    wiz_type: CONTAINER_REGISTRY
+    native_type: artifactregistry#repository
+    resource: google_artifact_registry_repository
+    instruqt_service:
+    - artifactregistry.googleapis.com
+    graph_min: 1.2
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: registry_path
+    # 1.2 min is the incidental registry. The track's own registry was absent at 11 min after the
+    # connector reached CONNECTED and present at 26 min, on one lease; on another it was present by
+    # name but held no images.
+    track_registry_graph_min: 26
+  - cloud: gcp
+    wiz_type: CONTAINER_REPOSITORY
+    native_type: artifactregistry#gar-repository
+    resource: the image's repository path
+    instruqt_service:
+    - artifactregistry.googleapis.com
+    graph_min: 4.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: composite_hash
+    # Still absent at 26 min after CONNECTED on the lease that had an image in the registry the whole
+    # time, so 4.5 does not describe a track's own repository.
+    track_repository_graph_min: null
+  - cloud: gcp
+    wiz_type: CONTAINER_IMAGE
+    native_type: artifactregistry#dockerimage
+    resource: the seeded image
+    instruqt_service:
+    - artifactregistry.googleapis.com
+    graph_min: 4.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: composite_hash
+    # NOT REACHED on either of two leases: absent 20+ min after the push on one and 26 min after
+    # CONNECTED on another, with the connector healthy, VMs and the GKE cluster already on the graph,
+    # and an image sitting in the registry since boot. It advances without a rescan, so it is a slow
+    # staged plane rather than a blocked one -- but nothing measured supports a figure a check can wait
+    # on, which is why challenge 2 of gcp-wizcraft-bootcamp-201 does not grade it.
+    track_image_graph_min: null
+
+  # DSPM, measured from a `rescan --data-scan` on a bucket whose classifier was created minutes earlier.
+  # TWO clocks, and conflating them is why a guide first told learners to wait 13 minutes for something
+  # that takes 16: the data finding lands on dataFindingsV2 first, and the HAS_DATA_FINDING edge reaches
+  # the Security Graph about three minutes after that. A query run between the two returns nothing, which
+  # reads to a learner as a query they built wrong.
+  - cloud: gcp
+    wiz_type: DATA_FINDING
+    native_type: dspm#data-finding
+    resource: an object matching a learner-created content classifier
+    instruqt_service:
+    - storage.googleapis.com
+    # graph_min is the HAS_DATA_FINDING edge becoming visible via graphSearch, which is what a
+    # toxic-combination check queries. The finding itself lands on dataFindingsV2 EARLIER, at 12.8
+    # (12m49s and 12m50s on two leases) -- budget against graph_min, because a query run between the two
+    # returns an empty page.
+    graph_min: 15.6
+    first_seen: false
+    created_at: false
+    external_id: composite          # classifier id + the bucket's bare graphEntity name
+  - cloud: gcp
+    wiz_type: CONTAINER_SERVICE
+    native_type: CloudRunService
+    resource: google_cloud_run_v2_service
+    instruqt_service:
+    - run.googleapis.com
+    graph_min: 4.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: SERVERLESS
+    native_type: run#revision
+    resource: Cloud Run revision
+    instruqt_service:
+    - run.googleapis.com
+    graph_min: 4.5
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: SERVERLESS
+    native_type: cloudfunctions#function
+    resource: google_cloudfunctions_function
+    instruqt_service:
+    - cloudfunctions.googleapis.com
+    graph_min: 8.2
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: relative_path
+  - cloud: gcp
+    wiz_type: CONTAINER
+    native_type: hostedContainer
+    resource: containers inside the image
+    instruqt_service:
+    - artifactregistry.googleapis.com
+    graph_min: 15.2
+    crv2_min: 21.9
+    first_seen: true
+    created_at: true
+    external_id: bare_sha256
+  - cloud: gcp
+    wiz_type: SERVICE_USAGE_TECHNOLOGY
+    native_type: 12 native types
+    resource: per-service usage records
+    instruqt_service:
+    - serviceusage.googleapis.com
+    graph_min: 8.3
+    crv2_min: 15.2
+    first_seen: true
+    created_at: false
+    external_id: composite_hash
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: REGION
+    native_type: compute#region
+    resource: every GCP region
+    instruqt_service:
+    - compute.googleapis.com
+    graph_min: 3.2
+    crv2_min: 8.8
+    first_seen: true
+    created_at: false
+    external_id: bare_name
+    created_by_track: false
+  - cloud: gcp
+    wiz_type: SUBSCRIPTION
+    native_type: project#instance
+    resource: the project itself
+    instruqt_service:
+    - cloudresourcemanager.googleapis.com
+    graph_min: 3.2
+    crv2_min: 8.8
+    first_seen: true
+    created_at: true
+    external_id: gcp_project_id
+    created_by_track: false
+
+  # ---- Azure. One kind measured (connector-101 essentials). The Entra lock blocks the identity
+  # scanning that would surface IAM/policy kinds, so this is not a multi-kind catalogue.
+  - cloud: azure
+    wiz_type: VIRTUAL_MACHINE
+    native_type: Microsoft.Compute/virtualMachines
+    resource: azurerm_linux_virtual_machine
+    instruqt_service: [Microsoft.Compute, Microsoft.Network]
+    graph_min: 6.6
+    crv2_min: 6.6
+    first_seen: true       # crv2 firstSeen populated (+6.6m); the GRAPH entity's firstSeen is null
+    created_at: true       # graph creationDate = the provider's ARM create clock, NOT when Wiz saw it
+    # The LOWERCASED ARM resource path, e.g.
+    #   /subscriptions/<sub>/resourcegroups/<rg>/providers/microsoft.compute/virtualmachines/<vm>
+    # NOT the VM GUID -- that is `providerUniqueId`, which is NOT FOUND as an externalId. The graph
+    # leg's equality is case-sensitive to this lowercased form; emit lower(azurerm_*.id). See
+    # planes.azure.graph_search.external_id_case.
+    external_id: azure_resource_path
+
+# ---------------------------------------------------------------------------------------------------
+# Wiz's own inferences. `cloudResourcesV2` NEVER returns these, so a check that queries the inventory
+# table for one waits out its budget against a plane that will never answer.
+# ---------------------------------------------------------------------------------------------------
+graph_only:
+  - {cloud: aws, wiz_type: CONFIGURATION_FINDING, graph_min: 5.8, note: also queryable as configurationFindings}
+  - {cloud: aws, wiz_type: POLICY_STATEMENT, graph_min: 5.8}
+  - {cloud: aws, wiz_type: NETWORK_INTERFACE, graph_min: 7.0}
+  - {cloud: aws, wiz_type: HOSTED_TECHNOLOGY, graph_min: 8.3, note: technologies detected on a container image}
+  - {cloud: aws, wiz_type: ENDPOINT, graph_min: 9.5, note: the listener URL; slowest kind measured}
+  - {cloud: aws, wiz_type: EXCESSIVE_ACCESS_FINDING, graph_min: 5.8}
+  - cloud: gcp
+    wiz_type: CONFIGURATION_FINDING
+    graph_min: 3.0
+    note: also queryable as configurationFindings, ~10 min later
+  - cloud: gcp
+    wiz_type: ACCESS_ROLE_BINDING
+    graph_min: 4.7
+    note: 'every IAM binding; <role>##<project>##<sha256>, sometimes ##resourceLevel'
+  - cloud: gcp
+    wiz_type: HOSTED_TECHNOLOGY
+    graph_min: 11.1
+  - cloud: gcp
+    wiz_type: HOST_CONFIGURATION_FINDING
+    graph_min: 13.9
+    note: present WITHOUT a sensor, unlike the AWS run
+
+# ---------------------------------------------------------------------------------------------------
+# What a cloud connector never surfaced. An absence is as load-bearing as an arrival time: it tells an
+# author not to design a challenge around it, which is the cheapest possible moment to learn it.
+# ---------------------------------------------------------------------------------------------------
+absent:
+  aws:
+    kubernetes:
+      surfaced: false
+      note: >
+        Zero KUBERNETES_* entities of any kind for a live k3s cluster running a workload. The host is an
+        ordinary VIRTUAL_MACHINE; isContainerHost is false and typeFields.kubernetesCluster is null,
+        identical to a cluster-less neighbour. Grading anything about a cluster needs the Sensor or a
+        Kubernetes connector, which a cloud connector does not deploy. That is a tier decision.
+    iam_instance_profile:
+      surfaced: false
+      note: Wiz models the role, not the wrapper. No entity corresponds to aws_iam_instance_profile.
+    vulnerability_findings:
+      surfaced: false
+      note: >
+        Needs disk scanning or the Sensor, not a connector alone. ECR BASIC scanning found zero
+        vulnerabilities on a stock image. Enhanced scanning was unavailable, but NOT permanently: see
+        dev_lab_service_gaps below.
+
+  gcp:
+    kubernetes:
+      surfaced: false
+      note: 'Zero KUBERNETES_* entities for a live k3s cluster running a two-replica nginx Deployment on the node''s port 80.
+        isContainerHost false, kubernetesCluster null. Identical to the AWS result, so this is the cloud connector''s reach
+        and not either cloud''s.
+
+        '
+    vulnerability_findings:
+      surfaced: false
+      note: >
+        needs disk scanning or the Sensor; 55 HOSTED_TECHNOLOGY on the image and no CVEs. TRUE FOR A
+        CONNECTOR-ONLY LAB ONLY: with a VCS connector on a repo, CVEs surface in ~15 min -- see
+        findings.gcp.vulnerability_findings.
+    data_findings:
+      surfaced: false
+      note: >
+        DSPM is its own integration even with data_scanning true on the module. TRUE FOR A
+        CONNECTOR-ONLY LAB ONLY: with the data_scanning role bound and a custom classifier they do
+        surface -- see findings.gcp.data_findings.
+    excessive_access_finding:
+      surfaced: false
+      note: 'DIFFERS FROM AWS, which raised one within 5.8 min for an equivalent over-broad role. roles/editor on a service
+        account produced an ACCESS_ROLE_BINDING and no excessive-access finding in 44 minutes.
+
+        '
+    policy_statement:
+      surfaced: false
+      note: DIFFERS FROM AWS (14 there). GCP IAM has no statement objects; the binding is the unit.
+    endpoint:
+      surfaced: false
+      note: DIFFERS FROM AWS. Neither the LB's :80 nor the Cloud Run HTTPS URL became an ENDPOINT.
+    load_balancer_parts:
+      surfaced: false
+      note: 'url_map, target_http_proxy, health_check and global_address are not modelled as resources at all. A load balancer
+        is its forwarding rule and backend service and nothing else.
+
+        '
+
+# ---------------------------------------------------------------------------------------------------
+# Deletion. The reason every resource assertion scopes to an id rather than to an account.
+# ---------------------------------------------------------------------------------------------------
+lifecycle:
+  aws:
+    status_reflects_reality: false
+    note: >
+      `status` reads Active on entities that no longer exist in the cloud, including entities that
+      already carry a deletedAt. Never grade liveness on it.
+    active_after_destroy_min_hours: 37       # lower bound, ground-truthed against AWS; not an SLA
+    observed_unchanged_after_destroy_min: 82  # 33 observations, nothing moved; stopped, not concluded
+    deleted_at_lag: days                     # a daily pass, clustering ~11:57-11:59 UTC
+    deleted_at_trustworthy: true
+    ingestion_can_create_dead_entities: true
+    ingestion_note: >
+      A NAT gateway deleted at 02:49Z was FIRST SEEN by Wiz 26 minutes AFTER its deletion, because the
+      cloud API still described it. So a fresh firstSeen is not evidence the resource exists.
+    cleanup_challenge_gradable: false
+    verify: |
+      destroy the root, then poll both planes for the same externalIds and watch status / deletedAt
+
+  gcp:
+    # NOT MEASURED. The decay watch was skipped on GCP to save lease time, so nothing here is inherited
+    # from AWS: an absent section would read as "the AWS figures apply", and they are the one thing a
+    # reader would most want and least be entitled to assume.
+    measured: false
+    verify: |
+      destroy the root, then poll both planes for the same externalIds and watch status / deletedAt
+    note: >
+      AWS held destroyed resources Active for ~37 hours with deletedAt null. Whether GCP behaves the same
+      is unknown. Until it is measured, scope a GCP resource assertion to an externalId and do not grade
+      liveness on status on either cloud.
+
+# ---------------------------------------------------------------------------------------------------
+# Tag filtering. The only lease-scoping mechanism that works at all, since AWS-side enumeration is
+# impossible on these leases: tag:GetResources is SCP-denied.
+# ---------------------------------------------------------------------------------------------------
+tag_filtering:
+  aws:
+    cloud_resources_v2: filterBy.tag.containsAll
+    graph_search: where.tags.TAG_CONTAINS_ALL     # requires type: ["ANY"]; an empty type list is rejected
+    configuration_findings: resource.tag.containsAll   # undocumented but honoured
+    caveats:
+      - "Reaches only TAGGED resources -- 51 of 171 entities. Findings, policies, ENIs, the running task
+         and the ECR image carry no tags and cannot be found this way."
+      - "Lease-scoped, not generation-scoped: a predecessor apply on a recycled account lands in the same
+         result set. Scope to an externalId when the question is about THIS run."
+      - "filterBy.tag is not filterBy.project.tag."
+      - "Verify any tag filter with a negative control. A filter that is silently ignored returns
+         everything, which looks exactly like success."
+
+  gcp:
+    cloud_resources_v2: filterBy.tag.containsAll
+    graph_search: where.tags.TAG_CONTAINS_ALL
+    configuration_findings: resource.tag.containsAll
+    key_casing: lowercase only; GCP rejects an uppercase label key or value, so the AWS LabKitSweep marker is not portable
+    reach: 17 of 53 declared resources
+    caveats:
+    - Reaches only LABELLABLE resources -- 32% here against AWS's 70%. The whole network layer (network, subnets, firewalls,
+      router, NAT), the whole IAM layer (service accounts, custom role, 45 bindings), most of the load balancer, the KMS key
+      ring, the log sink, the container image and every derived entity accept no label at all.
+    - 'Lease-scoped, not generation-scoped, and it bit visibly: three ENCRYPTION_KEY entities came back, one per apply, because
+      a KMS key ring cannot be deleted.'
+    - 'Verify with a negative control AND confirm the returned nodes carry the label. Both were done here: bogus value -> 0
+      on all three planes in all 18 rounds, and 17 of 17 nodes carried it.'
+    note: GCP calls these labels, not tags. The filter keys are identical to AWS; the value is lowercase-only.
+
+# ---------------------------------------------------------------------------------------------------
+# Findings that a connector alone does raise, for the one case measured.
+# ---------------------------------------------------------------------------------------------------
+findings:
+  aws:
+    public_bucket:
+      first_finding_min: 6.0
+      high_fails: 7                # against 0 on an otherwise identical private bucket
+      discriminator: >
+        Compare HIGH-severity FAIL count, not the raw finding count. Raw counts were 48 public vs 41
+        private -- a difference too small to grade on, while 7 vs 0 is unambiguous.
+
+  gcp:
+    public_bucket:
+      first_finding_min: 3.2
+      first_queryable_min: 13.0
+      high_fails: 1
+      rule: StorageBucket-007
+      discriminator: 'Name StorageBucket-007 explicitly. There is exactly ONE HIGH FAIL here against AWS''s seven, so "at least
+        one HIGH FAIL" is true but rests on a single finding.
+
+        '
+    other_high_fails:
+    - resource: compute instance
+      rule: Compute-010
+      name: should not have a public IP address
+    - resource: compute instance
+      rule: Compute-013
+      name: Shielded VM should be fully enabled
+    - resource: cloud function
+      rule: Serverless-018
+      name: should not be publicly accessible
+    cloud_run_no_high:
+      note: An identical allUsers invoker binding on Cloud Run raised NO HIGH -- four MEDIUM/LOW only. So a public-serverless-endpoint
+        challenge is gradeable at HIGH on a Cloud Function and is not on Cloud Run.
+    vulnerability_findings:
+      solver_budget_min: 25
+      note: >
+        Three planes at very different speeds, measured on gcp-wizcraft-bootcamp-201. FASTEST is code: a
+        VCS connector on the repo raised CVE-2025-55182 with firstDetectedAt ~15 min after the baseline
+        push, so a solver CAN grade this -- budget 25 min. That asset is a REPOSITORY_BRANCH and carries
+        NO cloud-subscription scope, so a vulnerabilityFindings filter on subscriptionExternalId never
+        returns it; filter by CVE and match the repo name. SLOW planes, do not budget for them: a GKE
+        node disk scan produced 357 findings but no CVE for a container deployed after the snapshot, and
+        the app's own CONTAINER_IMAGE was a graph node with ZERO findings after 9h (registry scanning is
+        a console-only tenant setting, weekly by default).
+        Re-establish: labkit check-vuln-finding --cve <cve> --project <p> --repo <owner/repo>
+    data_findings:
+      solver_budget_min: null       # null = NOT solver-gradeable; this plane is multi-day
+      bound_max_min: 520
+      note: >
+        Surfaces with the vendor module's data_scanning role bound and a custom classifier. An on-demand
+        data scan requested 03:18:24Z was observed as a finding by 11:58Z: <=8h40m, an upper BOUND and
+        not a delta (n=1). It cannot be narrowed from the API -- DataFinding exposes no timestamp field
+        at all, no firstSeen/createdAt/detectedAt -- so tightening it means polling. A challenge that
+        grades this cannot pass inside a lease window. On-demand scans are rate limited to one per 10 min
+        per connector and an inventory rescan resets that clock, so request the data scan last and alone.
+        Re-establish: connector.py rescan --account-id <p> --data-scan, then poll
+        labkit check-data-finding --bucket <b>
+
+# ---------------------------------------------------------------------------------------------------
+# A denial on a dev lease is usually a gap in the dev track's own allow-list, not a fact about the cloud.
+#
+# Instruqt implements the sandbox's allowed-services list AS an org policy on the account, so the error for
+# a service nobody added is indistinguishable from a hard organizational denial. Three things were recorded
+# as impossible on that evidence and are one line in `tracks/<cloud>-dev/config.yml` plus a fresh lease.
+# Check the list before concluding anything is unavailable, and classify a denial as one of: absent from the
+# services list, a cloud API not enabled in the project, or a genuine org policy constraint named by id.
+# ---------------------------------------------------------------------------------------------------
+dev_lab_service_gaps:
+  # Three causes, three very different remedies. Classifying a denial wrongly either kills a workable
+  # track or promises a fix that takes a month.
+  #
+  #   config_gap    -- in Instruqt's allowed list, absent from OUR dev track. One line plus a fresh lease.
+  #   platform_gap  -- not in Instruqt's allowed list at all. A support request; the docs say the
+  #                    feasibility and security review "can take up to a month".
+  #   org_policy    -- a constraint beyond either, named by id.
+  #
+  # The allowed list is published at
+  # docs.instruqt.com/sandboxes/manage/cloud-services-and-regions/allowed-services-and-regions
+  # and it is the thing to check FIRST, because Instruqt implements the per-track list as an org policy on
+  # the account: the error for a service nobody added is indistinguishable from a hard denial. Names are
+  # lowercase IAM service prefixes on AWS, full API hostnames on GCP, resource-provider namespaces on Azure.
+  # A misspelling is silently denied rather than rejected -- see TODO 12 -- so copy the name, do not type it.
+  aws:
+    config: tracks/aws-dev/config.yml -> aws_accounts[0]
+    config_gap:
+      - field: regions
+        current: [us-east-1]
+        note: >
+          The platform allows 29 AWS regions including us-east-2 and us-west-1/2. So "EC2 is denied outside
+          us-east-1" is our own single-region declaration, not a platform limit -- a one-line add.
+    platform_gap:
+      - service: secretsmanager
+        blocks: >
+          RDS `manage_master_user_password`, the only way to stand up a database with no password in
+          Terraform state. The measured fallback was `random_password` in state.
+      - service: tag / resource-groups / resource-explorer-2
+        blocks: >
+          `tag:GetResources`, and with it any AWS-side enumeration of a sweep by tag. Wiz-side tag
+          filtering works on all three planes and is the available substitute.
+      - service: inspector2
+        blocks: ECR enhanced scanning, and with it a vulnerability track built on registry scanning.
+  gcp:
+    config: tracks/gcp-dev/config.yml -> gcp_projects[0]
+    config_gap:
+      - service: servicenetworking.googleapis.com
+        unblocks: private service access, and so a private IP for Cloud SQL.
+      - service: firestore.googleapis.com
+        unblocks: Firestore.
+      - service: certificatemanager.googleapis.com
+        unblocks: managed certificates, and so HTTPS on a load balancer.
+    platform_gap:
+      - service: apigateway.googleapis.com
+        blocks: >
+          API Gateway. A Cloud Run URL serves as an HTTP endpoint without it. Note apigee and apihub ARE
+          allowed and are different products.
+    note: >
+      secretmanager.googleapis.com is enabled here while AWS's secretsmanager is not allowed at all, so the
+      credential-in-state problem that blocked RDS should not exist for Cloud SQL. The same problem is
+      solvable on one cloud and not the other, and the asymmetry is the platform's allow-list rather than
+      anything about the clouds.
