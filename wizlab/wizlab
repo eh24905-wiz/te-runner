@@ -34,6 +34,21 @@ FIND = """query FindConnector($ids: [String!]) {
   }
 }"""
 
+BY_TYPE = """query ConnectorsByType($t: [String!]) {
+  connectors(filterBy: { connectorType: $t }, first: 100) {
+    nodes {
+      id name enabled status
+      type { id }
+      config {
+        ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
+        ... on ConnectorConfigGCP { projectId: project_id }
+        ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
+      }
+    }
+    totalCount
+  }
+}"""
+
 CREATE = """mutation CreateConnector($input: CreateConnectorInput!) {
   createConnector(input: $input) { connector { id name status } }
 }"""
@@ -106,13 +121,35 @@ def _targets(node, account_id):
     if cfg.get("projectId") == account_id or cfg.get("subscriptionId") == account_id:
         return True
     arn = cfg.get("customerRoleARN") or ""
-    return f"::{account_id}:" in arn
+    return f":{account_id}:" in arn
 
 
-def find_connector(account_id):
+def _parents(nodes, cloud):
+    """Cloud connectors, not the child deployments Wiz auto-spawns (e.g. `ECR in <acct>`,
+    type.id=ecr) nor the builtin self-hosted pseudo-connector. Confirmed against TBCMP via
+    the GUI deployments query: our connector is type.id=aws, its child ECR is type.id=ecr."""
+    return [n for n in nodes if (n.get("type") or {}).get("id") == cloud]
+
+
+def find_connector(account_id, cloud="aws"):
+    """Connectors whose OWN config targets the account, active-first.
+
+    Two lookups (ported from te-labkit connector.py:97, live-measured). cloudAccountExternalId
+    filters on the account LINK, which Wiz creates 1-2 min AFTER the connector, so a check run
+    right after create/onboarding won't match yet. The BY_TYPE fallback matches on the connector's
+    own customerRoleARN and doesn't depend on the link. Gate it on finding no PARENT, never on no
+    nodes: Wiz attaches a builtin pseudo-connector to every account, so "no nodes" never occurs and
+    would silently retire the fallback — the exact bug that made delete miss a 3s-old connector.
+    Known gap: BY_TYPE caps at first:100, so in a tenant with >100 aws connectors a brand-new one
+    could be missed during the pre-link window; acceptable until measured to bite (v1 shipped 100)."""
     data, _ = api(FIND, {"ids": [account_id]})
-    nodes = (data.get("connectors") or {}).get("nodes") or []
-    return [n for n in nodes if _targets(n, account_id)]
+    parents = _parents(((data.get("connectors") or {}).get("nodes")) or [], cloud)
+    if not parents:
+        data, _ = api(BY_TYPE, {"t": [cloud]})
+        nodes = [n for n in (((data.get("connectors") or {}).get("nodes")) or []) if _targets(n, account_id)]
+        parents = _parents(nodes, cloud)
+    # An active connector outweighs a stale ERROR one left on a recycled account.
+    return sorted(parents, key=lambda n: not (n.get("enabled") and n.get("status") != "ERROR"))
 
 
 def cmd_session_verify(args):
