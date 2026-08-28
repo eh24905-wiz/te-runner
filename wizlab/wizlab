@@ -117,7 +117,9 @@ def find_connector(account_id):
 
 def cmd_session_verify(args):
     tok, dc, tid = token_and_dc()
-    data, _ = api("query { viewer { id } }", {})
+    # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is proven
+    # (FIND uses it). This confirms the token is accepted by the API, not just minted by auth.
+    api("query { connectors(first: 1) { totalCount } }", {})
     print(f"ok: authenticated to dc={dc} tenant={tid}")
     sys.exit(0)
 
@@ -149,17 +151,14 @@ def cmd_connector_ensure(args):
     # Naming lives HERE and nowhere else: <session-prefix>-<account>. The learner is told the
     # same convention, so a portal-created connector and this one produce the same string.
     name = f"{os.getenv('WIZLAB_SESSION_PREFIX', 'telab')}-{account}"
-    _, tid = api("query { viewer { id } }", {})
+    # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
+    # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
+    # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
     data, _ = api(CREATE, {"input": {
         "name": name,
         "type": "aws",
-        "enabled": True,
-        "extraConfig": {
-            "customerRoleARN": role_arn,
-            "skipOrganizationScan": True,
-            "diskAnalyzer": {"scanning": {"skip": True}},
-            "auditLogMonitorEnabled": False,
-        },
+        "authParams": {"customerRoleARN": role_arn},
+        "extraConfig": {"skipOrganizationScan": True},
     }})
     c = ((data.get("createConnector") or {}).get("connector") or {})
     if not c:
