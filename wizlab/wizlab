@@ -500,19 +500,20 @@ def _publish_user(email, pwd):
     # Instruqt 2.0 replaces 1.0 agent vars: an `exec` resource writes KEY=value to $EXEC_OUTPUT,
     # read as resource.exec.<name>.output.<KEY> and rendered into a `note` via Handlebars. When not
     # under exec (grader manual run / acceptance), print so a human can use the creds.
-    url = _wiz_login_url()
+    # Emit every key unconditionally: a note references resource.exec.<name>.output.WIZ_LOGIN_URL, and
+    # a missing key makes that ref fail the whole lab's HCL decode (not just render empty). Emit "" if
+    # the URL can't be built so the attribute always exists and the failure is a blank link, not a
+    # dead lab.
+    url = _wiz_login_url() or ""
     out = os.getenv("EXEC_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"WIZ_USER={email}\nWIZ_PWD={pwd}\n")
-            if url:
-                f.write(f"WIZ_LOGIN_URL={url}\n")
-        print("published WIZ_USER/WIZ_PWD" + ("/WIZ_LOGIN_URL" if url else "") + " to $EXEC_OUTPUT")
+            f.write(f"WIZ_USER={email}\nWIZ_PWD={pwd}\nWIZ_LOGIN_URL={url}\n")
+        print("published WIZ_USER/WIZ_PWD/WIZ_LOGIN_URL to $EXEC_OUTPUT")
     else:
         print(f"WIZ_USER={email}")
         print(f"WIZ_PWD={pwd}")
-        if url:
-            print(f"WIZ_LOGIN_URL={url}")
+        print(f"WIZ_LOGIN_URL={url}")
 
 
 def cmd_user_ensure(args):
