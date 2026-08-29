@@ -13,11 +13,21 @@ Queries and auth are mined from te-labkit/bricks/connector.py (proven on live le
 """
 import json
 import os
+import re
+import subprocess
 import sys
 import urllib.request
 import urllib.parse
 
 AUTH_URL = "https://auth.app.wiz.io/oauth/token"
+
+# The delegator ARN is per-tenant and its `prod-<dc>` segment varies by data center, so it is never
+# a constant — resolved live from managedIdentityParameters.aws.roleArn (v1 connector.py:934).
+IDENTITY = """query ManagedIdentityParameters {
+  managedIdentityParameters { aws { roleArn } }
+}"""
+_DELEGATOR_RE = re.compile(r"role/prod-[A-Za-z0-9_-]+-AssumeRoleDelegator", re.IGNORECASE)
+ROLE_NAME = "WizAccess-Role"
 
 FIND = """query FindConnector($ids: [String!]) {
   connectors(filterBy: { cloudAccountExternalId: $ids }, first: 10) {
@@ -216,6 +226,148 @@ def cmd_connector_delete(args):
     sys.exit(0)
 
 
+# --- role trust-policy helpers, ported from te-labkit clouds/aws.py (proven on live leases). IAM
+# policy docs write plurals as scalar-or-list and hand back the trust doc either decoded or
+# percent-encoded depending on the CLI build, so accept every shape or the assertion flickers. ---
+def _as_list(v):
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def _decode_trust_policy(doc):
+    if isinstance(doc, dict):
+        return doc
+    if isinstance(doc, (str, bytes)):
+        text = doc.decode("utf-8", "replace") if isinstance(doc, bytes) else doc
+        for cand in (text, urllib.parse.unquote_plus(text), urllib.parse.unquote(text)):
+            try:
+                p = json.loads(cand)
+            except Exception:
+                continue
+            if isinstance(p, dict):
+                return p
+    return None
+
+
+def _grants_assume_role(stmt):
+    if str(stmt.get("Effect", "")).strip().lower() != "allow":
+        return False
+    for a in _as_list(stmt.get("Action")):
+        s = str(a).strip().lower()
+        if s in ("*", "sts:*", "sts:assumerole") or (s.endswith("*") and "sts:assumerole".startswith(s[:-1])):
+            return True
+    return False
+
+
+def _principals(stmt):
+    pr = stmt.get("Principal")
+    if isinstance(pr, str):
+        return [pr]
+    if isinstance(pr, dict):
+        return [str(v) for vals in pr.values() for v in _as_list(vals)]
+    return []
+
+
+def _external_ids(stmt):
+    # Only equality pins the value: a StringLike or Null condition would pass a role Wiz can't assume.
+    cond = stmt.get("Condition") or {}
+    if not isinstance(cond, dict):
+        return []
+    out = []
+    for op, mp in cond.items():
+        if "equals" not in str(op).lower() or not isinstance(mp, dict):
+            continue
+        for k, v in mp.items():
+            if str(k).strip().lower() == "sts:externalid":
+                out.extend(str(x) for x in _as_list(v))
+    return out
+
+
+def _wiz_delegator():
+    data, tid = api(IDENTITY, {})
+    arn = ((data.get("managedIdentityParameters") or {}).get("aws") or {}).get("roleArn") or ""
+    return arn, tid
+
+
+def _aws(*a):
+    return subprocess.run(["aws", *a], capture_output=True, text=True)
+
+
+def cmd_role_inspect(args):
+    """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
+    reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
+    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
+    another data center's delegator looks almost identical and does not work."""
+    role = _flag(args, "--role-name") or ROLE_NAME
+    res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
+    if res.returncode != 0:
+        s = res.stderr.lower()
+        if any(t in s for t in ("invalidclienttokenid", "unrecognizedclienttokenid", "signaturedoesnotmatch")):
+            die(3, f"AWS auth failure probing role {role}: {res.stderr.strip()}")
+        print(f"role {role} not found")
+        sys.exit(1)
+    role_obj = (json.loads(res.stdout or "{}").get("Role") or {})
+    policy = _decode_trust_policy(role_obj.get("AssumeRolePolicyDocument"))
+    if policy is None:
+        print(f"role {role} exists but its trust policy could not be decoded")
+        sys.exit(1)
+    delegator, tid = _wiz_delegator()
+    grants = [s for s in _as_list(policy.get("Statement")) if isinstance(s, dict) and _grants_assume_role(s)]
+    if not grants:
+        print(f"role {role}: trust policy grants no sts:AssumeRole (trusts nobody)")
+        sys.exit(1)
+    principals = [p for s in grants for p in _principals(s)]
+    if delegator:
+        if delegator not in principals:
+            print(f"role {role}: does not trust this tenant's Wiz delegator {delegator}; trusts {principals}")
+            sys.exit(1)
+    elif not any(_DELEGATOR_RE.search(p) for p in principals):
+        print(f"role {role}: trusts no Wiz AssumeRoleDelegator; trusts {principals}")
+        sys.exit(1)
+    ext = [v for s in grants for v in _external_ids(s)]
+    if not ext:
+        print(f"role {role}: no StringEquals sts:ExternalId condition; Wiz's assume-role is rejected")
+        sys.exit(1)
+    if tid and tid not in ext:
+        print(f"role {role}: sts:ExternalId {ext} != tenant id {tid}")
+        sys.exit(1)
+    print(f"role {role}: trust valid (assume-role to {delegator or 'Wiz delegator'}, externalId={tid})")
+    sys.exit(0)
+
+
+def cmd_role_ensure(args):
+    """Deploy WizAccess-Role's trust so Wiz can assume it. Trust-only by design: task 2's check
+    verifies only the trust policy. Scan permissions (SecurityAudit / ViewOnlyAccess / inline) are
+    task 3's need and unverified against TBCMP health — added when there's a live health signal."""
+    role = _flag(args, "--role-name") or ROLE_NAME
+    delegator, tid = _wiz_delegator()
+    if not delegator:
+        die(3, "managedIdentityParameters.aws.roleArn is empty; cannot build a trust policy")
+    if not tid:
+        die(3, "no tenant id (tid) in token; cannot set sts:ExternalId")
+    trust = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": delegator},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"sts:ExternalId": tid}},
+        }],
+    })
+    res = _aws("iam", "create-role", "--role-name", role, "--assume-role-policy-document", trust, "--output", "json")
+    if res.returncode == 0:
+        print(f"role {role}: created, trusts {delegator} (externalId={tid})")
+    elif "entityalreadyexists" in res.stderr.lower():
+        upd = _aws("iam", "update-assume-role-policy", "--role-name", role, "--policy-document", trust)
+        if upd.returncode != 0:
+            die(3, f"update-assume-role-policy failed: {upd.stderr.strip()}")
+        print(f"role {role}: trust updated, trusts {delegator} (externalId={tid})")
+    else:
+        die(3, f"create-role failed: {res.stderr.strip()}")
+    sys.exit(0)
+
+
 def _flag(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
@@ -225,6 +377,8 @@ VERBS = {
     ("connector", "inspect"): cmd_connector_inspect,
     ("connector", "ensure"): cmd_connector_ensure,
     ("connector", "delete"): cmd_connector_delete,
+    ("role", "inspect"): cmd_role_inspect,
+    ("role", "ensure"): cmd_role_ensure,
 }
 
 
