@@ -245,8 +245,9 @@ def cmd_audit_user(args):
     """Catch/backstop: list Wiz audit actions by the ephemeral lab user in a recent window. Enumerates
     everything a learner did (GUI creates included) — the reaper's detection layer. Default shows only
     MUTATION (state-changing); --all includes queries. Match by --email/--account, override --match."""
-    email = _flag(args, "--email") or _lab_user_email(args)[0]
-    needle = (_flag(args, "--match") or email).lower()
+    match = _flag(args, "--match")
+    email = _flag(args, "--email") or (None if match else _lab_user_email(args)[0])
+    needle = (match or email).lower()
     minutes = int(_flag(args, "--last-min") or "120")
     include_all = "--all" in args
     scope = "" if include_all else "actionType: MUTATION, "
@@ -264,7 +265,7 @@ def cmd_audit_user(args):
             break
         cursor, pages = pi.get("endCursor"), pages + 1
     kind = "ALL" if include_all else "MUTATION"
-    print(f"# {hits} {kind} action(s) by {email} in last {minutes}m", file=sys.stderr)
+    print(f"# {hits} {kind} action(s) by {email or match} in last {minutes}m", file=sys.stderr)
     sys.exit(0)
 
 
