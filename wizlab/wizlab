@@ -11,6 +11,7 @@ with the env-health check as its own leading `check` block. In CI, consume 2/3 d
 
 Queries and auth are mined from te-labkit/bricks/connector.py (proven on live leases), not invented.
 """
+
 import json
 import os
 import re
@@ -80,6 +81,7 @@ def _claims(tok):
     pad = tok.split(".")[1]
     pad += "=" * (-len(pad) % 4)
     import base64
+
     return json.loads(base64.urlsafe_b64decode(pad))
 
 
@@ -102,12 +104,14 @@ def token_and_dc():
     sec = os.getenv(f"WIZ_{tenant}_CLIENT_SECRET") or os.getenv("WIZ_CLIENT_SECRET")
     if not cid or not sec:
         die(3, f"WIZ_{tenant}_CLIENT_ID / _CLIENT_SECRET not in environment")
-    payload = urllib.parse.urlencode({
-        "grant_type": "client_credentials",
-        "audience": "wiz-api",
-        "client_id": cid,
-        "client_secret": sec,
-    })
+    payload = urllib.parse.urlencode(
+        {
+            "grant_type": "client_credentials",
+            "audience": "wiz-api",
+            "client_id": cid,
+            "client_secret": sec,
+        }
+    )
     res = _post(AUTH_URL, payload, {"Content-Type": "application/x-www-form-urlencoded"})
     tok = res.get("access_token")
     if not tok:
@@ -206,13 +210,18 @@ def cmd_connector_ensure(args):
     # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
     # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
     # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
-    data, _ = api(CREATE, {"input": {
-        "name": name,
-        "type": "aws",
-        "authParams": {"customerRoleARN": role_arn},
-        "extraConfig": {"skipOrganizationScan": True},
-    }})
-    c = ((data.get("createConnector") or {}).get("connector") or {})
+    data, _ = api(
+        CREATE,
+        {
+            "input": {
+                "name": name,
+                "type": "aws",
+                "authParams": {"customerRoleARN": role_arn},
+                "extraConfig": {"skipOrganizationScan": True},
+            }
+        },
+    )
+    c = (data.get("createConnector") or {}).get("connector") or {}
     if not c:
         die(3, "createConnector returned no connector")
     print(f"created connector {c['name']} ({c['id']}) status={c['status']}")
@@ -312,7 +321,7 @@ def cmd_role_inspect(args):
             die(3, f"AWS auth failure probing role {role}: {res.stderr.strip()}")
         print(f"role {role} not found")
         sys.exit(1)
-    role_obj = (json.loads(res.stdout or "{}").get("Role") or {})
+    role_obj = json.loads(res.stdout or "{}").get("Role") or {}
     policy = _decode_trust_policy(role_obj.get("AssumeRolePolicyDocument"))
     if policy is None:
         print(f"role {role} exists but its trust policy could not be decoded")
@@ -351,15 +360,19 @@ def cmd_role_ensure(args):
         die(3, "managedIdentityParameters.aws.roleArn is empty; cannot build a trust policy")
     if not tid:
         die(3, "no tenant id (tid) in token; cannot set sts:ExternalId")
-    trust = json.dumps({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": {"AWS": delegator},
-            "Action": "sts:AssumeRole",
-            "Condition": {"StringEquals": {"sts:ExternalId": tid}},
-        }],
-    })
+    trust = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": delegator},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {"StringEquals": {"sts:ExternalId": tid}},
+                }
+            ],
+        }
+    )
     res = _aws("iam", "create-role", "--role-name", role, "--assume-role-policy-document", trust, "--output", "json")
     if res.returncode == 0:
         print(f"role {role}: created, trusts {delegator} (externalId={tid})")
@@ -383,15 +396,20 @@ def _kc_env():
         if not v:
             die(3, f"{k} not in environment (grader-only Keycloak secret; not wired?)")
         vals[k] = v
-    return (vals["LAB_KEYCLOAK_ENDPOINT"].rstrip("/"), vals["LAB_KEYCLOAK_REALM"],
-            vals["LAB_KEYCLOAK_ADMIN_USER"], vals["LAB_KEYCLOAK_ADMIN_PWD"])
+    return (
+        vals["LAB_KEYCLOAK_ENDPOINT"].rstrip("/"),
+        vals["LAB_KEYCLOAK_REALM"],
+        vals["LAB_KEYCLOAK_ADMIN_USER"],
+        vals["LAB_KEYCLOAK_ADMIN_PWD"],
+    )
 
 
 def _kc_token(endpoint, admin_user, admin_pwd):
     res = _post(
         f"{endpoint}/realms/master/protocol/openid-connect/token",
-        urllib.parse.urlencode({"grant_type": "password", "client_id": "admin-cli",
-                                "username": admin_user, "password": admin_pwd}),
+        urllib.parse.urlencode(
+            {"grant_type": "password", "client_id": "admin-cli", "username": admin_user, "password": admin_pwd}
+        ),
         {"Content-Type": "application/x-www-form-urlencoded"},
     )
     tok = res.get("access_token")
@@ -444,8 +462,11 @@ def _kc_group_id(endpoint, realm, token, group):
 def _gen_password(length=14):
     # upper+lower+digit guaranteed so it clears a typical Keycloak policy (v1 misc.generate_password).
     pool = string.ascii_uppercase + string.ascii_lowercase + string.digits
-    chars = [secrets.choice(string.ascii_uppercase), secrets.choice(string.ascii_lowercase),
-             secrets.choice(string.digits)] + [secrets.choice(pool) for _ in range(length - 3)]
+    chars = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+    ] + [secrets.choice(pool) for _ in range(length - 3)]
     secrets.SystemRandom().shuffle(chars)
     return "".join(chars)
 
@@ -499,21 +520,17 @@ def _wiz_login_url():
 def _publish_user(email, pwd):
     # Instruqt 2.0 replaces 1.0 agent vars: an `exec` resource writes KEY=value to $EXEC_OUTPUT,
     # read as resource.exec.<name>.output.<KEY> and rendered into a `note` via Handlebars. When not
-    # under exec (grader manual run / acceptance), print so a human can use the creds.
-    # Emit every key unconditionally: a note references resource.exec.<name>.output.WIZ_LOGIN_URL, and
-    # a missing key makes that ref fail the whole lab's HCL decode (not just render empty). Emit "" if
-    # the URL can't be built so the attribute always exists and the failure is a blank link, not a
-    # dead lab.
-    url = _wiz_login_url() or ""
+    # under exec (grader manual run / acceptance), print so a human can use the creds. The login URL is
+    # NOT emitted here: it is a per-tenant constant, not per-learner, so labs pin it as a note literal
+    # (regenerate with `wizlab user login-url`); emitting a new key here would deadlock note decode.
     out = os.getenv("EXEC_OUTPUT")
     if out:
         with open(out, "a") as f:
-            f.write(f"WIZ_USER={email}\nWIZ_PWD={pwd}\nWIZ_LOGIN_URL={url}\n")
-        print("published WIZ_USER/WIZ_PWD/WIZ_LOGIN_URL to $EXEC_OUTPUT")
+            f.write(f"WIZ_USER={email}\nWIZ_PWD={pwd}\n")
+        print("published WIZ_USER/WIZ_PWD to $EXEC_OUTPUT")
     else:
         print(f"WIZ_USER={email}")
         print(f"WIZ_PWD={pwd}")
-        print(f"WIZ_LOGIN_URL={url}")
 
 
 def cmd_user_ensure(args):
@@ -527,18 +544,32 @@ def cmd_user_ensure(args):
     pwd = _gen_password()
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
-        status, body = _kc_call("POST", f"{endpoint}/admin/realms/{realm}/users", token, {
-            "email": email, "username": email, "firstName": name, "lastName": "Student",
-            "emailVerified": True, "enabled": True, "requiredActions": [],
-            "credentials": [{"type": "password", "value": pwd, "temporary": False}],
-        })
+        status, body = _kc_call(
+            "POST",
+            f"{endpoint}/admin/realms/{realm}/users",
+            token,
+            {
+                "email": email,
+                "username": email,
+                "firstName": name,
+                "lastName": "Student",
+                "emailVerified": True,
+                "enabled": True,
+                "requiredActions": [],
+                "credentials": [{"type": "password", "value": pwd, "temporary": False}],
+            },
+        )
         if status != 201:
             die(3, f"create user HTTP {status}: {body[:300]!r}")
         uid = _kc_user_id(endpoint, realm, token, email)
         action = "created"
     else:
-        status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/reset-password",
-                                token, {"type": "password", "value": pwd, "temporary": False})
+        status, body = _kc_call(
+            "PUT",
+            f"{endpoint}/admin/realms/{realm}/users/{uid}/reset-password",
+            token,
+            {"type": "password", "value": pwd, "temporary": False},
+        )
         if status not in (200, 204):
             die(3, f"reset-password HTTP {status}: {body[:300]!r}")
         action = "reset"
@@ -584,6 +615,17 @@ def cmd_user_delete(args):
     sys.exit(0)
 
 
+def cmd_user_login_url(args):
+    """Print the tenant's Wiz SSO login URL. Author tool: a lab pins this URL as a note literal (it is
+    a per-tenant constant, identical for every learner), and regenerates it here when the tenant
+    changes — the single source that keeps the literal from silently drifting."""
+    url = _wiz_login_url()
+    if not url:
+        die(3, "cannot build login URL: no SSO entry for tenant or no tid in token")
+    print(url)
+    sys.exit(0)
+
+
 def _flag(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
@@ -598,6 +640,7 @@ VERBS = {
     ("user", "ensure"): cmd_user_ensure,
     ("user", "inspect"): cmd_user_inspect,
     ("user", "delete"): cmd_user_delete,
+    ("user", "login-url"): cmd_user_login_url,
 }
 
 
