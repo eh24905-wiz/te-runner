@@ -716,6 +716,127 @@ def cmd_user_login_url(args):
     sys.exit(0)
 
 
+# reap: delete a lab user's Wiz footprint from the audit log. Delete is uniform delete<Type>(input:{id})
+# across ~34 of 36 create types; correlation (find by name) is per-type — the generic handler
+# (plural+search, hard verify) covers the norm, _REAP_OVERRIDES holds the exceptions we measured.
+_REAP_OVERRIDES = {
+    "ServiceAccount": {"list": "serviceAccounts", "filter": "name", "soft": True},
+}
+
+
+def _plural(x):
+    lc = x[0].lower() + x[1:]
+    if lc.endswith("y") and lc[-2].lower() not in "aeiou":
+        return lc[:-1] + "ies"
+    return lc + "s"
+
+
+def _reap_handler(x):
+    o = _REAP_OVERRIDES.get(x, {})
+    return {"list": o.get("list", _plural(x)), "filter": o.get("filter", "search"),
+            "delete": "delete" + x, "soft": o.get("soft", False)}
+
+
+def _gql(tok, dc, query):
+    # Non-fatal twin of api(): returns (data, errors) so one unresolvable type alerts, not aborts.
+    res = _post(f"https://api.{dc}.app.wiz.io/graphql", {"query": query},
+                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
+    return res.get("data") or {}, res.get("errors") or []
+
+
+def _input_name(d):
+    if isinstance(d, dict):
+        for k in ("name", "displayName", "title"):
+            if isinstance(d.get(k), str):
+                return d[k]
+        for v in d.values():
+            r = _input_name(v)
+            if r:
+                return r
+    return None
+
+
+def _reap_enumerate(tok, dc, email, minutes):
+    fb = f"actionType: MUTATION, timestamp: {{ inLast: {{ amount: {minutes}, unit: DurationFilterValueUnitMinutes }} }}"
+    out, cursor, pages = [], None, 0
+    while pages < 30:
+        after = f', after: "{cursor}"' if cursor else ""
+        qy = ("query { auditLogEntries(first: 100" + after + ", filterBy: { " + fb + " }) "
+              "{ nodes { action status performer { name } actionParameters } pageInfo { hasNextPage endCursor } } }")
+        data, _ = _gql(tok, dc, qy)
+        conn = data.get("auditLogEntries") or {}
+        for n in conn.get("nodes") or []:
+            if (n.get("performer") or {}).get("name") != email or n.get("status") != "SUCCESS":
+                continue
+            if n["action"].startswith("Create"):
+                out.append((n["action"], _input_name((n.get("actionParameters") or {}).get("input") or {})))
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor, pages = pi.get("endCursor"), pages + 1
+    return out
+
+
+def _reap_find(tok, dc, h, name):
+    # Returns (id_if_exactly_one, exact_count, error). Exact-name guard is load-bearing: list filters
+    # are substring (measured on serviceAccounts.name), so a shared tenant demands ==1 before delete.
+    extra = ", deleted: false" if h["soft"] else ""
+    esc = name.replace("\\", "\\\\").replace('"', '\\"')
+    qy = ("query { " + h["list"] + "(first: 50, filterBy: { " + h["filter"]
+          + ': "' + esc + '"' + extra + " }) { nodes { id name } } }")
+    data, errs = _gql(tok, dc, qy)
+    if errs:
+        return None, None, errs[0].get("message", "?")
+    exact = [n for n in ((data.get(h["list"]) or {}).get("nodes") or []) if n.get("name") == name]
+    return (exact[0]["id"] if len(exact) == 1 else None), len(exact), None
+
+
+def _reap_one(tok, dc, action, name, commit):
+    """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None)."""
+    x = action[len("Create"):]
+    if not name:
+        return False, f"ALERT {action}: no name in input — manual review"
+    h = _reap_handler(x)
+    rid, count, err = _reap_find(tok, dc, h, name)
+    if err:
+        return False, f"ALERT {action} {name!r}: no handler ({err})"
+    if count != 1:
+        return False, f"ALERT {action} {name!r}: matched {count}, need exactly 1 — skipping"
+    soft = ", soft" if h["soft"] else ""
+    if not commit:
+        print(f"DRY-RUN would delete {x} {name!r} ({rid[:8]}{soft})")
+        return True, None
+    dq = "mutation { " + h["delete"] + '(input: { id: "' + rid + '" }) { _stub } }'
+    _d, derr = _gql(tok, dc, dq)
+    gone = _reap_find(tok, dc, h, name)[1] == 0
+    tail = f" ({derr[0]['message']})" if derr else ""
+    print(f"{'deleted' if gone else 'DELETE-FAILED'} {x} {name!r}{tail}")
+    return gone, None
+
+
+def cmd_reap(args):
+    """Reap a lab user's Wiz footprint from the audit log. DRY-RUN by default; --commit deletes.
+    Enumerates SUCCESS Create* by the user (--email/--account), maps each to delete<Type>({id}) via
+    exact-name correlation, and ALERTS on any type with no clean single match/handler. Audit-log lag
+    is minutes, so treat the completion-check run as best-effort and let the out-of-band sweep backstop
+    it; pair with `connector delete` / `user delete` for the known artifacts."""
+    email = _flag(args, "--email") or _lab_user_email(args)[0]
+    minutes = int(_flag(args, "--last-min") or "1440")
+    commit = "--commit" in args
+    tok, dc, _ = token_and_dc()
+    reaped = alerted = 0
+    for action, name in _reap_enumerate(tok, dc, email, minutes):
+        did, alert = _reap_one(tok, dc, action, name, commit)
+        if alert:
+            print(alert)
+            alerted += 1
+        elif did:
+            reaped += 1
+    verb = "reaped" if commit else "to reap (dry-run)"
+    print(f"# {reaped} {verb}, {alerted} alert(s) for {email}", file=sys.stderr)
+    sys.exit(0)
+
+
 def _flag(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
@@ -734,6 +855,7 @@ VERBS = {
     ("wiz", "queries"): cmd_wiz_queries,
     ("wiz", "type"): cmd_wiz_type,
     ("audit", "user"): cmd_audit_user,
+    ("user", "reap"): cmd_reap,
 }
 
 
