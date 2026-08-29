@@ -288,15 +288,21 @@ def cmd_connector_inspect(args):
     sys.exit(0 if node["enabled"] and node["status"] in HEALTHY_STATUSES else 1)
 
 
+def _lab_stem(account):
+    # One naming convention for everything a lab creates or tells the learner to create:
+    # lab-<account>. The account is lease-unique, so this prefix is a safe, actor-independent reap
+    # key — a name-prefix sweep catches solve-created (service-account actor) and learner-created
+    # alike, which audit-by-actor cannot. Override the leading token with WIZLAB_SESSION_PREFIX.
+    return f"{os.getenv('WIZLAB_SESSION_PREFIX', 'lab')}-{account}"
+
+
 def cmd_connector_ensure(args):
     account = _flag(args, "--account-id") or die(2, "connector ensure needs --account-id")
     role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/WizAccess-Role"
     if find_connector(account):
         print(f"a connector already targets {account}; nothing to create")
         sys.exit(0)
-    # Naming lives HERE and nowhere else: <session-prefix>-<account>. The learner is told the
-    # same convention, so a portal-created connector and this one produce the same string.
-    name = f"{os.getenv('WIZLAB_SESSION_PREFIX', 'telab')}-{account}"
+    name = f"{_lab_stem(account)}-connector"
     # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
     # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
     # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
@@ -567,9 +573,9 @@ def _lab_user_email(args):
     account = _flag(args, "--account") or os.getenv("AWS_ACCOUNT_ID")
     if not account:
         die(2, "user verbs need --account or AWS_ACCOUNT_ID (the lease-stable identity seed)")
-    prefix = _flag(args, "--prefix") or "lab"
     domain = _flag(args, "--domain") or "titra-labs.ai"
-    return f"{prefix}-{account}@{domain}", f"{prefix}-{account}"
+    stem = _lab_stem(account)
+    return f"{stem}@{domain}", stem
 
 
 # Per-tenant SSO constants that CANNOT be derived (v1 credentials_tab.py:52): the suffix Wiz appends
