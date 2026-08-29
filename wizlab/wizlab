@@ -28,6 +28,7 @@ IDENTITY = """query ManagedIdentityParameters {
 }"""
 _DELEGATOR_RE = re.compile(r"role/prod-[A-Za-z0-9_-]+-AssumeRoleDelegator", re.IGNORECASE)
 ROLE_NAME = "WizAccess-Role"
+HEALTHY_STATUSES = {"CONNECTED"}  # measured terminal state; INITIAL_SCANNING is transient, ERROR is failure
 
 FIND = """query FindConnector($ids: [String!]) {
   connectors(filterBy: { cloudAccountExternalId: $ids }, first: 10) {
@@ -184,9 +185,10 @@ def cmd_connector_inspect(args):
     print(f"connector {node['name']} ({node['id']}): enabled={node['enabled']} status={node['status']}")
     if require == "exists":
         sys.exit(0)
-    # healthy: v1 measured INITIAL_SCANNING -> ERROR(CONNECTION_ERROR) before the role exists.
-    # TODO(measure): confirm the post-role healthy enum on a live lease before pilot playtest.
-    sys.exit(0 if node["enabled"] and node["status"] not in ("ERROR",) else 1)
+    # healthy: measured role-first on TBCMP (measurements.yaml aws.connector) -- INITIAL_SCANNING for
+    # ~2-3 min, then CONNECTED, never ERROR. Require CONNECTED, not merely not-ERROR: INITIAL_SCANNING
+    # is the window before Wiz has actually assumed the role, so not-ERROR there is a false pass.
+    sys.exit(0 if node["enabled"] and node["status"] in HEALTHY_STATUSES else 1)
 
 
 def cmd_connector_ensure(args):
