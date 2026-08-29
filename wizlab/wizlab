@@ -71,6 +71,18 @@ DELETE = """mutation DeleteConnector($input: DeleteConnectorInput!) {
   deleteConnector(input: $input) { _stub }
 }"""
 
+# Schema-explorer spike: find the audit-log/activity query that could drive a reaper, and drill into
+# its return type. Kept as general Wiz API exploration, not throwaway.
+INTROSPECT_QUERIES = """query { __schema { queryType { fields {
+  name
+  args { name }
+  type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+} } } }"""
+
+# __type is inlined (Wiz's gateway won't bind $variables on introspection; normal queries bind fine).
+INTROSPECT_TYPE = ('query { __type(name: "%s") { fields { name type { kind name ofType '
+                   '{ kind name ofType { kind name } } } } inputFields { name } enumValues { name } } }')
+
 
 def die(code, msg):
     print(f"wizlab: {msg}", file=sys.stderr)
@@ -176,6 +188,83 @@ def cmd_session_verify(args):
     # (FIND uses it). This confirms the token is accepted by the API, not just minted by auth.
     api("query { connectors(first: 1) { totalCount } }", {})
     print(f"ok: authenticated to dc={dc} tenant={tid}")
+    sys.exit(0)
+
+
+def _typename(t):
+    # Unwrap NON_NULL/LIST wrappers to the underlying named type.
+    while t and not t.get("name") and t.get("ofType"):
+        t = t["ofType"]
+    return (t or {}).get("name") or "?"
+
+
+def cmd_wiz_queries(args):
+    """List top-level Wiz queries whose name matches any --match term (default: audit-relevant), with
+    return type. Finds the audit-log/activity query a reaper could use to enumerate what a user made."""
+    terms = (_flag(args, "--match") or "audit,activity,event,log,entit,delete").lower().split(",")
+    data, _ = api(INTROSPECT_QUERIES, {})
+    fields = ((data.get("__schema") or {}).get("queryType") or {}).get("fields") or []
+    hits = [f for f in fields if any(t in f["name"].lower() for t in terms)]
+    for f in sorted(hits, key=lambda f: f["name"]):
+        argnames = ", ".join(a["name"] for a in (f.get("args") or []))
+        print(f"{f['name']}({argnames}) -> {_typename(f.get('type'))}")
+    print(f"# {len(hits)} match of {len(fields)} top-level queries", file=sys.stderr)
+    sys.exit(0)
+
+
+def cmd_wiz_type(args):
+    """Print a Wiz type's fields / inputFields / enumValues (drill into a `wiz queries` return type)."""
+    name = _flag(args, "--name") or die(2, "wiz type needs --name <TypeName>")
+    if not name.isidentifier():
+        die(2, "type name must be alphanumeric")
+    data, _ = api(INTROSPECT_TYPE % name, {})
+    t = data.get("__type")
+    if not t:
+        die(1, f"no such type: {name}")
+    for f in t.get("fields") or []:
+        print(f"{f['name']}: {_typename(f.get('type'))}")
+    for f in t.get("inputFields") or []:
+        print(f"(in) {f['name']}")
+    for v in t.get("enumValues") or []:
+        print(f"(enum) {v['name']}")
+    sys.exit(0)
+
+
+def _audit_page(filter_body, cursor):
+    after = f', after: "{cursor}"' if cursor else ""
+    qy = (
+        "query { auditLogEntries(first: 100" + after + ", filterBy: { " + filter_body + " }) "
+        "{ nodes { action actionType status timestamp performer { id name } } "
+        "pageInfo { hasNextPage endCursor } } }"
+    )
+    data, _ = api(qy, {})
+    return data.get("auditLogEntries") or {}
+
+
+def cmd_audit_user(args):
+    """Catch/backstop: list Wiz audit actions by the ephemeral lab user in a recent window. Enumerates
+    everything a learner did (GUI creates included) — the reaper's detection layer. Default shows only
+    MUTATION (state-changing); --all includes queries. Match by --email/--account, override --match."""
+    email = _flag(args, "--email") or _lab_user_email(args)[0]
+    needle = (_flag(args, "--match") or email).lower()
+    minutes = int(_flag(args, "--last-min") or "120")
+    include_all = "--all" in args
+    scope = "" if include_all else "actionType: MUTATION, "
+    fb = scope + f"timestamp: {{ inLast: {{ amount: {minutes}, unit: DurationFilterValueUnitMinutes }} }}"
+    cursor, pages, hits = None, 0, 0
+    while pages < 25:
+        conn = _audit_page(fb, cursor)
+        for n in conn.get("nodes") or []:
+            p = n.get("performer") or {}
+            if needle in f"{p.get('id', '')} {p.get('name', '')}".lower():
+                hits += 1
+                print(f"{n['timestamp']}  {n['actionType']:10} {n.get('status', ''):8} {n['action']}")
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor, pages = pi.get("endCursor"), pages + 1
+    kind = "ALL" if include_all else "MUTATION"
+    print(f"# {hits} {kind} action(s) by {email} in last {minutes}m", file=sys.stderr)
     sys.exit(0)
 
 
@@ -641,6 +730,9 @@ VERBS = {
     ("user", "inspect"): cmd_user_inspect,
     ("user", "delete"): cmd_user_delete,
     ("user", "login-url"): cmd_user_login_url,
+    ("wiz", "queries"): cmd_wiz_queries,
+    ("wiz", "type"): cmd_wiz_type,
+    ("audit", "user"): cmd_audit_user,
 }
 
 
