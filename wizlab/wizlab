@@ -71,6 +71,16 @@ DELETE = """mutation DeleteConnector($input: DeleteConnectorInput!) {
   deleteConnector(input: $input) { _stub }
 }"""
 
+UPDATE = """mutation UpdateConnector($input: UpdateConnectorInput!) {
+  updateConnector(input: $input) { connector { id name status } }
+}"""
+
+# Inventory presence check: a scanned cloud resource of a type, filtered to the lease account.
+# subscriptionExternalId is the CSP account number (measured on TS_PROD); type is the Wiz graph type.
+INSTANCES = """query Instances($f: CloudResourceFilters) {
+  cloudResources(first: 1, filterBy: $f) { totalCount }
+}"""
+
 # Schema-explorer spike: find the audit-log/activity query that could drive a reaper, and drill into
 # its return type. Kept as general Wiz API exploration, not throwaway.
 INTROSPECT_QUERIES = """query { __schema { queryType { fields {
@@ -336,6 +346,34 @@ def cmd_connector_delete(args):
     sys.exit(0)
 
 
+def cmd_connector_repair(args):
+    """Repair a mis-configured connector: point its customerRoleARN at the account's WizAccess-Role.
+    For repair labs where setup seeded a connector with a wrong role ARN (same account, so
+    find_connector still matches). Updates authParams via updateConnector (patch), leaving the rest."""
+    account = _flag(args, "--account-id") or die(2, "connector repair needs --account-id")
+    role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
+    matches = find_connector(account)
+    if not matches:
+        die(1, f"no connector targets {account} to repair")
+    cid = matches[0]["id"]
+    data, _ = api(UPDATE, {"input": {"id": cid, "patch": {"authParams": {"customerRoleARN": role_arn}}}})
+    c = (data.get("updateConnector") or {}).get("connector") or {}
+    print(f"connector repair: {cid} customerRoleARN -> {role_arn} (status {c.get('status')})")
+    sys.exit(0)
+
+
+def cmd_instance_inspect(args):
+    """Assert a scanned cloud resource of --type (default VIRTUAL_MACHINE) exists in Wiz for the
+    account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check. Measured shape:
+    cloudResources(filterBy subscriptionExternalId + type) on TS_PROD."""
+    account = _flag(args, "--account-id") or die(2, "instance inspect needs --account-id")
+    rtype = _flag(args, "--type") or "VIRTUAL_MACHINE"
+    data, _ = api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
+    n = (data.get("cloudResources") or {}).get("totalCount") or 0
+    print(f"instance inspect: {n} {rtype} scanned in account {account}")
+    sys.exit(0 if n > 0 else 1)
+
+
 # --- role trust-policy helpers, ported from te-labkit clouds/aws.py (proven on live leases). IAM
 # policy docs write plurals as scalar-or-list and hand back the trust doc either decoded or
 # percent-encoded depending on the CLI build, so accept every shape or the assertion flickers. ---
@@ -454,8 +492,11 @@ def cmd_role_ensure(args):
     delegator, tid = _wiz_delegator()
     if not delegator:
         die(3, "managedIdentityParameters.aws.roleArn is empty; cannot build a trust policy")
-    if not tid:
-        die(3, "no tenant id (tid) in token; cannot set sts:ExternalId")
+    # --external-id overrides the correct tid: setup uses it to SEED a broken trust (repair labs);
+    # the learner's fix / solve runs `role ensure` with no override and writes the correct tid.
+    ext = _flag(args, "--external-id") or tid
+    if not ext:
+        die(3, "no tenant id (tid) in token and no --external-id; cannot set sts:ExternalId")
     trust = json.dumps(
         {
             "Version": "2012-10-17",
@@ -464,19 +505,19 @@ def cmd_role_ensure(args):
                     "Effect": "Allow",
                     "Principal": {"AWS": delegator},
                     "Action": "sts:AssumeRole",
-                    "Condition": {"StringEquals": {"sts:ExternalId": tid}},
+                    "Condition": {"StringEquals": {"sts:ExternalId": ext}},
                 }
             ],
         }
     )
     res = _aws("iam", "create-role", "--role-name", role, "--assume-role-policy-document", trust, "--output", "json")
     if res.returncode == 0:
-        print(f"role {role}: created, trusts {delegator} (externalId={tid})")
+        print(f"role {role}: created, trusts {delegator} (externalId={ext})")
     elif "entityalreadyexists" in res.stderr.lower():
         upd = _aws("iam", "update-assume-role-policy", "--role-name", role, "--policy-document", trust)
         if upd.returncode != 0:
             die(3, f"update-assume-role-policy failed: {upd.stderr.strip()}")
-        print(f"role {role}: trust updated, trusts {delegator} (externalId={tid})")
+        print(f"role {role}: trust updated, trusts {delegator} (externalId={ext})")
     else:
         die(3, f"create-role failed: {res.stderr.strip()}")
     sys.exit(0)
@@ -893,7 +934,9 @@ VERBS = {
     ("session", "verify"): cmd_session_verify,
     ("connector", "inspect"): cmd_connector_inspect,
     ("connector", "ensure"): cmd_connector_ensure,
+    ("connector", "repair"): cmd_connector_repair,
     ("connector", "delete"): cmd_connector_delete,
+    ("instance", "inspect"): cmd_instance_inspect,
     ("role", "inspect"): cmd_role_inspect,
     ("role", "ensure"): cmd_role_ensure,
     ("user", "ensure"): cmd_user_ensure,
