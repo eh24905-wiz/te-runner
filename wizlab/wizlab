@@ -14,10 +14,12 @@ Queries and auth are mined from te-labkit/bricks/connector.py (proven on live le
 import json
 import os
 import re
+import secrets
+import string
 import subprocess
 import sys
-import urllib.request
 import urllib.parse
+import urllib.request
 
 AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 
@@ -82,7 +84,8 @@ def _claims(tok):
 
 
 def _post(url, data, headers):
-    req = urllib.request.Request(url, data=data.encode() if isinstance(data, str) else json.dumps(data).encode(), headers=headers)
+    payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
+    req = urllib.request.Request(url, data=payload, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())
@@ -164,7 +167,7 @@ def find_connector(account_id, cloud="aws"):
 
 
 def cmd_session_verify(args):
-    tok, dc, tid = token_and_dc()
+    _tok, dc, tid = token_and_dc()
     # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is proven
     # (FIND uses it). This confirms the token is accepted by the API, not just minted by auth.
     api("query { connectors(first: 1) { totalCount } }", {})
@@ -293,7 +296,7 @@ def _wiz_delegator():
 
 
 def _aws(*a):
-    return subprocess.run(["aws", *a], capture_output=True, text=True)
+    return subprocess.run(["aws", *a], capture_output=True, text=True, check=False)
 
 
 def cmd_role_inspect(args):
@@ -370,6 +373,176 @@ def cmd_role_ensure(args):
     sys.exit(0)
 
 
+# --- lab user (Keycloak), ported from te-labkit keycloak/{auth,user}.py (proven; probe 2026-08-29
+# reached realm wiz-labs, group global-contributor). requests -> stdlib urllib. Backs Wiz SSO for a
+# learner. Realm/endpoint come from grader-only env, never hardcoded (probe found realm=wiz-labs). ---
+def _kc_env():
+    vals = {}
+    for k in ("LAB_KEYCLOAK_ENDPOINT", "LAB_KEYCLOAK_REALM", "LAB_KEYCLOAK_ADMIN_USER", "LAB_KEYCLOAK_ADMIN_PWD"):
+        v = os.getenv(k)
+        if not v:
+            die(3, f"{k} not in environment (grader-only Keycloak secret; not wired?)")
+        vals[k] = v
+    return (vals["LAB_KEYCLOAK_ENDPOINT"].rstrip("/"), vals["LAB_KEYCLOAK_REALM"],
+            vals["LAB_KEYCLOAK_ADMIN_USER"], vals["LAB_KEYCLOAK_ADMIN_PWD"])
+
+
+def _kc_token(endpoint, admin_user, admin_pwd):
+    res = _post(
+        f"{endpoint}/realms/master/protocol/openid-connect/token",
+        urllib.parse.urlencode({"grant_type": "password", "client_id": "admin-cli",
+                                "username": admin_user, "password": admin_pwd}),
+        {"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    tok = res.get("access_token")
+    if not tok:
+        die(3, "Keycloak admin token: no access_token returned")
+    return tok
+
+
+def _kc_call(method, url, token, body=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:
+        die(3, f"Keycloak transport failure to {url}: {type(e).__name__}: {e}")
+
+
+def _kc_user_id(endpoint, realm, token, email):
+    # `search` is a substring match: a prefix collision (bob@x vs bob@x.io) would return the wrong
+    # learner and a group-join/DELETE would hit them, so filter to an exact username/email and refuse
+    # to guess on >1 (v1 keycloak/user.py get_keycloak_user_id).
+    q = urllib.parse.urlencode({"exact": "true", "briefRepresentation": "true", "search": email})
+    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users?{q}", token)
+    if status != 200:
+        die(3, f"Keycloak user lookup HTTP {status}")
+    exact = [u for u in json.loads(body or b"[]") if email in (u.get("username"), u.get("email"))]
+    if len(exact) > 1:
+        die(3, f"{len(exact)} Keycloak users exactly match {email}; refusing to guess")
+    return exact[0]["id"] if exact else None
+
+
+def _kc_group_id(endpoint, realm, token, group):
+    q = urllib.parse.urlencode({"search": group, "exact": "true"})
+    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/groups?{q}", token)
+    if status != 200:
+        die(3, f"Keycloak group lookup HTTP {status}")
+    groups = json.loads(body or b"[]")
+    if not groups:
+        die(3, f"Keycloak group '{group}' not found in realm '{realm}'")
+    return groups[0]["id"]
+
+
+def _gen_password(length=14):
+    # upper+lower+digit guaranteed so it clears a typical Keycloak policy (v1 misc.generate_password).
+    pool = string.ascii_uppercase + string.ascii_lowercase + string.digits
+    chars = [secrets.choice(string.ascii_uppercase), secrets.choice(string.ascii_lowercase),
+             secrets.choice(string.digits)] + [secrets.choice(pool) for _ in range(length - 3)]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def _lab_user_email(args):
+    # Deterministic from the lease so `ensure` is idempotent and `delete` needs no stored state (v1
+    # kept the name in an agent var, which 2.0 drops). AWS_ACCOUNT_ID is the lease-stable seed here.
+    account = _flag(args, "--account") or os.getenv("AWS_ACCOUNT_ID")
+    if not account:
+        die(2, "user verbs need --account or AWS_ACCOUNT_ID (the lease-stable identity seed)")
+    prefix = _flag(args, "--prefix") or "lab"
+    domain = _flag(args, "--domain") or "titra-labs.ai"
+    return f"{prefix}-{account}@{domain}", f"{prefix}-{account}"
+
+
+def _publish_user(email, pwd):
+    # Instruqt 2.0 replaces 1.0 agent vars: an `exec` resource writes KEY=value to $EXEC_OUTPUT,
+    # read as resource.exec.<name>.output.<KEY> and rendered into a `note` via Handlebars. When not
+    # under exec (grader manual run / acceptance), print so a human can use the creds.
+    out = os.getenv("EXEC_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"WIZ_USER={email}\nWIZ_PWD={pwd}\n")
+        print("published WIZ_USER/WIZ_PWD to $EXEC_OUTPUT")
+    else:
+        print(f"WIZ_USER={email}")
+        print(f"WIZ_PWD={pwd}")
+
+
+def cmd_user_ensure(args):
+    """Create (or password-reset) the per-lease Keycloak user backing Wiz SSO, join it to the RBAC
+    group, and publish WIZ_USER/WIZ_PWD. Reset on an existing user: Keycloak never returns the old
+    password and the learner needs a working value."""
+    endpoint, realm, admin_user, admin_pwd = _kc_env()
+    email, name = _lab_user_email(args)
+    group = _flag(args, "--group") or "global-contributor"
+    token = _kc_token(endpoint, admin_user, admin_pwd)
+    pwd = _gen_password()
+    uid = _kc_user_id(endpoint, realm, token, email)
+    if uid is None:
+        status, body = _kc_call("POST", f"{endpoint}/admin/realms/{realm}/users", token, {
+            "email": email, "username": email, "firstName": name, "lastName": "Student",
+            "emailVerified": True, "enabled": True, "requiredActions": [],
+            "credentials": [{"type": "password", "value": pwd, "temporary": False}],
+        })
+        if status != 201:
+            die(3, f"create user HTTP {status}: {body[:300]!r}")
+        uid = _kc_user_id(endpoint, realm, token, email)
+        action = "created"
+    else:
+        status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/reset-password",
+                                token, {"type": "password", "value": pwd, "temporary": False})
+        if status not in (200, 204):
+            die(3, f"reset-password HTTP {status}: {body[:300]!r}")
+        action = "reset"
+    gid = _kc_group_id(endpoint, realm, token, group)
+    status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups/{gid}", token)
+    if status not in (200, 204):
+        die(3, f"group-join HTTP {status}: {body[:300]!r}")
+    _publish_user(email, pwd)
+    print(f"user {action}: {email} (group {group})")
+    sys.exit(0)
+
+
+def cmd_user_inspect(args):
+    endpoint, realm, admin_user, admin_pwd = _kc_env()
+    email, _ = _lab_user_email(args)
+    group = _flag(args, "--group") or "global-contributor"
+    token = _kc_token(endpoint, admin_user, admin_pwd)
+    uid = _kc_user_id(endpoint, realm, token, email)
+    if uid is None:
+        print(f"no Keycloak user {email}")
+        sys.exit(1)
+    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token)
+    groups = [g.get("name") for g in json.loads(body or b"[]")] if status == 200 else []
+    if group not in groups:
+        print(f"user {email} exists but is not in group {group}; groups={groups}")
+        sys.exit(1)
+    print(f"user {email} exists and is in group {group}")
+    sys.exit(0)
+
+
+def cmd_user_delete(args):
+    endpoint, realm, admin_user, admin_pwd = _kc_env()
+    email, _ = _lab_user_email(args)
+    token = _kc_token(endpoint, admin_user, admin_pwd)
+    uid = _kc_user_id(endpoint, realm, token, email)
+    if uid is None:
+        print(f"no Keycloak user {email}; nothing to delete")
+        sys.exit(0)
+    status, body = _kc_call("DELETE", f"{endpoint}/admin/realms/{realm}/users/{uid}", token)
+    if status not in (204, 404):
+        die(3, f"delete user HTTP {status}: {body[:300]!r}")
+    print(f"deleted Keycloak user {email}")
+    sys.exit(0)
+
+
 def _flag(args, name):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
 
@@ -381,6 +554,9 @@ VERBS = {
     ("connector", "delete"): cmd_connector_delete,
     ("role", "inspect"): cmd_role_inspect,
     ("role", "ensure"): cmd_role_ensure,
+    ("user", "ensure"): cmd_user_ensure,
+    ("user", "inspect"): cmd_user_inspect,
+    ("user", "delete"): cmd_user_delete,
 }
 
 

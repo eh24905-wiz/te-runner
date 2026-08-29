@@ -1,0 +1,9 @@
+# Lint gate for wizlab (stdlib-only CLI). Curated, not ruff's shifting defaults, so CI is stable.
+# Correctness + style + modernization + simplification. Complexity is radon's job (see CLAUDE.md),
+# not C90's. BLE/S unselected on purpose: broad `except -> die(3)` is the intended transport-failure
+# contract, not an oversight.
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
