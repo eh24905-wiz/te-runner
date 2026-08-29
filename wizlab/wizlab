@@ -729,6 +729,11 @@ _REAP_OVERRIDES = {
     "ServiceAccount": {"list": "serviceAccounts", "filter": "name", "soft": True},
 }
 
+# Types the prefix sweep checks by name. Verified delete<X>({id}) + search/name filter; the
+# lease-unique lab-<account> stem is a safe prefix match. Extend as labs create new types.
+_SWEEP_TYPES = ["Connector", "Project", "Report", "Control", "SavedGraphQuery",
+                "AutomationWorkflow", "ServiceAccount"]
+
 
 def _plural(x):
     lc = x[0].lower() + x[1:]
@@ -820,13 +825,46 @@ def _reap_one(tok, dc, action, name, commit):
     return gone, None
 
 
+def _reap_sweep_type(tok, dc, x, stem, commit):
+    """Prefix-sweep one type: delete resources whose name starts with the lease-unique stem. Returns
+    (reaped, alerted). Errors (type not searchable this way) are silent — the audit layer covers it."""
+    h = _reap_handler(x)
+    extra = ", deleted: false" if h["soft"] else ""
+    qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
+          + ': "' + stem + '"' + extra + " }) { nodes { id name } } }")
+    data, errs = _gql(tok, dc, qy)
+    if errs:
+        return 0, 0
+    reaped = alerted = 0
+    for n in (data.get(h["list"]) or {}).get("nodes") or []:
+        nm = n.get("name") or ""
+        if not nm.startswith(stem):
+            continue
+        if not commit:
+            print(f"DRY-RUN would sweep {x} {nm!r} ({n['id'][:8]})")
+            reaped += 1
+            continue
+        _d, derr = _gql(tok, dc, "mutation { " + h["delete"] + '(input: { id: "' + n["id"] + '" }) { _stub } }')
+        if derr:
+            print(f"SWEEP-FAILED {x} {nm!r}: {derr[0]['message']}")
+            alerted += 1
+        else:
+            print(f"swept {x} {nm!r}")
+            reaped += 1
+    return reaped, alerted
+
+
 def cmd_reap(args):
-    """Reap a lab user's Wiz footprint from the audit log. DRY-RUN by default; --commit deletes.
-    Enumerates SUCCESS Create* by the user (--email/--account), maps each to delete<Type>({id}) via
-    exact-name correlation, and ALERTS on any type with no clean single match/handler. Audit-log lag
-    is minutes, so treat the completion-check run as best-effort and let the out-of-band sweep backstop
-    it; pair with `connector delete` / `user delete` for the known artifacts."""
+    """Reap a lab session's Wiz footprint. DRY-RUN by default; --commit deletes. Two layers, both
+    scoped to the lease (--account/AWS_ACCOUNT_ID): (1) audit-by-actor — SUCCESS Create* by the
+    ephemeral user, mapped to delete<Type>({id}) by exact name, catches free-form learner GUI creates;
+    (2) prefix sweep — delete any known-type resource named lab-<account>*, catches solve /
+    service-account creates the audit layer can't attribute. Best-effort; pair with `user delete`."""
+    account = _flag(args, "--account") or os.getenv("AWS_ACCOUNT_ID")
+    if not account:
+        die(2, "reap needs --account or AWS_ACCOUNT_ID")
     email = _flag(args, "--email") or _lab_user_email(args)[0]
+    stem = _lab_stem(account)
     minutes = int(_flag(args, "--last-min") or "1440")
     commit = "--commit" in args
     tok, dc, _ = token_and_dc()
@@ -838,8 +876,12 @@ def cmd_reap(args):
             alerted += 1
         elif did:
             reaped += 1
+    for x in _SWEEP_TYPES:
+        r, a = _reap_sweep_type(tok, dc, x, stem, commit)
+        reaped += r
+        alerted += a
     verb = "reaped" if commit else "to reap (dry-run)"
-    print(f"# {reaped} {verb}, {alerted} alert(s) for {email}", file=sys.stderr)
+    print(f"# {reaped} {verb}, {alerted} alert(s) for {email} / {stem}*", file=sys.stderr)
     sys.exit(0)
 
 
