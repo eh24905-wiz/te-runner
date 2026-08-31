@@ -2,7 +2,7 @@
 
 The one Docker image TE 2.0 labs reference (`te-labkit-v2/PRD.md` rock 2).
 Carries `wizlab` (`/usr/local/bin/wizlab`), the measured-facts catalog
-(`/opt/te/measurements.yaml`), AWS CLI v2, python 3.12, jq.
+(`/opt/te/measurements.yaml`), AWS CLI v2, Terraform 1.9.8, python 3.12, jq.
 
 Build: CI only — push a `v*` tag, Actions pushes
 `ghcr.io/wiz-training/te-runner:<tag>`. Labs pin the tag; never `latest`.

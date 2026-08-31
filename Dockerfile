@@ -12,6 +12,13 @@ RUN ARCH=$(uname -m) && \
     curl -sSf "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscli.zip && \
     unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
 
+# Terraform: labs stage CSP infra from a runner container (the native terraform resource has no
+# egress — te-labkit-v2 lab-patterns). Pinned; version bumps via a new image tag. HashiCorp names
+# archives amd64/arm64, so dpkg --print-architecture (not uname -m, which the AWS CLI uses).
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sSfL "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_${ARCH}.zip" -o /tmp/tf.zip && \
+    unzip -q /tmp/tf.zip -d /usr/local/bin && rm /tmp/tf.zip
+
 COPY wizlab/wizlab /usr/local/bin/wizlab
 COPY measurements.yaml /opt/te/measurements.yaml
 RUN chmod 755 /usr/local/bin/wizlab
