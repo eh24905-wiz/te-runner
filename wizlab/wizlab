@@ -19,6 +19,7 @@ import secrets
 import string
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -107,17 +108,26 @@ def _claims(tok):
     return json.loads(base64.urlsafe_b64decode(pad))
 
 
-def _post(url, data, headers):
+def _post(url, data, headers, attempts=3):
+    # Retry transient failures (transport + 5xx/429) with backoff so a momentary Wiz blip doesn't
+    # exit 3 and abort a fail-loud setup. 4xx (auth/bad request) is not transient — fail fast.
     payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
     req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")[:500]
-        die(3, f"HTTP {e.code} from {url}: {body}")
-    except Exception as e:
-        die(3, f"transport failure to {url}: {type(e).__name__}: {e}")
+    last = ""
+    for i in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:500]
+            if e.code < 500 and e.code != 429:
+                die(3, f"HTTP {e.code} from {url}: {body}")
+            last = f"HTTP {e.code} from {url}: {body}"
+        except Exception as e:
+            last = f"transport failure to {url}: {type(e).__name__}: {e}"
+        if i < attempts - 1:
+            time.sleep(2**i)  # 1s, 2s
+    die(3, f"after {attempts} attempts: {last}")
 
 
 def token_and_dc():
