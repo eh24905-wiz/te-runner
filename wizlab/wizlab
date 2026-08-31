@@ -712,6 +712,13 @@ def cmd_user_ensure(args):
     group = _flag(args, "--group") or "global-contributor"
     token = _kc_token(endpoint, admin_user, admin_pwd)
     pwd = _gen_password()
+    # Provenance for the out-of-band reaper: session_id joins to Instruqt labPlayReports (the done
+    # signal), wiz_tenant routes cleanup to the right tenant. Re-ensure refreshes both for a re-leased
+    # account. session_id is absent on a manual/grader run (INSTRUQT_SESSION_ID unset) — that's fine.
+    attrs = {"wiz_tenant": [os.getenv("WIZ_TENANT", "TBCMP")]}
+    sid = os.getenv("INSTRUQT_SESSION_ID")
+    if sid:
+        attrs["session_id"] = [sid]
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         status, body = _kc_call(
@@ -726,6 +733,7 @@ def cmd_user_ensure(args):
                 "emailVerified": True,
                 "enabled": True,
                 "requiredActions": [],
+                "attributes": attrs,
                 "credentials": [{"type": "password", "value": pwd, "temporary": False}],
             },
         )
@@ -742,6 +750,9 @@ def cmd_user_ensure(args):
         )
         if status not in (200, 204):
             die(3, f"reset-password HTTP {status}: {body[:300]!r}")
+        st, b = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}", token, {"attributes": attrs})
+        if st not in (200, 204):
+            die(3, f"attr-update HTTP {st}: {b[:300]!r}")
         action = "reset"
     gid = _kc_group_id(endpoint, realm, token, group)
     status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups/{gid}", token)
