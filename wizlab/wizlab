@@ -469,7 +469,10 @@ def _wiz_delegator():
 
 
 def _aws(*a):
-    return subprocess.run(["aws", *a], capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(["aws", *a], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die(3, "AWS CLI ('aws') not found in PATH")  # env error (3), not the main() catch-all's 2
 
 
 def cmd_role_inspect(args):
