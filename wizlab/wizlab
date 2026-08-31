@@ -112,9 +112,9 @@ def _post(url, data, headers, attempts=3):
     # Retry transient failures (transport + 5xx/429) with backoff so a momentary Wiz blip doesn't
     # exit 3 and abort a fail-loud setup. 4xx (auth/bad request) is not transient — fail fast.
     payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
-    req = urllib.request.Request(url, data=payload, headers=headers)
     last = ""
     for i in range(attempts):
+        req = urllib.request.Request(url, data=payload, headers=headers)  # fresh per attempt
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read())
@@ -167,6 +167,8 @@ def api(query, variables):
 
 
 def _targets(node, account_id):
+    if not account_id:  # empty id would make ":{}:" == "::" match any ARN — never match nothing
+        return False
     cfg = node.get("config") or {}
     if cfg.get("projectId") == account_id or cfg.get("subscriptionId") == account_id:
         return True
@@ -861,9 +863,8 @@ def _reap_find(tok, dc, h, name):
     # Returns (id_if_exactly_one, exact_count, error). Exact-name guard is load-bearing: list filters
     # are substring (measured on serviceAccounts.name), so a shared tenant demands ==1 before delete.
     extra = ", deleted: false" if h["soft"] else ""
-    esc = name.replace("\\", "\\\\").replace('"', '\\"')
     qy = ("query { " + h["list"] + "(first: 50, filterBy: { " + h["filter"]
-          + ': "' + esc + '"' + extra + " }) { nodes { id name } } }")
+          + ": " + json.dumps(name) + extra + " }) { nodes { id name } } }")
     data, errs = _gql(tok, dc, qy)
     if errs:
         return None, None, errs[0].get("message", "?")
@@ -900,7 +901,7 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
     h = _reap_handler(x)
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
-          + ': "' + stem + '"' + extra + " }) { nodes { id name } } }")
+          + ": " + json.dumps(stem) + extra + " }) { nodes { id name } } }")
     data, errs = _gql(tok, dc, qy)
     if errs:
         return 0, 0
@@ -955,7 +956,12 @@ def cmd_reap(args):
 
 
 def _flag(args, name):
-    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+    if name not in args:
+        return None
+    i = args.index(name)
+    if i + 1 >= len(args):
+        die(2, f"missing value for flag {name}")
+    return args[i + 1]
 
 
 VERBS = {
@@ -981,7 +987,14 @@ VERBS = {
 def main():
     if len(sys.argv) < 3 or (sys.argv[1], sys.argv[2]) not in VERBS:
         die(2, f"usage: wizlab {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
-    VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
+    # One structural guard: any uncaught exception is a bug/invocation error (2), never a raw
+    # traceback exiting 1 (which a learner check would read as "you're wrong").
+    try:
+        VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
+    except SystemExit:
+        raise
+    except Exception as e:
+        die(2, f"internal error: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
