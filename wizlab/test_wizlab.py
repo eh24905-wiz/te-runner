@@ -143,5 +143,24 @@ class RoleInspectGrading(unittest.TestCase):
         self.assertEqual(self._run(_proc(1, "", "NoSuchEntity: not found")), 1)
 
 
+class Naming(unittest.TestCase):
+    def test_stem_is_session_scoped(self):
+        self.assertEqual(wz._lab_stem("abc123"), "lab-abc123")
+
+    def test_session_id_from_flag_then_env(self):
+        self.assertEqual(wz._session_id(["--session", "flagid"]), "flagid")
+        with mock.patch.dict(wz.os.environ, {"INSTRUQT_SESSION_ID": "envid"}, clear=False):
+            self.assertEqual(wz._session_id([]), "envid")
+
+    def test_session_id_missing_is_invocation_error(self):
+        with mock.patch.dict(wz.os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as cm:
+                wz._session_id([])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_user_email_keyed_on_session(self):
+        self.assertEqual(wz._lab_user_email(["--session", "s1"])[0], "lab-s1@titra-labs.ai")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

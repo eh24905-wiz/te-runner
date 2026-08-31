@@ -335,12 +335,20 @@ def cmd_connector_inspect(args):
     sys.exit(0 if node["enabled"] and node["status"] in HEALTHY_STATUSES else 1)
 
 
-def _lab_stem(account):
-    # One naming convention for everything a lab creates or tells the learner to create:
-    # lab-<account>. The account is lease-unique, so this prefix is a safe, actor-independent reap
-    # key — a name-prefix sweep catches solve-created (service-account actor) and learner-created
-    # alike, which audit-by-actor cannot. Override the leading token with WIZLAB_SESSION_PREFIX.
-    return f"{os.getenv('WIZLAB_SESSION_PREFIX', 'lab')}-{account}"
+def _session_id(args):
+    # The lab session id: unique per play, injected as INSTRUQT_SESSION_ID, and the id labPlayReports
+    # returns — so the out-of-band reaper joins a stopped session straight to its objects by name.
+    sid = _flag(args, "--session") or os.getenv("INSTRUQT_SESSION_ID")
+    if not sid:
+        die(2, "need --session or INSTRUQT_SESSION_ID (the lab session id = naming + reap key)")
+    return sid
+
+
+def _lab_stem(session_id):
+    # Everything a lab creates (or tells the learner to create) is named lab-<session_id>: an
+    # actor-independent, per-session reap key the prefix sweep matches and labPlayReports keys on
+    # directly. Override the leading token with WIZLAB_SESSION_PREFIX.
+    return f"{os.getenv('WIZLAB_SESSION_PREFIX', 'lab')}-{session_id}"
 
 
 def cmd_connector_ensure(args):
@@ -358,7 +366,7 @@ def cmd_connector_ensure(args):
         api(UPDATE, {"input": {"id": n["id"], "patch": {"authParams": {"customerRoleARN": role_arn}}}})
         print(f"connector {n['name']}: customerRoleARN {cur or '(none)'} -> {role_arn}")
         sys.exit(0)
-    name = f"{_lab_stem(account)}-connector"
+    name = f"{_lab_stem(_session_id(args))}-connector"
     # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
     # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
     # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
@@ -642,13 +650,10 @@ def _gen_password(length=14):
 
 
 def _lab_user_email(args):
-    # Deterministic from the lease so `ensure` is idempotent and `delete` needs no stored state (v1
-    # kept the name in an agent var, which 2.0 drops). AWS_ACCOUNT_ID is the lease-stable seed here.
-    account = _flag(args, "--account") or os.getenv("AWS_ACCOUNT_ID")
-    if not account:
-        die(2, "user verbs need --account or AWS_ACCOUNT_ID (the lease-stable identity seed)")
+    # Deterministic from the session id so `ensure` is idempotent and `delete`/reap need no stored
+    # state — and the email carries the reaper's join key (lab-<session_id>@).
     domain = _flag(args, "--domain") or "titra-labs.ai"
-    stem = _lab_stem(account)
+    stem = _lab_stem(_session_id(args))
     return f"{stem}@{domain}", stem
 
 
@@ -712,13 +717,6 @@ def cmd_user_ensure(args):
     group = _flag(args, "--group") or "global-contributor"
     token = _kc_token(endpoint, admin_user, admin_pwd)
     pwd = _gen_password()
-    # Provenance for the out-of-band reaper: session_id joins to Instruqt labPlayReports (the done
-    # signal), wiz_tenant routes cleanup to the right tenant. Re-ensure refreshes both for a re-leased
-    # account. session_id is absent on a manual/grader run (INSTRUQT_SESSION_ID unset) — that's fine.
-    attrs = {"wiz_tenant": [os.getenv("WIZ_TENANT", "TBCMP")]}
-    sid = os.getenv("INSTRUQT_SESSION_ID")
-    if sid:
-        attrs["session_id"] = [sid]
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         status, body = _kc_call(
@@ -733,7 +731,6 @@ def cmd_user_ensure(args):
                 "emailVerified": True,
                 "enabled": True,
                 "requiredActions": [],
-                "attributes": attrs,
                 "credentials": [{"type": "password", "value": pwd, "temporary": False}],
             },
         )
@@ -750,9 +747,6 @@ def cmd_user_ensure(args):
         )
         if status not in (200, 204):
             die(3, f"reset-password HTTP {status}: {body[:300]!r}")
-        st, b = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}", token, {"attributes": attrs})
-        if st not in (200, 204):
-            die(3, f"attr-update HTTP {st}: {b[:300]!r}")
         action = "reset"
     gid = _kc_group_id(endpoint, realm, token, group)
     status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups/{gid}", token)
@@ -939,16 +933,14 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
 
 
 def cmd_reap(args):
-    """Reap a lab session's Wiz footprint. DRY-RUN by default; --commit deletes. Two layers, both
-    scoped to the lease (--account/AWS_ACCOUNT_ID): (1) audit-by-actor — SUCCESS Create* by the
-    ephemeral user, mapped to delete<Type>({id}) by exact name, catches free-form learner GUI creates;
-    (2) prefix sweep — delete any known-type resource named lab-<account>*, catches solve /
+    """Reap one lab session's Wiz footprint. DRY-RUN by default; --commit deletes. Scoped to the
+    session (--session/INSTRUQT_SESSION_ID): (1) audit-by-actor — SUCCESS Create* by the ephemeral
+    user lab-<session_id>@, mapped to delete<Type>({id}) by exact name, catches free-form learner GUI
+    creates; (2) prefix sweep — delete any known-type resource named lab-<session_id>*, catches solve /
     service-account creates the audit layer can't attribute. Best-effort; pair with `user delete`."""
-    account = _flag(args, "--account") or os.getenv("AWS_ACCOUNT_ID")
-    if not account:
-        die(2, "reap needs --account or AWS_ACCOUNT_ID")
+    sid = _session_id(args)
     email = _flag(args, "--email") or _lab_user_email(args)[0]
-    stem = _lab_stem(account)
+    stem = _lab_stem(sid)
     minutes = int(_flag(args, "--last-min") or "1440")
     commit = "--commit" in args
     tok, dc, _ = token_and_dc()
