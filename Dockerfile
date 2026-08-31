@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates git jq unzip less groff \
+      curl ca-certificates git jq unzip less groff openssh-server tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # AWS CLI v2 (arch-aware; pinning happens via the image tag, not here)

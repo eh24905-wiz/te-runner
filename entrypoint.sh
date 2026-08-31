@@ -1,17 +1,32 @@
 #!/bin/sh
-# Dev-only tailnet access. When TS_AUTHKEY is injected (dev tracks only), join the tailnet so an
-# operator can reach this grader for live iteration; learner tracks never set it, so no daemon runs
-# and no surface is exposed. Presence of the key is the switch. Never `set -e`: the grader must
-# reach its keepalive even if the mesh fails to come up.
+# Dev-only remote access. When TS_AUTHKEY is injected (dev tracks only), join the tailnet and open a
+# key-based sshd so an operator can reach this grader for live iteration; learner tracks set neither
+# secret, so nothing below runs and no surface is exposed. Never `set -e`: the grader must reach its
+# keepalive even if dev access fails to come up.
 if [ -n "${TS_AUTHKEY:-}" ]; then
-  # No TUN device in a container -> userspace networking. Ephemeral state: a fresh node per boot is
-  # correct for a throwaway dev lease.
+  # No TUN device in a container → userspace networking. Ephemeral state: a fresh node per boot is
+  # correct for a throwaway dev lease. Tailscale SSH is deliberately NOT used — it needs a TUN and
+  # hangs in userspace mode (proven 2026-08-31); we run a real sshd and reach it over the tailnet IP.
+  mkdir -p /var/run/tailscale
   tailscaled --tun=userspace-networking --state=mem: --socks5-server=localhost:1055 \
     >/var/log/tailscaled.log 2>&1 &
   i=0
   while [ ! -S /var/run/tailscale/tailscaled.sock ] && [ "$i" -lt 10 ]; do i=$((i + 1)); sleep 1; done
-  tailscale up --authkey "$TS_AUTHKEY" --hostname "${TS_HOSTNAME:-grader-dev}" --ssh \
+  tailscale up --authkey "$TS_AUTHKEY" --hostname "${TS_HOSTNAME:-grader-dev}" \
     || echo "tailscale up failed (see /var/log/tailscaled.log)" >&2
+
+  if [ -n "${TE_DEV_SSH_PUBKEY:-}" ]; then
+    install -d -m 700 /root/.ssh
+    printf '%s\n' "$TE_DEV_SSH_PUBKEY" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    ssh-keygen -A
+    mkdir -p /run/sshd
+    /usr/sbin/sshd
+  fi
+
+  # Persistent session that carries THIS process's injected env (WIZ_*/AWS/lease creds); a plain sshd
+  # session starts with a clean env, so attach here instead: `tmux attach -t dev`.
+  tmux new-session -d -s dev
 fi
 
 exec "$@"
