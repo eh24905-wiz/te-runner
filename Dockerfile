@@ -19,9 +19,19 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSfL "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_${ARCH}.zip" -o /tmp/tf.zip && \
     unzip -q /tmp/tf.zip -d /usr/local/bin && rm /tmp/tf.zip
 
+# Tailscale static binaries (dev-only mesh; entrypoint starts it only when TS_AUTHKEY is injected on
+# a dev track). Pinned; bump via a new image tag. tgz names amd64/arm64 → dpkg --print-architecture.
+RUN ARCH=$(dpkg --print-architecture) && TSVER=1.102.3 && \
+    curl -sSfL "https://pkgs.tailscale.com/stable/tailscale_${TSVER}_${ARCH}.tgz" -o /tmp/ts.tgz && \
+    tar -xzf /tmp/ts.tgz -C /tmp && \
+    mv "/tmp/tailscale_${TSVER}_${ARCH}/tailscale" "/tmp/tailscale_${TSVER}_${ARCH}/tailscaled" /usr/local/bin/ && \
+    rm -rf /tmp/ts.tgz "/tmp/tailscale_${TSVER}_${ARCH}"
+
 COPY wizlab/wizlab /usr/local/bin/wizlab
 COPY measurements.yaml /opt/te/measurements.yaml
 COPY reaper/reap_orphans.py /opt/reaper/reap_orphans.py
-RUN chmod 755 /usr/local/bin/wizlab
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 755 /usr/local/bin/wizlab /entrypoint.sh
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["sleep", "infinity"]
