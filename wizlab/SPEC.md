@@ -13,6 +13,7 @@ wrappers (one `wizlab` call + an exit-code remap). Change it only within this co
 | delete | remove one resource (reapers) |
 | verify | env/session health (check 1) |
 | reap | audit + prefix cleanup of a session's footprint |
+| tenant | (`wiz`) emit live tenant connector facts as `KEY=value` (+ `$EXEC_OUTPUT`) for a script/terraform; grow by adding keys, never removing |
 
 Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1.
 
