@@ -90,33 +90,32 @@ class ExitCodeContract(unittest.TestCase):
 
     def test_post_transport_retries_then_exit_3(self):
         op = mock.MagicMock(side_effect=urllib.error.URLError("boom"))
-        with mock.patch.object(wz.urllib.request, "urlopen", op), mock.patch.object(wz.time, "sleep"):
-            with self.assertRaises(SystemExit) as cm:
-                wz._post("https://x/", "d", {}, attempts=3)
+        with mock.patch.object(wz.urllib.request, "urlopen", op), mock.patch.object(wz.time, "sleep"), \
+             self.assertRaises(SystemExit) as cm:
+            wz._post("https://x/", "d", {}, attempts=3)
         self.assertEqual(cm.exception.code, 3)
         self.assertEqual(op.call_count, 3)  # retried, not one-shot
 
     def test_post_4xx_fails_fast(self):
         err = urllib.error.HTTPError("u", 400, "bad", None, io.BytesIO(b"nope"))
         op = mock.MagicMock(side_effect=err)
-        with mock.patch.object(wz.urllib.request, "urlopen", op), mock.patch.object(wz.time, "sleep"):
-            with self.assertRaises(SystemExit) as cm:
-                wz._post("https://x/", "d", {}, attempts=3)
+        with mock.patch.object(wz.urllib.request, "urlopen", op), mock.patch.object(wz.time, "sleep"), \
+             self.assertRaises(SystemExit) as cm:
+            wz._post("https://x/", "d", {}, attempts=3)
         self.assertEqual(cm.exception.code, 3)
         self.assertEqual(op.call_count, 1)  # 4xx is not transient — no retry
 
     def test_main_bad_verb_is_invocation_error(self):
-        with mock.patch.object(wz.sys, "argv", ["wizlab", "bogus", "verb"]):
-            with self.assertRaises(SystemExit) as cm:
-                wz.main()
+        with mock.patch.object(wz.sys, "argv", ["wizlab", "bogus", "verb"]), self.assertRaises(SystemExit) as cm:
+            wz.main()
         self.assertEqual(cm.exception.code, 2)
 
     def test_main_guards_uncaught_exception_as_2(self):
         boom = mock.MagicMock(side_effect=RuntimeError("kaboom"))
-        with mock.patch.dict(wz.VERBS, {("session", "verify"): boom}):
-            with mock.patch.object(wz.sys, "argv", ["wizlab", "session", "verify"]):
-                with self.assertRaises(SystemExit) as cm:
-                    wz.main()
+        with mock.patch.dict(wz.VERBS, {("session", "verify"): boom}), \
+             mock.patch.object(wz.sys, "argv", ["wizlab", "session", "verify"]), \
+             self.assertRaises(SystemExit) as cm:
+            wz.main()
         self.assertEqual(cm.exception.code, 2)  # bug, not a raw traceback exiting 1
 
 
@@ -126,9 +125,9 @@ class RoleInspectGrading(unittest.TestCase):
 
     def _run(self, aws_proc, delegator=DELEGATOR, tid=TID):
         with mock.patch.object(wz, "_aws", return_value=aws_proc), \
-             mock.patch.object(wz, "_wiz_delegator", return_value=(delegator, tid)):
-            with self.assertRaises(SystemExit) as cm:
-                wz.cmd_role_inspect([])
+             mock.patch.object(wz, "_wiz_delegator", return_value=(delegator, tid)), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_role_inspect([])
         return cm.exception.code
 
     def test_valid_trust_exit_0(self):
@@ -153,13 +152,58 @@ class Naming(unittest.TestCase):
             self.assertEqual(wz._session_id([]), "envid")
 
     def test_session_id_missing_is_invocation_error(self):
-        with mock.patch.dict(wz.os.environ, {}, clear=True):
-            with self.assertRaises(SystemExit) as cm:
-                wz._session_id([])
+        with mock.patch.dict(wz.os.environ, {}, clear=True), self.assertRaises(SystemExit) as cm:
+            wz._session_id([])
         self.assertEqual(cm.exception.code, 2)
 
     def test_user_email_keyed_on_session(self):
         self.assertEqual(wz._lab_user_email(["--session", "s1"])[0], "lab-s1@titra-labs.ai")
+
+
+class ConnectorAndReaperSafety(unittest.TestCase):
+    def _api(self, find_nodes, bytype_nodes=None):
+        def side(query, variables):
+            if query == wz.FIND:
+                return {"connectors": {"nodes": find_nodes}}, "tid"
+            if query == wz.BY_TYPE:
+                return {"connectors": {"nodes": bytype_nodes or []}}, "tid"
+            return {}, "tid"
+        return side
+
+    def test_find_connector_ranks_active_before_stale(self):
+        nodes = [
+            {"id": "e", "enabled": True, "status": "ERROR", "type": {"id": "aws"}, "config": {}},
+            {"id": "c", "enabled": True, "status": "CONNECTED", "type": {"id": "aws"}, "config": {}},
+        ]
+        with mock.patch.object(wz, "api", side_effect=self._api(nodes)):
+            self.assertEqual(wz.find_connector("111111111111")[0]["status"], "CONNECTED")
+
+    def test_find_connector_by_type_fallback_when_no_parent(self):
+        find = [{"id": "builtin", "type": {"id": "self-hosted"}, "config": {}}]  # no aws parent yet
+        bytype = [{"id": "a", "enabled": True, "status": "CONNECTED", "type": {"id": "aws"},
+                   "config": {"customerRoleARN": "arn:aws:iam::111111111111:role/WizAccess-Role"}}]
+        with mock.patch.object(wz, "api", side_effect=self._api(find, bytype)):
+            self.assertEqual([n["id"] for n in wz.find_connector("111111111111")], ["a"])
+
+    def test_reap_one_refuses_ambiguous_match(self):
+        # Shared-tenant safety: >1 name match must skip+alert, never delete — even with --commit.
+        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+             mock.patch.object(wz, "_reap_find", return_value=(None, 2, None)):
+            did, alert = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
+        self.assertFalse(did)
+        self.assertIn("matched 2", alert)
+
+    def test_kc_user_id_refuses_multiple_exact(self):
+        dup = json.dumps([{"id": "1", "username": "lab-s1@titra-labs.ai"},
+                          {"id": "2", "email": "lab-s1@titra-labs.ai"}])
+        with mock.patch.object(wz, "_kc_call", return_value=(200, dup)), self.assertRaises(SystemExit) as cm:
+            wz._kc_user_id("http://kc", "realm", "tok", "lab-s1@titra-labs.ai")
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_wiz_type_rejects_non_identifier(self):
+        with self.assertRaises(SystemExit) as cm:
+            wz.cmd_wiz_type(["--name", "Type; DROP"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":
