@@ -16,3 +16,4 @@ jobs:
       # Gate complexity so it can't regress; thresholds pass today (worst is cmd_role_inspect at D).
       - run: xenon --max-absolute D --max-average B wizlab/wizlab
       - run: radon cc wizlab/wizlab -s -a   # report in the log; xenon above is the gate
+      - run: python wizlab/test_wizlab.py   # exit-code contract + IAM parsing + flag/dispatch invariants

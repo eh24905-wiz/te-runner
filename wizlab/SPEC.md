@@ -33,5 +33,6 @@ A change qualifies only if ALL hold:
 
 ## Change process
 Propose → **operator approves** → update this spec → then implement. Default answer is no; the bar is
-general + API-level + fits the grammar. Gates: `ruff` + `xenon` (CI); cite `measurements.yaml`, never
-re-derive it.
+general + API-level + fits the grammar. Gates: `ruff` + `xenon` + `test_wizlab.py` (CI); cite
+`measurements.yaml`, never re-derive it. Tests lock the exit-code contract + IAM parsing — a refactor
+that stays green needs no lab re-play.
