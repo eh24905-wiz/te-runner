@@ -1,0 +1,32 @@
+name: reap-orphans
+# Out-of-band reaper: daily, finds stopped tagged lab sessions and reaps their Wiz footprint + Keycloak
+# user (via the baked-in reaper + wizlab). DRY-RUN by default — set repo variable REAP_COMMIT=true to
+# actually delete (do that only after reviewing a few dry-run logs).
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Delete (unchecked = dry-run)"
+        type: boolean
+        default: false
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    container: ghcr.io/eh24905-wiz/te-runner:v0.1.21 # the reaper-bearing tag; bump when the reaper changes
+    steps:
+      - name: reap orphans
+        env:
+          INSTRUQT_TOKEN: ${{ secrets.INSTRUQT_TOKEN }}
+          WIZ_TBCMP_CLIENT_ID: ${{ secrets.WIZ_TBCMP_CLIENT_ID }}
+          WIZ_TBCMP_CLIENT_SECRET: ${{ secrets.WIZ_TBCMP_CLIENT_SECRET }}
+          LAB_KEYCLOAK_ENDPOINT: ${{ secrets.LAB_KEYCLOAK_ENDPOINT }}
+          LAB_KEYCLOAK_REALM: ${{ secrets.LAB_KEYCLOAK_REALM }}
+          LAB_KEYCLOAK_ADMIN_USER: ${{ secrets.LAB_KEYCLOAK_ADMIN_USER }}
+          LAB_KEYCLOAK_ADMIN_PWD: ${{ secrets.LAB_KEYCLOAK_ADMIN_PWD }}
+        # --commit when the manual input asks, or when the repo variable REAP_COMMIT=true; else dry-run.
+        run: |
+          COMMIT=""
+          if [ "${{ inputs.commit }}" = "true" ] || [ "${{ vars.REAP_COMMIT }}" = "true" ]; then COMMIT="--commit"; fi
+          python /opt/reaper/reap_orphans.py $COMMIT

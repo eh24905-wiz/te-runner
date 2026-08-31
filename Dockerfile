@@ -21,6 +21,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 COPY wizlab/wizlab /usr/local/bin/wizlab
 COPY measurements.yaml /opt/te/measurements.yaml
+COPY reaper/reap_orphans.py /opt/reaper/reap_orphans.py
 RUN chmod 755 /usr/local/bin/wizlab
 
 CMD ["sleep", "infinity"]
