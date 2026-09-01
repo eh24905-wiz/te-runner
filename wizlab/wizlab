@@ -31,12 +31,22 @@ IDENTITY = """query ManagedIdentityParameters {
   managedIdentityParameters {
     aws { roleArn defaultEnvironment }
     gcp { serviceAccountEmail }
+    azure { commercial { appId } }
   }
 }"""
 _DELEGATOR_RE = re.compile(r"role/prod-[A-Za-z0-9_-]+-AssumeRoleDelegator", re.IGNORECASE)
 ROLE_NAME = "WizAccess-Role"
 HEALTHY_STATUSES = {"CONNECTED"}  # measured terminal state; INITIAL_SCANNING is transient, ERROR is failure
 CLOUDS = ("aws", "gcp", "azure")
+# Azure subscription ids are GUIDs, and Wiz stores them lowercase: an UPPERCASED id returns
+# totalCount 0 silently rather than erroring, which grades a healthy subscription as "nothing found".
+# AWS account ids are digits and GCP project ids are already lowercase, so normalising only things
+# shaped like a GUID is safe on every cloud.
+_GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _norm_account(account):
+    return account.lower() if _GUID_RE.match(account or "") else account
 
 # GCP grants Wiz nothing to assume: Wiz binds roles to its OWN managed service account, so the graded
 # state is the project's IAM policy, not a trust policy. These five built-ins are what the vendor
@@ -277,6 +287,7 @@ def cmd_wiz_tenant(args):
     data, tid = api(IDENTITY, {})
     aws = ((data.get("managedIdentityParameters") or {}).get("aws")) or {}
     gcp = ((data.get("managedIdentityParameters") or {}).get("gcp")) or {}
+    azure = ((data.get("managedIdentityParameters") or {}).get("azure")) or {}
     facts = {
         "WIZ_REMOTE_ARN": aws.get("roleArn") or "",     # the delegator Wiz assumes (per-tenant/dc)
         "WIZ_EXTERNAL_ID": tid or "",                    # tenant id == the role's sts:ExternalId
@@ -285,6 +296,9 @@ def cmd_wiz_tenant(args):
         # wiz_managed_identity_external_id. Its prod-<dc> segment is per-tenant AND per-data-center,
         # so a lab must feed this live value to terraform, never commit a literal.
         "WIZ_GCP_SERVICE_ACCOUNT": gcp.get("serviceAccountEmail") or "",
+        # Azure's Application (client) id. NOT the service-principal OBJECT id, which lives in the
+        # customer's own directory and is unknowable to Wiz — that one is an operator secret.
+        "WIZ_AZURE_APP_ID": ((azure.get("commercial") or {}).get("appId")) or "",
     }
     # Fatal only when the tenant yields NOTHING: a GCP-only lab must not die because this tenant has
     # no AWS managed identity, and vice versa. Callers assert the one key they need
@@ -392,7 +406,7 @@ def _stem_opt(args):
 
 def cmd_connector_inspect(args):
     cloud = _cloud(args)
-    account = _flag(args, "--account-id") or die(2, "connector inspect needs --account-id")
+    account = _norm_account(_flag(args, "--account-id") or die(2, "connector inspect needs --account-id"))
     require = _flag(args, "--require") or "exists"
     if require not in ("exists", "healthy"):
         die(2, f"--require must be exists|healthy, got {require}")
@@ -460,17 +474,42 @@ def _ensure_gcp(args, account):
     _create_connector(name, "gcp", {"isManagedIdentity": True, "project_id": account}, extra)
 
 
+def _ensure_azure(args, account):
+    """Create-if-absent, like GCP: an azure connector carries the subscription and Wiz's own managed
+    identity, so there is nothing that can drift. authParams shape is the readback of 89 live azure
+    connectors (isManagedIdentity on all 89, subscriptionId on the 55 at subscription scope) and v1's
+    live-proven create. The authParams/extraConfig BOUNDARY is inferred by analogy to aws+gcp:
+    testConnectorConfig answers success:true even for a bogus key, so it cannot prove the split."""
+    tenant_id = _flag(args, "--tenant-id") or os.getenv("ARM_TENANT_ID")
+    if not tenant_id:
+        die(2, "connector ensure --cloud azure needs --tenant-id (or ARM_TENANT_ID): the connector "
+               "stores the directory the subscription belongs to")
+    matches = find_connector(account, "azure", _stem_opt(args))
+    if matches:
+        print(f"connector {matches[0]['name']} already targets subscription {account}; nothing to do")
+        sys.exit(0)
+    # Subscription scope: every scope list present and EMPTY, not absent (readback of the live 89).
+    extra = {
+        "includedSubscriptions": [],
+        "excludedSubscriptions": [],
+        "includedManagementGroups": [],
+        "excludedManagementGroups": [],
+        "includedRegions": [],
+        "excludedRegions": [],
+    }
+    auth = {"isManagedIdentity": True, "subscriptionId": account, "tenantId": tenant_id}
+    _create_connector(f"{_lab_stem(_session_id(args))}-connector", "azure", auth, extra)
+
+
 def cmd_connector_ensure(args):
     """Idempotent converge: create the connector if absent, else correct its customerRoleARN if it
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
     cloud = _cloud(args)
-    account = _flag(args, "--account-id") or die(2, "connector ensure needs --account-id")
+    account = _norm_account(_flag(args, "--account-id") or die(2, "connector ensure needs --account-id"))
     if cloud == "gcp":
         _ensure_gcp(args, account)
     if cloud == "azure":
-        # inspect/delete are cloud-agnostic, but a create needs the Entra app + subscription auth
-        # params, unproven against a live Azure lease — refuse rather than send a guessed payload.
-        die(2, "connector ensure --cloud azure is not implemented (no proven authParams shape)")
+        _ensure_azure(args, account)
     role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
     matches = find_connector(account, cloud, _stem_opt(args))
     if matches:
@@ -491,7 +530,7 @@ def cmd_connector_ensure(args):
 
 def cmd_connector_delete(args):
     cloud = _cloud(args)
-    account = _flag(args, "--account-id") or die(2, "connector delete needs --account-id")
+    account = _norm_account(_flag(args, "--account-id") or die(2, "connector delete needs --account-id"))
     matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}; nothing to delete")
@@ -506,7 +545,7 @@ def cmd_instance_inspect(args):
     """Assert a scanned cloud resource of --type (default VIRTUAL_MACHINE) exists in Wiz for the
     account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check. Measured shape:
     cloudResources(filterBy subscriptionExternalId + type) on TS_PROD."""
-    account = _flag(args, "--account-id") or die(2, "instance inspect needs --account-id")
+    account = _norm_account(_flag(args, "--account-id") or die(2, "instance inspect needs --account-id"))
     rtype = _flag(args, "--type") or "VIRTUAL_MACHINE"
     data, _ = api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
     n = (data.get("cloudResources") or {}).get("totalCount") or 0
@@ -597,6 +636,56 @@ def _wiz_gcp_sa():
     return ((data.get("managedIdentityParameters") or {}).get("gcp") or {}).get("serviceAccountEmail") or ""
 
 
+def _az(*a):
+    try:
+        return subprocess.run(["az", *a], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die(3, "Azure CLI ('az') not found in PATH")  # env error (3), not the main() catch-all's 2
+
+
+def _wiz_azure_object_id():
+    """Wiz's service-principal OBJECT id in the CUSTOMER's directory. Unknowable to Wiz (its API
+    exposes only the Application id) and unreadable from the lease (the lookup is Microsoft Graph,
+    which Instruqt's Entra policy denies), so it is an operator secret — tenant-keyed exactly like
+    the client id/secret in token_and_dc()."""
+    tenant = os.getenv("WIZ_TENANT", "TBCMP")
+    oid = os.getenv(f"WIZ_{tenant}_AZURE_APP_OBJECT_ID") or os.getenv("WIZ_AZURE_APP_OBJECT_ID")
+    if not oid:
+        die(3, f"WIZ_{tenant}_AZURE_APP_OBJECT_ID not in environment (operator secret; not wired?)")
+    return oid
+
+
+AZURE_WIZ_ROLE = "WizCustomRole"  # the vendor module's default display name; labs override per session
+
+
+def _role_inspect_azure(args):
+    """The Azure twin of the GCP IAM-policy assertion: does the subscription actually grant Wiz's
+    service principal the ARM roles it needs? Wiz owns the App Registration in its own tenant, so
+    there is nothing for a learner to create in Entra — only role assignments to make."""
+    sub = _norm_account(_flag(args, "--account-id") or os.getenv("ARM_SUBSCRIPTION_ID"))
+    if not sub:
+        die(2, "role inspect --cloud azure needs --account-id <subscription id> (or ARM_SUBSCRIPTION_ID)")
+    custom = _flag(args, "--role-name") or AZURE_WIZ_ROLE
+    # --fill-principal-name false is NOT optional: it defaults TRUE and resolves names through
+    # Microsoft Graph, which Entra denies here — the call would fail for a reason unrelated to the
+    # learner's state (v1 passed only --assignee-object-id and would break on this lease).
+    res = _az("role", "assignment", "list", "--scope", f"/subscriptions/{sub}",
+              "--assignee-object-id", _wiz_azure_object_id(), "--fill-principal-name", "false",
+              "--query", "[].roleDefinitionName", "-o", "json")
+    if res.returncode != 0:
+        # No "not found" here means learner state: the subscription IS the lease, so any az failure
+        # (no session, denied, bad scope) is environment. Branch on the exit code, never on az's
+        # message text.
+        die(3, f"az role assignment list failed on /subscriptions/{sub}: {res.stderr.strip()}")
+    assigned = set(json.loads(res.stdout or "[]"))
+    missing = [r for r in ("Reader", custom) if r not in assigned]
+    if missing:
+        print(f"subscription {sub}: Wiz's service principal is missing {', '.join(missing)}")
+        sys.exit(1)
+    print(f"subscription {sub}: Wiz's service principal holds Reader and {custom}")
+    sys.exit(0)
+
+
 def _role_inspect_gcp(args):
     """The GCP twin of the AWS trust-policy assertion: does this project's IAM policy actually grant
     Wiz's managed SA the roles it needs to read the project? A project that grants nothing is exactly
@@ -632,7 +721,7 @@ def cmd_role_inspect(args):
     if cloud == "gcp":
         _role_inspect_gcp(args)
     if cloud == "azure":
-        die(2, "role inspect --cloud azure is not implemented (Entra app role assignment, unproven)")
+        _role_inspect_azure(args)
     role = _flag(args, "--role-name") or ROLE_NAME
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:

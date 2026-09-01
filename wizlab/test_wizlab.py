@@ -323,6 +323,72 @@ class ConnectorLookupLayers(unittest.TestCase):
         self.assertEqual(wz._stem_opt(["--session", "s1"]), "lab-s1")
 
 
+class AzureConnector(unittest.TestCase):
+    SUB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+    def test_uppercased_subscription_id_is_normalised(self):
+        # An uppercased GUID returns totalCount 0 from Wiz rather than an error, so a check would
+        # grade a healthy subscription as empty. AWS digits and GCP project ids pass through.
+        self.assertEqual(wz._norm_account(self.SUB.upper()), self.SUB)
+        self.assertEqual(wz._norm_account("111111111111"), "111111111111")
+        self.assertEqual(wz._norm_account("wiz-lab-42"), "wiz-lab-42")
+
+    def test_ensure_needs_a_tenant_id(self):
+        with mock.patch.dict(wz.os.environ, {}, clear=True), self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", self.SUB])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_ensure_payload_is_managed_identity_with_subscription_and_tenant(self):
+        created = {"createConnector": {"connector": {"id": "n", "name": "lab-s1-connector", "status": "INITIAL"}}}
+        with mock.patch.object(wz, "find_connector", return_value=[]), \
+             mock.patch.object(wz, "api", return_value=(created, "tid")) as api, \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", self.SUB,
+                                     "--tenant-id", "dir-1", "--session", "s1"])
+        self.assertEqual(cm.exception.code, 0)
+        payload = api.call_args[0][1]["input"]
+        self.assertEqual(payload["type"], "azure")
+        self.assertEqual(payload["authParams"],
+                         {"isManagedIdentity": True, "subscriptionId": self.SUB, "tenantId": "dir-1"})
+        self.assertEqual(len(payload["extraConfig"]), 6)
+        self.assertTrue(all(v == [] for v in payload["extraConfig"].values()))
+
+
+class AzureRoleInspect(unittest.TestCase):
+    SUB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    OID = "11111111-2222-3333-4444-555555555555"
+
+    def _run(self, proc, argv=None, env=None):
+        env = {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID} if env is None else env
+        with mock.patch.object(wz, "_az", return_value=proc) as az, \
+             mock.patch.dict(wz.os.environ, env, clear=True), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_role_inspect(argv or ["--cloud", "azure", "--account-id", self.SUB])
+        return cm.exception.code, az
+
+    def test_both_roles_assigned_exit_0(self):
+        code, az = self._run(_proc(0, json.dumps(["Reader", "WizCustomRole"])))
+        self.assertEqual(code, 0)
+        # --fill-principal-name false is load-bearing: the default resolves names via Graph, which
+        # Entra denies on this lease, so the call would fail for a non-learner reason.
+        self.assertIn("--fill-principal-name", az.call_args[0])
+        self.assertIn("false", az.call_args[0])
+
+    def test_missing_role_exit_1(self):
+        self.assertEqual(self._run(_proc(0, json.dumps(["Reader"])))[0], 1)
+
+    def test_session_scoped_custom_role_name(self):
+        argv = ["--cloud", "azure", "--account-id", self.SUB, "--role-name", "lab-s1-WizCustomRole"]
+        self.assertEqual(self._run(_proc(0, json.dumps(["Reader", "lab-s1-WizCustomRole"])), argv)[0], 0)
+        self.assertEqual(self._run(_proc(0, json.dumps(["Reader", "WizCustomRole"])), argv)[0], 1)
+
+    def test_az_failure_is_environment_3(self):
+        self.assertEqual(self._run(_proc(1, "", "AuthorizationFailed"))[0], 3)
+
+    def test_missing_operator_secret_is_environment_3(self):
+        self.assertEqual(self._run(_proc(0, "[]"), env={})[0], 3)
+
+
 class WizTenantFacts(unittest.TestCase):
     def _run(self, params, tid="tid-1"):
         with mock.patch.object(wz, "api", return_value=({"managedIdentityParameters": params}, tid)), \
