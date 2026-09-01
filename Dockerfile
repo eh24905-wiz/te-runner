@@ -19,6 +19,16 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSfL "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_${ARCH}.zip" -o /tmp/tf.zip && \
     unzip -q /tmp/tf.zip -d /usr/local/bin && rm /tmp/tf.zip
 
+# gcloud + az: native CSP CLIs alongside the AWS one (unpinned like it — the image tag is the pin).
+# gcloud from Google's apt repo; az via pip because Microsoft's apt repo trails new Debian codenames
+# and this image's python is the stable interpreter. Entrypoint logs both in from the injected env.
+RUN curl -sSf https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /usr/share/keyrings/cloud.google.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    apt-get update && apt-get install -y --no-install-recommends google-cloud-cli && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir azure-cli
+
 # Tailscale static binaries (dev-only mesh; entrypoint starts it only when TS_AUTHKEY is injected on
 # a dev track). Pinned; bump via a new image tag. tgz names amd64/arm64 → dpkg --print-architecture.
 RUN ARCH=$(dpkg --print-architecture) && TSVER=1.102.3 && \

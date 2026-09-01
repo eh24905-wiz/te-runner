@@ -29,4 +29,21 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   tmux new-session -d -s dev
 fi
 
+# Log the native CLIs in from the lease env (terraform-standard names) so gcloud/az work like the
+# AWS CLI does. Best-effort: a CLI login failing must not stop the grader. AWS needs nothing — the
+# CLI reads AWS_* directly.
+if [ -n "${GOOGLE_CREDENTIALS:-}" ] && command -v gcloud >/dev/null 2>&1; then
+  printf '%s' "$GOOGLE_CREDENTIALS" > /tmp/.gcp-sa.json
+  gcloud auth activate-service-account --key-file /tmp/.gcp-sa.json --quiet \
+    && rm -f /tmp/.gcp-sa.json \
+    || echo "gcloud service-account login failed" >&2
+  [ -n "${GOOGLE_PROJECT:-}" ] && gcloud config set project "$GOOGLE_PROJECT" --quiet
+fi
+if [ -n "${ARM_CLIENT_ID:-}" ] && command -v az >/dev/null 2>&1; then
+  az login --service-principal -u "$ARM_CLIENT_ID" -p "$ARM_CLIENT_SECRET" \
+    --tenant "$ARM_TENANT_ID" >/dev/null 2>&1 \
+    && az account set --subscription "$ARM_SUBSCRIPTION_ID" \
+    || echo "az service-principal login failed" >&2
+fi
+
 exec "$@"
