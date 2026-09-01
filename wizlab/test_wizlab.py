@@ -268,6 +268,61 @@ class CloudSelection(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class ConnectorLookupLayers(unittest.TestCase):
+    """The account LINK lags create by 1-2 min, so the fallbacks decide what a check reports during
+    the window a learner is most likely to click Check."""
+    GCP: typing.ClassVar = {"id": "g", "name": "lab-s1-connector", "enabled": True,
+                            "status": "CONNECTED", "type": {"id": "gcp"},
+                            "config": {"projectId": "proj-1"}}
+
+    def _api(self, find=None, search=None, bytype=None, total=0):
+        def side(query, variables):
+            if query == wz.FIND:
+                return {"connectors": {"nodes": find or []}}, "tid"
+            if query == wz.SEARCH:
+                return {"connectors": {"nodes": search or [], "totalCount": len(search or [])}}, "tid"
+            if query == wz.BY_TYPE:
+                return {"connectors": {"nodes": bytype or [], "totalCount": total}}, "tid"
+            return {}, "tid"
+        return side
+
+    def test_name_search_covers_the_pre_link_window(self):
+        # Nothing linked yet, but the stem finds it — and BY_TYPE is never consulted.
+        api = mock.MagicMock(side_effect=self._api(find=[], search=[self.GCP]))
+        with mock.patch.object(wz, "api", api):
+            self.assertEqual([n["id"] for n in wz.find_connector("proj-1", "gcp", "lab-s1")], ["g"])
+        self.assertNotIn(wz.BY_TYPE, [c[0][0] for c in api.call_args_list])
+
+    def test_search_result_must_still_target_the_account(self):
+        # A same-stem connector for a DIFFERENT project is not this lab's connector.
+        other = {**self.GCP, "config": {"projectId": "proj-2"}}
+        with mock.patch.object(wz, "api", side_effect=self._api(search=[other], total=1)):
+            self.assertEqual(wz.find_connector("proj-1", "gcp", "lab-s1"), [])
+
+    def test_search_ignores_child_deployments(self):
+        child = {"id": "c", "name": "GAR in lab-s1-connector", "enabled": True, "status": "CONNECTED",
+                 "type": {"id": "gar"}, "config": {"projectId": "proj-1"}}
+        with mock.patch.object(wz, "api", side_effect=self._api(search=[child, self.GCP])):
+            self.assertEqual([n["id"] for n in wz.find_connector("proj-1", "gcp", "lab-s1")], ["g"])
+
+    def test_beyond_the_page_is_environment_3_not_learner_1(self):
+        # Past BY_TYPE_PAGE, "no match" stops meaning "absent". Reporting 1 would tell a learner they
+        # did nothing; it would also let `ensure` create a duplicate of a connector it cannot see.
+        with mock.patch.object(wz, "api", side_effect=self._api(total=wz.BY_TYPE_PAGE + 1)), \
+             self.assertRaises(SystemExit) as cm:
+            wz.find_connector("proj-1", "gcp", None)
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_within_the_page_absence_is_still_learner_state(self):
+        with mock.patch.object(wz, "api", side_effect=self._api(total=wz.BY_TYPE_PAGE)):
+            self.assertEqual(wz.find_connector("proj-1", "gcp", None), [])
+
+    def test_stem_is_optional_and_never_dies(self):
+        with mock.patch.dict(wz.os.environ, {}, clear=True):
+            self.assertIsNone(wz._stem_opt([]))
+        self.assertEqual(wz._stem_opt(["--session", "s1"]), "lab-s1")
+
+
 class WizTenantFacts(unittest.TestCase):
     def _run(self, params, tid="tid-1"):
         with mock.patch.object(wz, "api", return_value=({"managedIdentityParameters": params}, tid)), \

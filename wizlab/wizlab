@@ -79,6 +79,26 @@ BY_TYPE = """query ConnectorsByType($t: [String!]) {
     totalCount
   }
 }"""
+BY_TYPE_PAGE = 100  # the page BY_TYPE asks for; past it, "not found" stops meaning "absent"
+
+# Server-side substring search on name (the Deployments page's own filter; `search` also backs the
+# reaper's prefix sweep). Bounded by the lab's own naming stem, so it has no page-size cliff — unlike
+# BY_TYPE. Verified live on TS_PROD: a full name and a half-name both matched, and it returns the
+# connector's CHILD deployments too ("GAR in <name>"), which is why _parents still filters by type.
+SEARCH = """query SearchConnectors($s: String!) {
+  connectors(filterBy: { search: $s }, first: 50) {
+    nodes {
+      id name enabled status
+      type { id }
+      config {
+        ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
+        ... on ConnectorConfigGCP { projectId: project_id }
+        ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
+      }
+    }
+    totalCount
+  }
+}"""
 
 CREATE = """mutation CreateConnector($input: CreateConnectorInput!) {
   createConnector(input: $input) { connector { id name status } }
@@ -199,23 +219,36 @@ def _parents(nodes, cloud):
     return [n for n in nodes if (n.get("type") or {}).get("id") == cloud]
 
 
-def find_connector(account_id, cloud="aws"):
+def find_connector(account_id, cloud="aws", stem=None):
     """Connectors whose OWN config targets the account, active-first.
 
-    Two lookups (ported from te-labkit connector.py:97, live-measured). cloudAccountExternalId
-    filters on the account LINK, which Wiz creates 1-2 min AFTER the connector, so a check run
-    right after create/onboarding won't match yet. The BY_TYPE fallback matches on the connector's
-    own customerRoleARN and doesn't depend on the link. Gate it on finding no PARENT, never on no
+    Three lookups, cheapest-and-most-correct first. Gate each on finding no PARENT, never on no
     nodes: Wiz attaches a builtin pseudo-connector to every account, so "no nodes" never occurs and
-    would silently retire the fallback — the exact bug that made delete miss a 3s-old connector.
-    Known gap: BY_TYPE caps at first:100, so in a tenant with >100 aws connectors a brand-new one
-    could be missed during the pre-link window; acceptable until measured to bite (v1 shipped 100)."""
+    would silently retire the fallbacks — the exact bug that made delete miss a 3s-old connector.
+
+    1. cloudAccountExternalId — the account LINK, which Wiz creates 1-2 min AFTER the connector, so a
+       check run right after create/onboarding won't match yet.
+    2. name search, when the caller knows this session's stem — server-side, bounded by a
+       session-unique name, so it covers the pre-link window with no page-size cliff.
+    3. BY_TYPE — matches the connector's own config for anything NOT named on the stem (a learner who
+       typed a different name, a pre-existing connector). This one pages at BY_TYPE_PAGE: past that,
+       "no match" no longer means "absent", so say so with exit 3 instead of reporting learner state.
+       Without that guard `ensure` would also create a duplicate of a connector it merely couldn't
+       see."""
     data, _ = api(FIND, {"ids": [account_id]})
     parents = _parents(((data.get("connectors") or {}).get("nodes")) or [], cloud)
-    if not parents:
-        data, _ = api(BY_TYPE, {"t": [cloud]})
+    if not parents and stem:
+        data, _ = api(SEARCH, {"s": stem})
         nodes = [n for n in (((data.get("connectors") or {}).get("nodes")) or []) if _targets(n, account_id)]
         parents = _parents(nodes, cloud)
+    if not parents:
+        data, _ = api(BY_TYPE, {"t": [cloud]})
+        conn = (data.get("connectors") or {})
+        nodes = [n for n in (conn.get("nodes") or []) if _targets(n, account_id)]
+        parents = _parents(nodes, cloud)
+        if not parents and (conn.get("totalCount") or 0) > BY_TYPE_PAGE:
+            die(3, f"tenant holds {conn['totalCount']} {cloud} connectors, more than the {BY_TYPE_PAGE} "
+                   f"this lookup can page; cannot prove whether one targets {account_id}")
     # An active connector outweighs a stale ERROR one left on a recycled account.
     return sorted(parents, key=lambda n: not (n.get("enabled") and n.get("status") != "ERROR"))
 
@@ -349,13 +382,21 @@ def _cloud(args):
     return cloud
 
 
+def _stem_opt(args):
+    """The session stem when it is knowable, else None. Unlike _session_id this never dies: a check
+    run by hand has no INSTRUQT_SESSION_ID, and the name-search layer is an optimisation, not a
+    requirement."""
+    sid = _flag(args, "--session") or os.getenv("INSTRUQT_SESSION_ID")
+    return _lab_stem(sid) if sid else None
+
+
 def cmd_connector_inspect(args):
     cloud = _cloud(args)
     account = _flag(args, "--account-id") or die(2, "connector inspect needs --account-id")
     require = _flag(args, "--require") or "exists"
     if require not in ("exists", "healthy"):
         die(2, f"--require must be exists|healthy, got {require}")
-    matches = find_connector(account, cloud)
+    matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}")
         sys.exit(1)
@@ -401,7 +442,7 @@ def _ensure_gcp(args, account):
     """GCP has nothing to converge: the connector carries a project id and Wiz's own managed identity,
     neither of which can drift the way an AWS customerRoleARN does (there is no customer-side role).
     So this is create-if-absent only — the repair path AWS needs has no GCP equivalent."""
-    matches = find_connector(account, "gcp")
+    matches = find_connector(account, "gcp", _stem_opt(args))
     if matches:
         print(f"connector {matches[0]['name']} already targets project {account}; nothing to do")
         sys.exit(0)
@@ -431,7 +472,7 @@ def cmd_connector_ensure(args):
         # params, unproven against a live Azure lease — refuse rather than send a guessed payload.
         die(2, "connector ensure --cloud azure is not implemented (no proven authParams shape)")
     role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
-    matches = find_connector(account, cloud)
+    matches = find_connector(account, cloud, _stem_opt(args))
     if matches:
         n = matches[0]
         cur = (n.get("config") or {}).get("customerRoleARN") or ""
@@ -451,7 +492,7 @@ def cmd_connector_ensure(args):
 def cmd_connector_delete(args):
     cloud = _cloud(args)
     account = _flag(args, "--account-id") or die(2, "connector delete needs --account-id")
-    matches = find_connector(account, cloud)
+    matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}; nothing to delete")
         sys.exit(0)
