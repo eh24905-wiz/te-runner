@@ -491,11 +491,13 @@ def cmd_role_inspect(args):
     role = _flag(args, "--role-name") or ROLE_NAME
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:
-        s = res.stderr.lower()
-        if any(t in s for t in ("invalidclienttokenid", "unrecognizedclienttokenid", "signaturedoesnotmatch")):
-            die(3, f"AWS auth failure probing role {role}: {res.stderr.strip()}")
-        print(f"role {role} not found")
-        sys.exit(1)
+        # NoSuchEntity is the ONLY failure meaning "not found" (learner state, 1). Everything else
+        # — missing/expired creds, network, AccessDenied — is environment (3): an allowlist of auth
+        # strings here once let "no credentials" grade as "learner wrong".
+        if "nosuchentity" in res.stderr.lower():
+            print(f"role {role} not found")
+            sys.exit(1)
+        die(3, f"aws iam get-role failed probing {role}: {res.stderr.strip()}")
     role_obj = json.loads(res.stdout or "{}").get("Role") or {}
     policy = _decode_trust_policy(role_obj.get("AssumeRolePolicyDocument"))
     if policy is None:

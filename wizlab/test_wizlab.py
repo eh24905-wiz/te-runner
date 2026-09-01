@@ -141,6 +141,12 @@ class RoleInspectGrading(unittest.TestCase):
     def test_missing_role_exit_1(self):
         self.assertEqual(self._run(_proc(1, "", "NoSuchEntity: not found")), 1)
 
+    def test_missing_creds_exit_3_not_1(self):
+        # Anything but NoSuchEntity is environment: "no credentials" must never grade as
+        # "learner wrong" (the v1 LIVENESS class).
+        self.assertEqual(self._run(_proc(255, "", "Unable to locate credentials")), 3)
+        self.assertEqual(self._run(_proc(255, "", "ExpiredToken: token is expired")), 3)
+
 
 class Naming(unittest.TestCase):
     def test_stem_is_session_scoped(self):
