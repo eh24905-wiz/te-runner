@@ -198,18 +198,33 @@ def token_and_dc():
     return tok, claims["dc"], claims.get("tid")
 
 
-def api(query, variables):
-    tok, dc, tid = token_and_dc()
-    res = _post(
-        f"https://api.{dc}.app.wiz.io/graphql",
-        {"query": query, "variables": variables},
-        {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
-    )
-    errors = res.get("errors") or []
-    data = res.get("data")
-    if errors and not any((data or {}).get(k) is not None for k in (data or {})):
-        die(3, "; ".join(e.get("message", "?") for e in errors))
-    return data or {}, tid
+# Wiz answers a transient fault as a GraphQL error with HTTP 200, so _post's 5xx retry never sees it.
+# Left unretried it became a learner-facing lie: a 500 on a `connector inspect` read exits 3, the
+# check wrapper remaps 3->1, and the learner is told "no connector targets this subscription" seconds
+# after creating one (observed once during azure-connector-101 validation).
+_TRANSIENT_GQL = ("internal server error", "temporarily unavailable", "service unavailable", "timeout")
+
+
+def api(query, variables, attempts=3):
+    for i in range(attempts):
+        tok, dc, tid = token_and_dc()
+        res = _post(
+            f"https://api.{dc}.app.wiz.io/graphql",
+            {"query": query, "variables": variables},
+            {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+        )
+        errors = res.get("errors") or []
+        data = res.get("data")
+        if not errors or any((data or {}).get(k) is not None for k in (data or {})):
+            return data or {}, tid
+        msg = "; ".join(e.get("message", "?") for e in errors)
+        # Reads only. A mutation that 500s may still have applied, so retrying could create a second
+        # connector — fail loud there and let the operator look.
+        is_read = query.lstrip().startswith("query")
+        if not (is_read and any(t in msg.lower() for t in _TRANSIENT_GQL)) or i == attempts - 1:
+            die(3, msg)
+        time.sleep(2**i)  # 1s, 2s
+    die(3, "unreachable")  # pragma: no cover
 
 
 def _targets(node, account_id):

@@ -268,6 +268,44 @@ class CloudSelection(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class TransientGraphqlErrors(unittest.TestCase):
+    """Wiz returns a transient fault as a GraphQL error with HTTP 200, so _post's 5xx retry never sees
+    it. Unretried, a read that 500s becomes "you didn't do the work" on a learner's screen."""
+
+    def _post_returning(self, *responses):
+        return mock.MagicMock(side_effect=list(responses))
+
+    def test_transient_read_error_is_retried_then_succeeds(self):
+        boom = {"errors": [{"message": "Internal server error"}], "data": None}
+        ok = {"data": {"connectors": {"totalCount": 1}}}
+        post = self._post_returning(boom, boom, ok)
+        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(wz, "_post", post), mock.patch.object(wz.time, "sleep"):
+            data, _ = wz.api("query Q { connectors { totalCount } }", {})
+        self.assertEqual(data["connectors"]["totalCount"], 1)
+        self.assertEqual(post.call_count, 3)
+
+    def test_a_mutation_is_never_retried(self):
+        # It may have applied; retrying could create a second connector.
+        boom = {"errors": [{"message": "Internal server error"}], "data": None}
+        post = self._post_returning(boom, boom, boom)
+        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(wz, "_post", post), mock.patch.object(wz.time, "sleep"), \
+             self.assertRaises(SystemExit) as cm:
+            wz.api("mutation M { createConnector { id } }", {})
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(post.call_count, 1)
+
+    def test_a_real_error_is_not_retried(self):
+        bad = {"errors": [{"message": "Resource not found"}], "data": None}
+        post = self._post_returning(bad, bad, bad)
+        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(wz, "_post", post), self.assertRaises(SystemExit) as cm:
+            wz.api("query Q { x }", {})
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(post.call_count, 1)
+
+
 class ConnectorLookupLayers(unittest.TestCase):
     """The account LINK lags create by 1-2 min, so the fallbacks decide what a check reports during
     the window a learner is most likely to click Check."""

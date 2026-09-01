@@ -139,6 +139,24 @@ planes:
       # so a challenge that grades "registered" must grade existence, not health (the --assert-exists
       # split). CONNECTED is Azure's healthy status; --assert-ok passes it.
       connected_min: 5.4
+      # Second observation (azure-connector-101 validation, identity-first): [2.6, 3.1] -- roughly
+      # 2.3m FASTER than the row above. Two runs disagree, so budget for the slower one; the spread
+      # itself is the finding, and a lab must not print a countdown either number implies.
+      connected_min_run2: [2.6, 3.1]
+      solver_budget_min: 8        # covers the slower observation + margin. Was absent entirely.
+    cloud_resources:
+      # The OLDER cloudResources plane -- the one `wizlab instance inspect` queries. Unmeasured on
+      # azure until the azure-connector-101 validation run. Distinct from cloud_resources_v2 below:
+      # do not reuse that budget for an `instance inspect` check.
+      vm_after_connected_min: [5.2, 6.3]   # first VIRTUAL_MACHINE 5.2-6.3m AFTER the connector hit CONNECTED
+      vm_after_create_min: [8.4, 9.4]      # ...i.e. 8.4-9.4m after connector create. n=1, 60s polls.
+      solver_budget_min: 20                # ceiling + margin; matches the gcp twin
+      # Azure is slightly FASTER than gcp on both legs (gcp: [5.5, 6.6] / [9.7, 10.7]).
+      # verify: `instance inspect --account-id <subscription id> --type VIRTUAL_MACHINE` -- exit 1 until >=1
+    role_assignment_apply:
+      # The vendor module's own gate, not a Wiz plane: time_sleep.wait_for_az_dataplane_custom_role
+      # has create_duration 360s, so the apply cannot finish faster than ~6m however small the change.
+      apply_min: 7.4              # measured 442s, 6 resources. n=1. Budget a task timeout well past it.
     graph_search:
       first_entity_min: 6.6       # the VM; connector virtualMachineCount went 0->1 by +7.2m
       solver_budget_min: 16       # VM at ~7m + margin; matches the aws graph budget. n=1, slower over time.
