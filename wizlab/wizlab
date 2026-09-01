@@ -28,11 +28,27 @@ AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 # The delegator ARN is per-tenant and its `prod-<dc>` segment varies by data center, so it is never
 # a constant — resolved live from managedIdentityParameters.aws.roleArn (v1 connector.py:934).
 IDENTITY = """query ManagedIdentityParameters {
-  managedIdentityParameters { aws { roleArn defaultEnvironment } }
+  managedIdentityParameters {
+    aws { roleArn defaultEnvironment }
+    gcp { serviceAccountEmail }
+  }
 }"""
 _DELEGATOR_RE = re.compile(r"role/prod-[A-Za-z0-9_-]+-AssumeRoleDelegator", re.IGNORECASE)
 ROLE_NAME = "WizAccess-Role"
 HEALTHY_STATUSES = {"CONNECTED"}  # measured terminal state; INITIAL_SCANNING is transient, ERROR is failure
+CLOUDS = ("aws", "gcp", "azure")
+
+# GCP grants Wiz nothing to assume: Wiz binds roles to its OWN managed service account, so the graded
+# state is the project's IAM policy, not a trust policy. These five built-ins are what the vendor
+# module binds under its defaults (fetcher_roles_standard, module build 2696 main.tf:7-14) and what
+# the manual guide tells a customer to bind by hand — so asserting exactly these accepts both paths.
+GCP_WIZ_ROLES = (
+    "roles/viewer",
+    "roles/browser",
+    "roles/iam.securityReviewer",
+    "roles/cloudasset.viewer",
+    "roles/serviceusage.serviceUsageViewer",
+)
 
 FIND = """query FindConnector($ids: [String!]) {
   connectors(filterBy: { cloudAccountExternalId: $ids }, first: 10) {
@@ -227,15 +243,22 @@ def cmd_wiz_tenant(args):
     only what they know). To $EXEC_OUTPUT too, for a note/HCL ref."""
     data, tid = api(IDENTITY, {})
     aws = ((data.get("managedIdentityParameters") or {}).get("aws")) or {}
+    gcp = ((data.get("managedIdentityParameters") or {}).get("gcp")) or {}
     facts = {
         "WIZ_REMOTE_ARN": aws.get("roleArn") or "",     # the delegator Wiz assumes (per-tenant/dc)
         "WIZ_EXTERNAL_ID": tid or "",                    # tenant id == the role's sts:ExternalId
         "WIZ_AWS_ENV": aws.get("defaultEnvironment") or "",
+        # GCP's whole Wiz-side identity: the SA the vendor TF module takes as
+        # wiz_managed_identity_external_id. Its prod-<dc> segment is per-tenant AND per-data-center,
+        # so a lab must feed this live value to terraform, never commit a literal.
+        "WIZ_GCP_SERVICE_ACCOUNT": gcp.get("serviceAccountEmail") or "",
     }
-    if not facts["WIZ_REMOTE_ARN"]:
-        die(3, "managedIdentityParameters.aws.roleArn is empty; no delegator to emit")
-    if not facts["WIZ_EXTERNAL_ID"]:
-        die(3, "no tenant id (tid) in token; cannot emit external-id")
+    # Fatal only when the tenant yields NOTHING: a GCP-only lab must not die because this tenant has
+    # no AWS managed identity, and vice versa. Callers assert the one key they need
+    # (`: "${WIZ_GCP_SERVICE_ACCOUNT:?...}"`), which is also what "readers take only what they know"
+    # requires — emitting a key is this verb's job, needing it is the script's.
+    if not any(facts.values()):
+        die(3, "managedIdentityParameters returned no usable tenant facts (no aws roleArn, no gcp SA, no tid)")
     lines = "".join(f"{k}={v}\n" for k, v in facts.items() if v)
     sys.stdout.write(lines)
     out = os.getenv("EXEC_OUTPUT")
@@ -316,12 +339,23 @@ def cmd_audit_user(args):
     sys.exit(0)
 
 
+def _cloud(args):
+    # Defaults to aws so every pre-GCP lab keeps working unchanged. The default is also the trap it
+    # replaced: find_connector(cloud="aws") silently returned nothing for a live CONNECTED GCP
+    # project, i.e. a check that graded "learner did nothing" when the learner was done.
+    cloud = _flag(args, "--cloud") or "aws"
+    if cloud not in CLOUDS:
+        die(2, f"--cloud must be {'|'.join(CLOUDS)}, got {cloud}")
+    return cloud
+
+
 def cmd_connector_inspect(args):
+    cloud = _cloud(args)
     account = _flag(args, "--account-id") or die(2, "connector inspect needs --account-id")
     require = _flag(args, "--require") or "exists"
     if require not in ("exists", "healthy"):
         die(2, f"--require must be exists|healthy, got {require}")
-    matches = find_connector(account)
+    matches = find_connector(account, cloud)
     if not matches:
         print(f"no connector targets {account}")
         sys.exit(1)
@@ -351,12 +385,53 @@ def _lab_stem(session_id):
     return f"{os.getenv('WIZLAB_SESSION_PREFIX', 'lab')}-{session_id}"
 
 
+def _create_connector(name, cloud, auth, extra):
+    data, _ = api(
+        CREATE,
+        {"input": {"name": name, "type": cloud, "authParams": auth, "extraConfig": extra}},
+    )
+    c = (data.get("createConnector") or {}).get("connector") or {}
+    if not c:
+        die(3, "createConnector returned no connector")
+    print(f"created connector {c['name']} ({c['id']}) status={c['status']}")
+    sys.exit(0)
+
+
+def _ensure_gcp(args, account):
+    """GCP has nothing to converge: the connector carries a project id and Wiz's own managed identity,
+    neither of which can drift the way an AWS customerRoleARN does (there is no customer-side role).
+    So this is create-if-absent only — the repair path AWS needs has no GCP equivalent."""
+    matches = find_connector(account, "gcp")
+    if matches:
+        print(f"connector {matches[0]['name']} already targets project {account}; nothing to do")
+        sys.exit(0)
+    # Live-proven payload (v1 bricks/connector.py:499-508) and the readback shape of every live GCP
+    # connector: project scope means every scope list is empty, NOT absent.
+    extra = {
+        "projects": [],
+        "excludedProjects": [],
+        "includedFolders": [],
+        "excludedFolders": [],
+        "includedRegions": [],
+        "excludedRegions": [],
+    }
+    name = f"{_lab_stem(_session_id(args))}-connector"
+    _create_connector(name, "gcp", {"isManagedIdentity": True, "project_id": account}, extra)
+
+
 def cmd_connector_ensure(args):
     """Idempotent converge: create the connector if absent, else correct its customerRoleARN if it
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
+    cloud = _cloud(args)
     account = _flag(args, "--account-id") or die(2, "connector ensure needs --account-id")
+    if cloud == "gcp":
+        _ensure_gcp(args, account)
+    if cloud == "azure":
+        # inspect/delete are cloud-agnostic, but a create needs the Entra app + subscription auth
+        # params, unproven against a live Azure lease — refuse rather than send a guessed payload.
+        die(2, "connector ensure --cloud azure is not implemented (no proven authParams shape)")
     role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
-    matches = find_connector(account)
+    matches = find_connector(account, cloud)
     if matches:
         n = matches[0]
         cur = (n.get("config") or {}).get("customerRoleARN") or ""
@@ -370,27 +445,13 @@ def cmd_connector_ensure(args):
     # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
     # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
     # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
-    data, _ = api(
-        CREATE,
-        {
-            "input": {
-                "name": name,
-                "type": "aws",
-                "authParams": {"customerRoleARN": role_arn},
-                "extraConfig": {"skipOrganizationScan": True},
-            }
-        },
-    )
-    c = (data.get("createConnector") or {}).get("connector") or {}
-    if not c:
-        die(3, "createConnector returned no connector")
-    print(f"created connector {c['name']} ({c['id']}) status={c['status']}")
-    sys.exit(0)
+    _create_connector(name, "aws", {"customerRoleARN": role_arn}, {"skipOrganizationScan": True})
 
 
 def cmd_connector_delete(args):
+    cloud = _cloud(args)
     account = _flag(args, "--account-id") or die(2, "connector delete needs --account-id")
-    matches = find_connector(account)
+    matches = find_connector(account, cloud)
     if not matches:
         print(f"no connector targets {account}; nothing to delete")
         sys.exit(0)
@@ -483,11 +544,54 @@ def _aws(*a):
         die(3, "AWS CLI ('aws') not found in PATH")  # env error (3), not the main() catch-all's 2
 
 
+def _gcp(*a):
+    try:
+        return subprocess.run(["gcloud", *a], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        die(3, "gcloud CLI not found in PATH")  # env error (3), not the main() catch-all's 2
+
+
+def _wiz_gcp_sa():
+    data, _tid = api(IDENTITY, {})
+    return ((data.get("managedIdentityParameters") or {}).get("gcp") or {}).get("serviceAccountEmail") or ""
+
+
+def _role_inspect_gcp(args):
+    """The GCP twin of the AWS trust-policy assertion: does this project's IAM policy actually grant
+    Wiz's managed SA the roles it needs to read the project? A project that grants nothing is exactly
+    the state a learner reaches by opening the wizard and stopping."""
+    project = _flag(args, "--account-id") or os.getenv("GOOGLE_PROJECT")
+    if not project:
+        die(2, "role inspect --cloud gcp needs --account-id <project id> (or GOOGLE_PROJECT)")
+    sa = _wiz_gcp_sa()
+    if not sa:
+        die(3, "managedIdentityParameters.gcp.serviceAccountEmail is empty; no Wiz identity to check")
+    res = _gcp("projects", "get-iam-policy", project, "--format=json")
+    if res.returncode != 0:
+        # Unlike AWS get-role, there is no "not found" that means learner state: the project is the
+        # lease itself, so any failure here (no creds, denied, no such project) is environment (3).
+        die(3, f"gcloud projects get-iam-policy {project} failed: {res.stderr.strip()}")
+    member = f"serviceAccount:{sa}"
+    policy = json.loads(res.stdout or "{}")
+    bound = {b.get("role") for b in (policy.get("bindings") or []) if member in (b.get("members") or [])}
+    missing = [r for r in GCP_WIZ_ROLES if r not in bound]
+    if missing:
+        print(f"project {project}: Wiz identity is missing {', '.join(missing)}")
+        sys.exit(1)
+    print(f"project {project}: all {len(GCP_WIZ_ROLES)} Wiz roles bound to the tenant's managed identity")
+    sys.exit(0)
+
+
 def cmd_role_inspect(args):
     """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
     reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
     verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
     another data center's delegator looks almost identical and does not work."""
+    cloud = _cloud(args)
+    if cloud == "gcp":
+        _role_inspect_gcp(args)
+    if cloud == "azure":
+        die(2, "role inspect --cloud azure is not implemented (Entra app role assignment, unproven)")
     role = _flag(args, "--role-name") or ROLE_NAME
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:
@@ -531,6 +635,11 @@ def cmd_role_ensure(args):
     """Deploy WizAccess-Role's trust so Wiz can assume it. Trust-only by design: task 2's check
     verifies only the trust policy. Scan permissions (SecurityAudit / ViewOnlyAccess / inline) are
     task 3's need and unverified against TBCMP health — added when there's a live health signal."""
+    if _cloud(args) != "aws":
+        # No GCP twin by design: GCP's grant is custom-role creation + setIamPolicy, i.e. CSP
+        # provisioning, which SPEC.md §"What may NOT" keeps in Terraform
+        # (te-labkit-v2 template/infra/gcp/wiz-connector-roles). Fail loudly rather than no-op.
+        die(2, "role ensure is aws-only; on GCP the vendor Terraform module binds the roles")
     role = _flag(args, "--role-name") or ROLE_NAME
     delegator, tid = _wiz_delegator()
     if not delegator:

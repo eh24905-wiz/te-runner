@@ -6,6 +6,7 @@ import io
 import json
 import pathlib
 import types
+import typing
 import unittest
 import urllib.error
 from importlib.machinery import SourceFileLoader
@@ -210,6 +211,118 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             wz.cmd_wiz_type(["--name", "Type; DROP"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class CloudSelection(unittest.TestCase):
+    """The AWS-blindness this fixes failed in the worst direction: a live CONNECTED GCP connector
+    graded as "no connector targets", telling a learner they hadn't done what they had just done."""
+    GCP_NODE: typing.ClassVar = {"id": "g", "name": "lab-s1-connector", "enabled": True,
+                                 "status": "CONNECTED", "type": {"id": "gcp"},
+                                 "config": {"projectId": "wiz-lab-42"}}
+
+    def test_default_is_aws_and_bad_value_is_invocation_error(self):
+        self.assertEqual(wz._cloud([]), "aws")
+        self.assertEqual(wz._cloud(["--cloud", "gcp"]), "gcp")
+        with self.assertRaises(SystemExit) as cm:
+            wz._cloud(["--cloud", "oracle"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_gcp_connector_found_only_when_cloud_is_gcp(self):
+        with mock.patch.object(wz, "api", return_value=({"connectors": {"nodes": [self.GCP_NODE]}}, "tid")):
+            self.assertEqual([n["id"] for n in wz.find_connector("wiz-lab-42", "gcp")], ["g"])
+            self.assertEqual(wz.find_connector("wiz-lab-42", "aws"), [])  # the old bug, locked down
+
+    def test_gcp_inspect_healthy_exit_0(self):
+        with mock.patch.object(wz, "find_connector", return_value=[self.GCP_NODE]), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--require", "healthy"])
+        self.assertEqual(cm.exception.code, 0)
+
+    def test_gcp_ensure_is_create_if_absent_never_patch(self):
+        # No customerRoleARN equivalent to drift, so an existing connector is a no-op, not an update.
+        with mock.patch.object(wz, "find_connector", return_value=[self.GCP_NODE]), \
+             mock.patch.object(wz, "api") as api, self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
+        self.assertEqual(cm.exception.code, 0)
+        api.assert_not_called()
+
+    def test_gcp_create_payload_is_managed_identity_with_empty_scopes(self):
+        created = {"createConnector": {"connector": {"id": "n", "name": "lab-s1-connector", "status": "INITIAL"}}}
+        with mock.patch.object(wz, "find_connector", return_value=[]), \
+             mock.patch.object(wz, "api", return_value=(created, "tid")) as api, \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--session", "s1"])
+        self.assertEqual(cm.exception.code, 0)
+        payload = api.call_args[0][1]["input"]
+        self.assertEqual(payload["type"], "gcp")
+        self.assertEqual(payload["authParams"], {"isManagedIdentity": True, "project_id": "wiz-lab-42"})
+        self.assertTrue(all(v == [] for v in payload["extraConfig"].values()))
+        self.assertNotIn("customerRoleARN", json.dumps(payload))
+
+    def test_unproven_paths_refuse_rather_than_guess(self):
+        with self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", "sub-1"])
+        self.assertEqual(cm.exception.code, 2)
+        with self.assertRaises(SystemExit) as cm:  # provisioning belongs to terraform, not wizlab
+            wz.cmd_role_ensure(["--cloud", "gcp"])
+        self.assertEqual(cm.exception.code, 2)
+
+
+class WizTenantFacts(unittest.TestCase):
+    def _run(self, params, tid="tid-1"):
+        with mock.patch.object(wz, "api", return_value=({"managedIdentityParameters": params}, tid)), \
+             mock.patch.dict(wz.os.environ, {}, clear=True), \
+             mock.patch.object(wz.sys, "stdout", io.StringIO()) as out, \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_wiz_tenant([])
+        return cm.exception.code, out.getvalue()
+
+    def test_emits_gcp_service_account(self):
+        code, text = self._run({"aws": {}, "gcp": {"serviceAccountEmail": "wizabc@prod-us100.iam.gserviceaccount.com"}})
+        self.assertEqual(code, 0)
+        self.assertIn("WIZ_GCP_SERVICE_ACCOUNT=wizabc@prod-us100.iam.gserviceaccount.com", text)
+
+    def test_gcp_only_tenant_does_not_die_on_missing_aws_delegator(self):
+        # The coupling this replaced would have failed a GCP lab for an absent AWS fact.
+        code, text = self._run({"aws": {}, "gcp": {"serviceAccountEmail": "wizabc@prod-us100.iam.gserviceaccount.com"}})
+        self.assertEqual(code, 0)
+        self.assertNotIn("WIZ_REMOTE_ARN", text)  # empty facts are omitted, not emitted blank
+
+    def test_no_facts_at_all_is_environment_3(self):
+        # No aws delegator, no gcp SA AND no tid in the token — nothing a caller could consume.
+        self.assertEqual(self._run({"aws": {}, "gcp": {}}, tid=None)[0], 3)
+
+
+class GcpRoleInspect(unittest.TestCase):
+    SA = "wizdeadbeef@prod-us100.iam.gserviceaccount.com"
+
+    def _policy(self, roles, member=None):
+        member = member or f"serviceAccount:{self.SA}"
+        return json.dumps({"bindings": [{"role": r, "members": [member]} for r in roles]})
+
+    def _run(self, proc, sa=SA):
+        with mock.patch.object(wz, "_gcp", return_value=proc), \
+             mock.patch.object(wz, "_wiz_gcp_sa", return_value=sa), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_role_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
+        return cm.exception.code
+
+    def test_all_five_bound_exit_0(self):
+        self.assertEqual(self._run(_proc(0, self._policy(wz.GCP_WIZ_ROLES))), 0)
+
+    def test_one_missing_exit_1(self):
+        self.assertEqual(self._run(_proc(0, self._policy(wz.GCP_WIZ_ROLES[:-1]))), 1)
+
+    def test_bound_to_a_different_member_exit_1(self):
+        other = self._policy(wz.GCP_WIZ_ROLES, member="user:someone@example.com")
+        self.assertEqual(self._run(_proc(0, other)), 1)
+
+    def test_gcloud_failure_is_environment_3(self):
+        # No "not found" here means learner state: the project IS the lease, so any failure is env.
+        self.assertEqual(self._run(_proc(1, "", "PERMISSION_DENIED")), 3)
+
+    def test_empty_tenant_sa_is_environment_3(self):
+        self.assertEqual(self._run(_proc(0, self._policy(wz.GCP_WIZ_ROLES)), sa=""), 3)
 
 
 if __name__ == "__main__":
