@@ -79,6 +79,22 @@ planes:
       #   wizlab connector inspect --account-id <acct> --require healthy   # exit 1 until CONNECTED
 
   gcp:
+    connector_health:
+      # Measured IDENTITY-FIRST (vendor TF module binds the 5 fetcher roles to Wiz's managed SA, THEN
+      # the connector is created) -- the gcp-connector-101 flow. GCP grants Wiz's OWN service account,
+      # so there is no role to assume and no ERROR-on-missing-trust state to pass through.
+      connected_min: [3.6, 4.2]    # last INITIAL_SCANNING at +3.6m, CONNECTED by +4.2m. n=1, 30s polls.
+      solver_budget_min: 7         # observed ceiling + margin; the connector converges alone, no rescan.
+      # verify: apply template/infra/gcp/wiz-connector-roles, `connector ensure --cloud gcp
+      #   --account-id <project id>`, then poll `connector inspect --cloud gcp --require healthy`
+    cloud_resources:
+      # The OLDER cloudResources plane -- the one `wizlab instance inspect` actually queries, which was
+      # unmeasured on every cloud until this run. Distinct from cloud_resources_v2 below: do not reuse
+      # that block's budget for an `instance inspect` check.
+      vm_after_connected_min: [5.5, 6.6]   # first VIRTUAL_MACHINE 5.5-6.6m AFTER the connector hit CONNECTED
+      vm_after_create_min: [9.7, 10.7]     # ...i.e. 9.7-10.7m after connector create. n=1, 60s polls.
+      solver_budget_min: 20                # ceiling + margin; 28 (crv2) is the conservative fallback
+      # verify: `instance inspect --account-id <project id> --type VIRTUAL_MACHINE` -- exit 1 until >=1
     graph_search:
       first_entity_min: 1.2
       plateau_min: 17.4
