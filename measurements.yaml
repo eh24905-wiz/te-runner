@@ -181,7 +181,7 @@ planes:
       python3 bricks/connector.py --cloud azure create --account-id <sub> --tenant-id <arm-tenant>
       # then poll status (CONNECTED) and `resource --external-id <lower(vm-arm-id)>` from create time
   sensor:
-    # Cloudless Runtime-Sensor lab (te-aws-sensor-101): the sensor installs on an Instruqt `vm`
+    # Cloudless Runtime-Sensor lab (te-wiz-sensor-101): the sensor installs on an Instruqt `vm`
     # sandbox (real kernel + systemd -- a container cannot run its engine) and grades on the
     # `sensors`/`detections` planes, keyed by name = VM hostname = lab-<session_id>. n=1, one live
     # play (session s3sd84thneqa, 2026-09-02). SensorStatus is ACTIVE/INACTIVE only.
@@ -195,7 +195,7 @@ planes:
       # Grade the Detection plane scoped by sensorId (resolved from name), keyed on matchedRuleName +
       # type. Never a rule id (tenant-specific) and never a Threat/Issue (tenant-wide anti-burst cap).
     verify: |
-      # On a connected te-aws-sensor-101 play, from the grader (dev access on, SSH to the vm):
+      # On a connected te-wiz-sensor-101 play, from the grader (dev access on, SSH to the vm):
       wizlab sensor ensure   # mint type:SENSOR SA; install on the vm with WIZ_API_CLIENT_ID/SECRET
       wizlab sensor inspect --require active                                             # -> 3.6m
       # trigger `cat /proc/$$/mem` on the vm, then:
