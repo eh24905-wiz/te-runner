@@ -15,6 +15,7 @@ Queries and auth are mined from te-labkit/bricks/connector.py (proven on live le
 import json
 import os
 import re
+from collections import namedtuple
 import secrets
 import string
 import subprocess
@@ -278,11 +279,41 @@ def find_connector(account_id, cloud="aws", stem=None):
     return sorted(parents, key=lambda n: not (n.get("enabled") and n.get("status") != "ERROR"))
 
 
+_CSP_REQUIRED_VARS = {
+    "aws":   ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+    "gcp":   ["GOOGLE_CREDENTIALS", "GOOGLE_PROJECT"],
+    "azure": ["ARM_CLIENT_ID", "ARM_CLIENT_SECRET", "ARM_TENANT_ID", "ARM_SUBSCRIPTION_ID"],
+}
+
+
+def _verify_csp(cloud):
+    missing = [v for v in _CSP_REQUIRED_VARS[cloud] if not os.getenv(v)]
+    if missing:
+        die(3, f"CSP credentials missing from environment: {', '.join(missing)}")
+    if cloud == "aws":
+        r = _aws("sts", "get-caller-identity")
+        if r.returncode != 0:
+            die(3, f"aws sts get-caller-identity failed: {r.stderr.strip()}")
+    elif cloud == "gcp":
+        r = _gcp("auth", "list", "--format=json")
+        if r.returncode != 0:
+            die(3, f"gcloud auth list failed: {r.stderr.strip()}")
+    elif cloud == "azure":
+        r = _az("account", "show")
+        if r.returncode != 0:
+            die(3, f"az account show failed: {r.stderr.strip()}")
+
+
 def cmd_session_verify(args):
     _tok, dc, tid = token_and_dc()
     # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is proven
     # (FIND uses it). This confirms the token is accepted by the API, not just minted by auth.
     api("query { connectors(first: 1) { totalCount } }", {})
+    cloud = _flag(args, "--cloud")
+    if cloud:
+        if cloud not in _CSP_REQUIRED_VARS:
+            die(2, f"session verify --cloud: unknown value {cloud!r}; choose aws, gcp, azure")
+        _verify_csp(cloud)
     print(f"ok: authenticated to dc={dc} tenant={tid}")
     sys.exit(0)
 
@@ -299,10 +330,8 @@ def cmd_wiz_tenant(args):
     per-tenant values. A script `eval`s stdout to feed a terraform apply (the Wiz connector-role
     module needs remote-arn + external-id). One call, one auth; grow it by adding keys (readers take
     only what they know). To $EXEC_OUTPUT too, for a note/HCL ref."""
-    data, tid = api(IDENTITY, {})
-    aws = ((data.get("managedIdentityParameters") or {}).get("aws")) or {}
-    gcp = ((data.get("managedIdentityParameters") or {}).get("gcp")) or {}
-    azure = ((data.get("managedIdentityParameters") or {}).get("azure")) or {}
+    params, tid = _managed_identity()
+    aws, gcp, azure = params["aws"], params["gcp"], params["azure"]
     facts = {
         "WIZ_REMOTE_ARN": aws.get("roleArn") or "",     # the delegator Wiz assumes (per-tenant/dc)
         "WIZ_EXTERNAL_ID": tid or "",                    # tenant id == the role's sts:ExternalId
@@ -521,10 +550,11 @@ def cmd_connector_ensure(args):
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
     cloud = _cloud(args)
     account = _norm_account(_flag(args, "--account-id") or die(2, "connector ensure needs --account-id"))
+    # gcp/azure are create-if-absent (no ARN to drift); only aws falls through to the repair path.
     if cloud == "gcp":
-        _ensure_gcp(args, account)
+        return _ensure_gcp(args, account)
     if cloud == "azure":
-        _ensure_azure(args, account)
+        return _ensure_azure(args, account)
     role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
     matches = find_connector(account, cloud, _stem_opt(args))
     if matches:
@@ -626,36 +656,34 @@ def _external_ids(stmt):
     return out
 
 
-def _wiz_delegator():
+def _managed_identity():
     data, tid = api(IDENTITY, {})
-    arn = ((data.get("managedIdentityParameters") or {}).get("aws") or {}).get("roleArn") or ""
-    return arn, tid
+    params = data.get("managedIdentityParameters") or {}
+    return {"aws": params.get("aws") or {}, "gcp": params.get("gcp") or {}, "azure": params.get("azure") or {}}, tid
 
 
-def _aws(*a):
+def _wiz_delegator():
+    params, tid = _managed_identity()
+    return params["aws"].get("roleArn") or "", tid
+
+
+def _cli(binary, *a):
     try:
-        return subprocess.run(["aws", *a], capture_output=True, text=True, check=False)
+        return subprocess.run([binary, *a], capture_output=True, text=True, check=False)
     except FileNotFoundError:
-        die(3, "AWS CLI ('aws') not found in PATH")  # env error (3), not the main() catch-all's 2
+        die(3, f"{binary!r} not found in PATH")  # env error (3), not the main() catch-all's 2
 
 
-def _gcp(*a):
-    try:
-        return subprocess.run(["gcloud", *a], capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        die(3, "gcloud CLI not found in PATH")  # env error (3), not the main() catch-all's 2
+def _aws(*a): return _cli("aws", *a)
+def _gcp(*a): return _cli("gcloud", *a)
 
 
 def _wiz_gcp_sa():
-    data, _tid = api(IDENTITY, {})
-    return ((data.get("managedIdentityParameters") or {}).get("gcp") or {}).get("serviceAccountEmail") or ""
+    params, _tid = _managed_identity()
+    return params["gcp"].get("serviceAccountEmail") or ""
 
 
-def _az(*a):
-    try:
-        return subprocess.run(["az", *a], capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        die(3, "Azure CLI ('az') not found in PATH")  # env error (3), not the main() catch-all's 2
+def _az(*a): return _cli("az", *a)
 
 
 def _wiz_azure_object_id():
@@ -670,9 +698,6 @@ def _wiz_azure_object_id():
     return oid
 
 
-AZURE_WIZ_ROLE = "WizCustomRole"  # the vendor module's default display name; labs override per session
-
-
 def _role_inspect_azure(args):
     """The Azure twin of the GCP IAM-policy assertion: does the subscription actually grant Wiz's
     service principal the ARM roles it needs? Wiz owns the App Registration in its own tenant, so
@@ -680,7 +705,11 @@ def _role_inspect_azure(args):
     sub = _norm_account(_flag(args, "--account-id") or os.getenv("ARM_SUBSCRIPTION_ID"))
     if not sub:
         die(2, "role inspect --cloud azure needs --account-id <subscription id> (or ARM_SUBSCRIPTION_ID)")
-    custom = _flag(args, "--role-name") or AZURE_WIZ_ROLE
+    custom = _flag(args, "--role-name")
+    if not custom:
+        # No safe default: every lab uses a session-scoped name (lab-<session_id>-WizCustomRole).
+        # A fallback to any fixed string silently grades as 1 for every correctly-configured learner.
+        die(2, "role inspect --cloud azure requires --role-name <display-name> (session-scoped; no default is safe)")
     # --fill-principal-name false is NOT optional: it defaults TRUE and resolves names through
     # Microsoft Graph, which Entra denies here — the call would fail for a reason unrelated to the
     # learner's state (v1 passed only --assignee-object-id and would break on this lease).
@@ -734,9 +763,9 @@ def cmd_role_inspect(args):
     another data center's delegator looks almost identical and does not work."""
     cloud = _cloud(args)
     if cloud == "gcp":
-        _role_inspect_gcp(args)
+        return _role_inspect_gcp(args)
     if cloud == "azure":
-        _role_inspect_azure(args)
+        return _role_inspect_azure(args)
     role = _flag(args, "--role-name") or ROLE_NAME
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:
@@ -850,6 +879,18 @@ def _kc_token(endpoint, admin_user, admin_pwd):
     if not tok:
         die(3, "Keycloak admin token: no access_token returned")
     return tok
+
+
+# The setup every `user` verb shares: grader-only env, the per-lease email, an admin token. `name`
+# is the firstName only `ensure` needs; inspect/delete unpack it to `_`.
+_KcSession = namedtuple("_KcSession", "endpoint realm token email name")
+
+
+def _kc_session(args):
+    endpoint, realm, admin_user, admin_pwd = _kc_env()
+    email, name = _lab_user_email(args)
+    token = _kc_token(endpoint, admin_user, admin_pwd)
+    return _KcSession(endpoint, realm, token, email, name)
 
 
 def _kc_call(method, url, token, body=None):
@@ -968,10 +1009,8 @@ def cmd_user_ensure(args):
     """Create (or password-reset) the per-lease Keycloak user backing Wiz SSO, join it to the RBAC
     group, and publish WIZ_USER/WIZ_PWD. Reset on an existing user: Keycloak never returns the old
     password and the learner needs a working value."""
-    endpoint, realm, admin_user, admin_pwd = _kc_env()
-    email, name = _lab_user_email(args)
+    endpoint, realm, token, email, name = _kc_session(args)
     group = _flag(args, "--group") or "global-contributor"
-    token = _kc_token(endpoint, admin_user, admin_pwd)
     pwd = _gen_password()
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
@@ -1014,10 +1053,8 @@ def cmd_user_ensure(args):
 
 
 def cmd_user_inspect(args):
-    endpoint, realm, admin_user, admin_pwd = _kc_env()
-    email, _ = _lab_user_email(args)
+    endpoint, realm, token, email, _ = _kc_session(args)
     group = _flag(args, "--group") or "global-contributor"
-    token = _kc_token(endpoint, admin_user, admin_pwd)
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         print(f"no Keycloak user {email}")
@@ -1032,9 +1069,7 @@ def cmd_user_inspect(args):
 
 
 def cmd_user_delete(args):
-    endpoint, realm, admin_user, admin_pwd = _kc_env()
-    email, _ = _lab_user_email(args)
-    token = _kc_token(endpoint, admin_user, admin_pwd)
+    endpoint, realm, token, email, _ = _kc_session(args)
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         print(f"no Keycloak user {email}; nothing to delete")

@@ -77,6 +77,10 @@ planes:
       solver_budget_min: 5         # covers the observed ceiling + margin; the connector self-heals, no rescan.
       # verify: after `role ensure`, `connector ensure --account-id <acct>`, then poll
       #   wizlab connector inspect --account-id <acct> --require healthy   # exit 1 until CONNECTED
+      arn_patch_connected_min: [7, 9]  # REPAIR path only: ARN corrected on an existing ERROR connector →
+      # ERROR→INITIAL_SCANNING→CONNECTED. ~3-5x slower than role-first. n=1, aws-connector-repair-201
+      # validator run 2026-09-01 (acct 851725559513). Solver budget for the repair lab's condition 02
+      # should be >= 15 min (observed 13.5 min solve→re-check pass).
 
   gcp:
     connector_health:

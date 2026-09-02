@@ -79,6 +79,26 @@ class FlagParsing(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class CliHelper(unittest.TestCase):
+    def test_missing_binary_is_environment_3(self):
+        # FileNotFoundError must map to exit 3, not bubble as an uncaught exception (which would be 2).
+        with mock.patch.object(wz.subprocess, "run", side_effect=FileNotFoundError), \
+             self.assertRaises(SystemExit) as cm:
+            wz._cli("no-such-binary", "version")
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_aws_gcp_az_delegate_to_cli(self):
+        proc = _proc(0, "ok")
+        with mock.patch.object(wz, "_cli", return_value=proc) as cli:
+            wz._aws("sts", "get-caller-identity")
+            wz._gcp("auth", "list")
+            wz._az("account", "show")
+        calls = [c[0] for c in cli.call_args_list]
+        self.assertEqual(calls[0][0], "aws")
+        self.assertEqual(calls[1][0], "gcloud")
+        self.assertEqual(calls[2][0], "az")
+
+
 class ExitCodeContract(unittest.TestCase):
     def _urlopen_returning(self, body):
         cm = mock.MagicMock()
@@ -206,6 +226,16 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         with mock.patch.object(wz, "_kc_call", return_value=(200, dup)), self.assertRaises(SystemExit) as cm:
             wz._kc_user_id("http://kc", "realm", "tok", "lab-s1@titra-labs.ai")
         self.assertEqual(cm.exception.code, 3)
+
+    def test_kc_session_bundles_setup_in_field_order(self):
+        # The three user verbs unpack this positionally, so field ORDER is the contract: a swap of
+        # token/email would silently send the token as the lookup key.
+        with mock.patch.object(wz, "_kc_env", return_value=("http://kc", "realm", "admin", "pw")), \
+             mock.patch.object(wz, "_kc_token", return_value="tok"):
+            s = wz._kc_session(["--session", "s1"])
+        self.assertEqual((s.endpoint, s.realm, s.token), ("http://kc", "realm", "tok"))
+        self.assertEqual((s.email, s.name), ("lab-s1@titra-labs.ai", "lab-s1"))
+        self.assertEqual(tuple(s), ("http://kc", "realm", "tok", "lab-s1@titra-labs.ai", "lab-s1"))
 
     def test_wiz_type_rejects_non_identifier(self):
         with self.assertRaises(SystemExit) as cm:
@@ -396,12 +426,14 @@ class AzureRoleInspect(unittest.TestCase):
     SUB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     OID = "11111111-2222-3333-4444-555555555555"
 
+    DEFAULT_ARGV = ["--cloud", "azure", "--account-id", SUB, "--role-name", "WizCustomRole"]
+
     def _run(self, proc, argv=None, env=None):
         env = {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID} if env is None else env
         with mock.patch.object(wz, "_az", return_value=proc) as az, \
              mock.patch.dict(wz.os.environ, env, clear=True), \
              self.assertRaises(SystemExit) as cm:
-            wz.cmd_role_inspect(argv or ["--cloud", "azure", "--account-id", self.SUB])
+            wz.cmd_role_inspect(argv if argv is not None else self.DEFAULT_ARGV)
         return cm.exception.code, az
 
     def test_both_roles_assigned_exit_0(self):
@@ -411,6 +443,12 @@ class AzureRoleInspect(unittest.TestCase):
         # Entra denies on this lease, so the call would fail for a non-learner reason.
         self.assertIn("--fill-principal-name", az.call_args[0])
         self.assertIn("false", az.call_args[0])
+
+    def test_missing_role_name_flag_is_invocation_error(self):
+        with mock.patch.dict(wz.os.environ, {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID}, clear=True), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_role_inspect(["--cloud", "azure", "--account-id", self.SUB])
+        self.assertEqual(cm.exception.code, 2)
 
     def test_missing_role_exit_1(self):
         self.assertEqual(self._run(_proc(0, json.dumps(["Reader"])))[0], 1)
@@ -450,6 +488,52 @@ class WizTenantFacts(unittest.TestCase):
     def test_no_facts_at_all_is_environment_3(self):
         # No aws delegator, no gcp SA AND no tid in the token — nothing a caller could consume.
         self.assertEqual(self._run({"aws": {}, "gcp": {}}, tid=None)[0], 3)
+
+
+class SessionVerifyCsp(unittest.TestCase):
+    def _mock_wiz(self):
+        return mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid"))
+
+    def _mock_api(self):
+        return mock.patch.object(wz, "api", return_value=({"connectors": {"totalCount": 0}}, "tid"))
+
+    def test_no_cloud_skips_csp_probe(self):
+        with self._mock_wiz(), self._mock_api(), \
+             mock.patch.object(wz, "_aws") as csp, \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify([])
+        self.assertEqual(cm.exception.code, 0)
+        csp.assert_not_called()
+
+    def test_unknown_cloud_is_invocation_error(self):
+        with self._mock_wiz(), self._mock_api(), self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--cloud", "oracle"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_missing_csp_vars_exit_3(self):
+        with self._mock_wiz(), self._mock_api(), \
+             mock.patch.dict(wz.os.environ, {}, clear=True), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--cloud", "aws"])
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_csp_probe_failure_exit_3(self):
+        env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
+        with self._mock_wiz(), self._mock_api(), \
+             mock.patch.dict(wz.os.environ, env, clear=True), \
+             mock.patch.object(wz, "_aws", return_value=_proc(1, "", "ExpiredToken")), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--cloud", "aws"])
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_csp_probe_success_exit_0(self):
+        env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
+        with self._mock_wiz(), self._mock_api(), \
+             mock.patch.dict(wz.os.environ, env, clear=True), \
+             mock.patch.object(wz, "_aws", return_value=_proc(0, '{"Account": "123456789012"}')), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--cloud", "aws"])
+        self.assertEqual(cm.exception.code, 0)
 
 
 class GcpRoleInspect(unittest.TestCase):
