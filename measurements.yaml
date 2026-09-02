@@ -180,6 +180,27 @@ planes:
                                               # =true + wiz_app_object_id) + one centralus VM
       python3 bricks/connector.py --cloud azure create --account-id <sub> --tenant-id <arm-tenant>
       # then poll status (CONNECTED) and `resource --external-id <lower(vm-arm-id)>` from create time
+  sensor:
+    # Cloudless Runtime-Sensor lab (te-aws-sensor-101): the sensor installs on an Instruqt `vm`
+    # sandbox (real kernel + systemd -- a container cannot run its engine) and grades on the
+    # `sensors`/`detections` planes, keyed by name = VM hostname = lab-<session_id>. n=1, one live
+    # play (session s3sd84thneqa, 2026-09-02). SensorStatus is ACTIVE/INACTIVE only.
+    registration:
+      install_to_active_min: 3.6      # native install (systemd starts it) -> sensors(...).status ACTIVE
+      solver_budget_min: 12           # solve_wait_active polls to 720s -- wide margin over 3.6m
+    detection:
+      trigger_to_queryable_min: 1.2   # cat /proc/<pid>/mem -> detections(GENERATED_THREAT) totalCount>=1
+      match_only_lag_min: 0.05        # the MATCH_ONLY sibling lands with the GT (one keystroke, both rules)
+      solver_budget_min: 8            # solve_trigger polls to 480s
+      # Grade the Detection plane scoped by sensorId (resolved from name), keyed on matchedRuleName +
+      # type. Never a rule id (tenant-specific) and never a Threat/Issue (tenant-wide anti-burst cap).
+    verify: |
+      # On a connected te-aws-sensor-101 play, from the grader (dev access on, SSH to the vm):
+      wizlab sensor ensure   # mint type:SENSOR SA; install on the vm with WIZ_API_CLIENT_ID/SECRET
+      wizlab sensor inspect --require active                                             # -> 3.6m
+      # trigger `cat /proc/$$/mem` on the vm, then:
+      wizlab detection inspect --rule-name "Process memory dump via common utilities"    # GENERATED_THREAT
+      wizlab detection inspect --rule-name "Process memory data file was accessed" --match-only
 
 # ---------------------------------------------------------------------------------------------------
 # Per entity kind. `external_id` is the column that decides whether an equality test can work at all:
