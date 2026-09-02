@@ -15,7 +15,6 @@ Queries and auth are mined from te-labkit/bricks/connector.py (proven on live le
 import json
 import os
 import re
-from collections import namedtuple
 import secrets
 import string
 import subprocess
@@ -23,6 +22,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 
 AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 
@@ -127,6 +127,29 @@ UPDATE = """mutation UpdateConnector($input: UpdateConnectorInput!) {
 # subscriptionExternalId is the CSP account number (measured on TS_PROD); type is the Wiz graph type.
 INSTANCES = """query Instances($f: CloudResourceFilters) {
   cloudResources(first: 1, filterBy: $f) { totalCount }
+}"""
+
+# --- Runtime Sensor (connectorless). A type:SENSOR service account is the sensor's credential; the
+# installed sensor registers under the HOST name (a lab sets the host name to the session stem, so the
+# stem scopes both planes). Neither SensorFilters nor DetectionFilters carries a cloud-account/instance
+# field, so `search` by name is the only session key; detections then scope by the resolved sensorId.
+# Shapes introspected live on TS_PROD 2026-09-02 (createSA payload, DetectionType, SensorStatus). ---
+SA_FIND = """query FindSA($n: String!) {
+  serviceAccounts(first: 50, filterBy: { name: $n, deleted: false }) { nodes { id name } }
+}"""
+
+CREATE_SA = """mutation CreateSA($input: CreateServiceAccountInput!) {
+  createServiceAccount(input: $input) { serviceAccount { id name clientId clientSecret } }
+}"""
+
+SENSORS_Q = """query Sensors($s: String!) {
+  sensors(first: 50, filterBy: { search: $s }) { nodes { id name status type } totalCount }
+}"""
+
+# Default DetectionType is GENERATED_THREAT: the MATCH_ONLY sibling is invisible without the explicit
+# filter, which IS the track's Threats-vs-Detections lesson. sensorId scopes to one lab's sensor.
+DETECTIONS_Q = """query Dets($f: DetectionFilters) {
+  detections(first: 1, filterBy: $f) { totalCount }
 }"""
 
 # Schema-explorer spike: find the audit-log/activity query that could drive a reaper, and drill into
@@ -595,6 +618,109 @@ def cmd_instance_inspect(args):
     data, _ = api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
     n = (data.get("cloudResources") or {}).get("totalCount") or 0
     print(f"instance inspect: {n} {rtype} scanned in account {account}")
+    sys.exit(0 if n > 0 else 1)
+
+
+def _sensor_name(args):
+    # The installed sensor's name == the host name, which a lab pins to the session stem. So the stem
+    # is the sensor's scoping key; --name overrides for a manual/dev run.
+    return _flag(args, "--name") or _lab_stem(_session_id(args))
+
+
+def _sa_name(args):
+    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}-sensor"
+
+
+def _resolve_sensor(name):
+    """The sensor whose name exactly matches, ACTIVE-first (search is substring, so filter to ==)."""
+    data, _ = api(SENSORS_Q, {"s": name})
+    nodes = [n for n in ((data.get("sensors") or {}).get("nodes") or []) if n.get("name") == name]
+    return sorted(nodes, key=lambda n: n.get("status") != "ACTIVE")[0] if nodes else None
+
+
+def cmd_sensor_ensure(args):
+    """Create the type:SENSOR service account the Runtime Sensor authenticates with, named on the
+    session stem so the reaper sweeps it. Idempotent by name: the client secret is shown once and is
+    not re-fetchable, so a re-run reports the existing account rather than minting a duplicate. Emits
+    WIZ_API_CLIENT_ID / WIZ_API_CLIENT_SECRET (the install one-liner's own variable names) to stdout
+    and $EXEC_OUTPUT. Solve/setup only — never a learner check (it prints a secret)."""
+    name = _sa_name(args)
+    data, _ = api(SA_FIND, {"n": name})
+    exact = [n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name]
+    if exact:
+        print(f"service account {name} already exists ({exact[0]['id']}); secret not re-fetchable", file=sys.stderr)
+        sys.exit(0)
+    data, _ = api(CREATE_SA, {"input": {"name": name, "type": "SENSOR"}})
+    sa = (data.get("createServiceAccount") or {}).get("serviceAccount") or {}
+    cid, sec = sa.get("clientId"), sa.get("clientSecret")
+    if not cid or not sec:
+        die(3, "createServiceAccount returned no client credentials")
+    lines = f"WIZ_API_CLIENT_ID={cid}\nWIZ_API_CLIENT_SECRET={sec}\n"
+    sys.stdout.write(lines)
+    out = os.getenv("EXEC_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(lines)
+    print(f"created sensor service account {name} ({sa['id']})", file=sys.stderr)
+    sys.exit(0)
+
+
+def cmd_sensor_delete(args):
+    """Delete the sensor service account, by --id or (default) by the session-stem name. The reaper's
+    prefix sweep already covers ServiceAccount, so this is for a solve/explicit teardown."""
+    sid = _flag(args, "--id")
+    if not sid:
+        name = _sa_name(args)
+        data, _ = api(SA_FIND, {"n": name})
+        exact = [n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name]
+        if not exact:
+            print(f"no service account named {name}; nothing to delete")
+            sys.exit(0)
+        sid = exact[0]["id"]
+    api('mutation { deleteServiceAccount(input: { id: "' + sid + '" }) { _stub } }', {})
+    print(f"deleted service account {sid}")
+    sys.exit(0)
+
+
+def cmd_sensor_inspect(args):
+    """Assert the session's sensor is known to Wiz (--require exists) or reports Active (--require
+    active). SensorStatus is ACTIVE/INACTIVE only; a pre-Active sensor reads INACTIVE or is absent."""
+    name = _sensor_name(args)
+    require = _flag(args, "--require") or "exists"
+    if require not in ("exists", "active"):
+        die(2, f"--require must be exists|active, got {require}")
+    node = _resolve_sensor(name)
+    if not node:
+        print(f"no sensor named {name}")
+        sys.exit(1)
+    print(f"sensor {node['name']} ({node['id']}): status={node['status']} type={node['type']}")
+    if require == "exists":
+        sys.exit(0)
+    sys.exit(0 if node["status"] == "ACTIVE" else 1)
+
+
+def cmd_detection_inspect(args):
+    """Assert >=1 detection for --rule-name on the session's sensor. Default type GENERATED_THREAT;
+    --match-only queries the MATCH_ONLY side (the rule that matched and raised no threat). Keyed on
+    matchedRuleName + type + the resolved sensorId — never a rule id (tenant-specific) and never an
+    Issue/Threat object (tenant-wide anti-burst cap)."""
+    name = _sensor_name(args)
+    rule = _flag(args, "--rule-name") or die(2, "detection inspect needs --rule-name")
+    dtype = "MATCH_ONLY" if "--match-only" in args else "GENERATED_THREAT"
+    minutes = int(_flag(args, "--since-minutes") or "120")
+    node = _resolve_sensor(name)
+    if not node:
+        print(f"no sensor named {name}; cannot scope detections")
+        sys.exit(1)
+    f = {
+        "sensorId": {"equals": [node["id"]]},
+        "matchedRuleName": {"equals": [rule]},
+        "type": {"equals": [dtype]},
+        "startedAt": {"inLast": {"amount": minutes, "unit": "DurationFilterValueUnitMinutes"}},
+    }
+    data, _ = api(DETECTIONS_Q, {"f": f})
+    n = (data.get("detections") or {}).get("totalCount") or 0
+    print(f"detection inspect: {n} {dtype} for rule {rule!r} on sensor {name} ({node['id']})")
     sys.exit(0 if n > 0 else 1)
 
 
@@ -1267,6 +1393,10 @@ VERBS = {
     ("connector", "ensure"): cmd_connector_ensure,
     ("connector", "delete"): cmd_connector_delete,
     ("instance", "inspect"): cmd_instance_inspect,
+    ("sensor", "ensure"): cmd_sensor_ensure,
+    ("sensor", "delete"): cmd_sensor_delete,
+    ("sensor", "inspect"): cmd_sensor_inspect,
+    ("detection", "inspect"): cmd_detection_inspect,
     ("role", "inspect"): cmd_role_inspect,
     ("role", "ensure"): cmd_role_ensure,
     ("user", "ensure"): cmd_user_ensure,

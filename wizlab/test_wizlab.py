@@ -568,5 +568,62 @@ class GcpRoleInspect(unittest.TestCase):
         self.assertEqual(self._run(_proc(0, self._policy(wz.GCP_WIZ_ROLES)), sa=""), 3)
 
 
+class SensorDetectionGrading(unittest.TestCase):
+    ACTIVE = [{"id": "s1", "name": "lab-x", "status": "ACTIVE", "type": "LINUX_VIRTUAL_MACHINE"}]
+
+    def _api(self, sensor_nodes, det_count=0):
+        def side(query, variables):
+            if "sensors(" in query:
+                return {"sensors": {"nodes": sensor_nodes, "totalCount": len(sensor_nodes)}}, "tid"
+            if "detections(" in query:
+                return {"detections": {"totalCount": det_count}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _exit(self, fn, argv, side):
+        with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code
+
+    def test_sensor_inspect_exists(self):
+        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 0)
+
+    def test_sensor_inspect_active_vs_inactive(self):
+        self.assertEqual(
+            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "active"], self._api(self.ACTIVE)), 0)
+        inactive = [{"id": "s1", "name": "lab-x", "status": "INACTIVE", "type": "x"}]
+        self.assertEqual(
+            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "active"], self._api(inactive)), 1)
+
+    def test_sensor_inspect_absent_exit_1(self):
+        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api([])), 1)
+
+    def test_sensor_inspect_bad_require_exit_2(self):
+        self.assertEqual(
+            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "bogus"], self._api(self.ACTIVE)), 2)
+
+    def test_sensor_name_matches_exactly_not_substring(self):
+        # `search` is substring server-side, so a longer name that merely contains the stem must NOT
+        # match — else a neighbour session's sensor grades this one.
+        other = [{"id": "s2", "name": "lab-xyz", "status": "ACTIVE", "type": "x"}]
+        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api(other)), 1)
+
+    def test_detection_hit_exit_0(self):
+        self.assertEqual(
+            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api(self.ACTIVE, 3)), 0)
+
+    def test_detection_none_exit_1(self):
+        self.assertEqual(
+            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api(self.ACTIVE, 0)), 1)
+
+    def test_detection_no_sensor_exit_1(self):
+        self.assertEqual(
+            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api([])), 1)
+
+    def test_detection_missing_rule_exit_2(self):
+        self.assertEqual(
+            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

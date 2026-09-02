@@ -17,6 +17,20 @@ wrappers (one `wizlab` call + an exit-code remap). Change it only within this co
 
 Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1.
 
+## Nouns
+`session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, and — for connectorless
+Runtime-Sensor labs — `sensor` and `detection`:
+- `sensor ensure|delete|inspect` — a `type:SENSOR` service account is the sensor's credential
+  (`ensure` mints it named on the session stem, emits `WIZ_API_CLIENT_ID/SECRET`; `delete` removes it;
+  the reaper's ServiceAccount sweep also covers it). `inspect --require active` asserts the sensor
+  named for the session reports `ACTIVE`. Scoping key: the installed sensor's name == the host name,
+  which a lab pins to the session stem (neither `SensorFilters` nor `DetectionFilters` has a
+  cloud-account/instance field).
+- `detection inspect --rule-name N [--match-only]` — asserts ≥1 detection, keyed on
+  `matchedRuleName` + `type` + the resolved `sensorId`. Never a rule id (tenant-specific) and never an
+  Issue/Threat object (tenant-wide anti-burst cap). Default type `GENERATED_THREAT`; `--match-only`
+  queries the sibling that matched and raised no threat.
+
 ## What may be added
 A change qualifies only if ALL hold:
 1. **General** — reused across labs, not bespoke to one scenario.
