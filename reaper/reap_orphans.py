@@ -60,20 +60,34 @@ def _wizlab(tenant, *args):
     return r.returncode
 
 
+def _reap_session(tenant, sid, commit):
+    if not commit:
+        print(f"DRY-RUN {tenant}: reap lab-{sid}* + delete lab-{sid}@")
+        return
+    # Footprint first, user last: a crash leaves the user for the next run to retry.
+    _wizlab(tenant, "user", "reap", "--session", sid, "--commit")
+    _wizlab(tenant, "user", "delete", "--session", sid)
+
+
 def main():
     commit = "--commit" in sys.argv
     total = 0
+    # Manual override: reap explicit sids regardless of tag/window. For orphans that predate a track's
+    # tid:<tenant> tag (labPlayReports captures tags at play time, so a late tag never back-fills), or
+    # any one-off. `REAP_SESSIONS="sid1,sid2"`; reaped under REAP_SESSIONS_TENANT (default TBCMP).
+    manual = [s.strip() for s in os.getenv("REAP_SESSIONS", "").split(",") if s.strip()]
+    if manual:
+        mtenant = os.getenv("REAP_SESSIONS_TENANT", "TBCMP")
+        print(f"# manual: {len(manual)} session(s) under {mtenant}")
+        for sid in manual:
+            total += 1
+            _reap_session(mtenant, sid, commit)
     for tenant, tag in TENANTS.items():
         sids = stopped_sessions(tag)
         print(f"# tenant {tenant} ({tag}): {len(sids)} stopped session(s) in last {WINDOW_H}h")
         for sid in sids:
             total += 1
-            if not commit:
-                print(f"DRY-RUN {tenant}: reap lab-{sid}* + delete lab-{sid}@")
-                continue
-            # Footprint first, user last: a crash leaves the user for the next run to retry.
-            _wizlab(tenant, "user", "reap", "--session", sid, "--commit")
-            _wizlab(tenant, "user", "delete", "--session", sid)
+            _reap_session(tenant, sid, commit)
     print(f"# {total} session(s) {'reaped' if commit else 'to reap (dry-run)'}", file=sys.stderr)
 
 

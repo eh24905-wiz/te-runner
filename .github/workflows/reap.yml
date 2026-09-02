@@ -11,10 +11,14 @@ on:
         description: "Delete (unchecked = dry-run)"
         type: boolean
         default: false
+      sessions:
+        description: "Manual session ids to reap (comma-separated), bypassing the tag/window filter"
+        type: string
+        default: ""
 jobs:
   reap:
     runs-on: ubuntu-latest
-    container: ghcr.io/eh24905-wiz/te-runner:v0.1.21 # the reaper-bearing tag; bump when the reaper changes
+    container: ghcr.io/eh24905-wiz/te-runner:v0.1.30 # the reaper-bearing tag; bump when the reaper changes
     steps:
       - name: reap orphans
         env:
@@ -25,6 +29,7 @@ jobs:
           LAB_KEYCLOAK_REALM: ${{ secrets.LAB_KEYCLOAK_REALM }}
           LAB_KEYCLOAK_ADMIN_USER: ${{ secrets.LAB_KEYCLOAK_ADMIN_USER }}
           LAB_KEYCLOAK_ADMIN_PWD: ${{ secrets.LAB_KEYCLOAK_ADMIN_PWD }}
+          REAP_SESSIONS: ${{ inputs.sessions }}
         # --commit when the manual input asks, or when the repo variable REAP_COMMIT=true; else dry-run.
         run: |
           COMMIT=""
