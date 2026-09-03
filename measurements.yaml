@@ -1220,6 +1220,13 @@ outpost_lifecycle:
     # `--require scanned` flipped to exit 0. A graded scan is affordable ONLY if the lab triggers it;
     # unprompted, the schedule is what the docs' "several hours" refers to. requestConnectorEntityScan
     # is NOT that trigger: it returns OK, registers as a 1-second CLOUD_EVENT, and scans nothing.
+    scan_trigger_mutation: requestConnectorScan   # input {id, omitDataScan: false, enableArchivedReposCodeScan}
+    scan_trigger_quota_is_per_tenant: true
+    # The ceiling on any track that GRADES a disk scan, and the reason grading one is a fleet decision
+    # rather than a lab decision: the quota is 1 per 10 min, 5 per day, 30 per month PER TENANT, shared
+    # with every other concurrent lease and with any track that rescans for inventory (same quota).
+    # 5 graded plays a day fleet-wide, and a solver gets one attempt -- it must never loop. Carried from
+    # the v1 connector brick's rescan verb, which is where this verb is implemented; wizlab has none.
     transient_snapshot: true
     # The disk scan surfaces in the lease as an EBS snapshot alive for seconds (0->1->0 within 16s), so
     # snapshot count is useless as a poll signal -- and reap has nothing to clean up after it.
