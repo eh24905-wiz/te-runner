@@ -10,7 +10,7 @@ on:
       commit:
         description: "Delete (unchecked = dry-run)"
         type: boolean
-        default: false
+        default: true
       sessions:
         description: "Manual session ids to reap (comma-separated), bypassing the tag/window filter"
         type: string
