@@ -33,10 +33,14 @@ fi
 # AWS CLI does. Best-effort: a CLI login failing must not stop the grader. AWS needs nothing — the
 # CLI reads AWS_* directly.
 if [ -n "${GOOGLE_CREDENTIALS:-}" ] && command -v gcloud >/dev/null 2>&1; then
-  printf '%s' "$GOOGLE_CREDENTIALS" > /tmp/.gcp-sa.json
-  gcloud auth activate-service-account --key-file /tmp/.gcp-sa.json --quiet \
-    && rm -f /tmp/.gcp-sa.json \
+  gcp_key=$(mktemp /tmp/gcp-sa.XXXXXX)
+  trap 'rm -f "$gcp_key"' EXIT HUP INT TERM
+  chmod 600 "$gcp_key"
+  printf '%s' "$GOOGLE_CREDENTIALS" > "$gcp_key"
+  gcloud auth activate-service-account --key-file "$gcp_key" --quiet \
     || echo "gcloud service-account login failed" >&2
+  rm -f "$gcp_key"
+  trap - EXIT HUP INT TERM
   [ -n "${GOOGLE_PROJECT:-}" ] && gcloud config set project "$GOOGLE_PROJECT" --quiet
 fi
 if [ -n "${ARM_CLIENT_ID:-}" ] && command -v az >/dev/null 2>&1; then

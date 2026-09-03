@@ -1077,17 +1077,7 @@ def _role_inspect_gcp(args):
     sys.exit(0)
 
 
-def cmd_role_inspect(args):
-    """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
-    reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
-    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
-    another data center's delegator looks almost identical and does not work."""
-    cloud = _cloud(args)
-    if cloud == "gcp":
-        return _role_inspect_gcp(args)
-    if cloud == "azure":
-        return _role_inspect_azure(args)
-    role = _flag(args, "--role-name") or ROLE_NAME
+def _aws_role(role):
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:
         # NoSuchEntity is the ONLY failure meaning "not found" (learner state, 1). Everything else
@@ -1097,7 +1087,10 @@ def cmd_role_inspect(args):
             print(f"role {role} not found")
             sys.exit(1)
         die(3, f"aws iam get-role failed probing {role}: {res.stderr.strip()}")
-    role_obj = json.loads(res.stdout or "{}").get("Role") or {}
+    return json.loads(res.stdout or "{}").get("Role") or {}
+
+
+def _inspect_aws_trust(role, role_obj):
     policy = _decode_trust_policy(role_obj.get("AssumeRolePolicyDocument"))
     if policy is None:
         print(f"role {role} exists but its trust policy could not be decoded")
@@ -1124,6 +1117,19 @@ def cmd_role_inspect(args):
         sys.exit(1)
     print(f"role {role}: trust valid (assume-role to {delegator or 'Wiz delegator'}, externalId={tid})")
     sys.exit(0)
+
+
+def cmd_role_inspect(args):
+    """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
+    reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
+    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
+    another data center's delegator looks almost identical and does not work."""
+    handlers = {"gcp": _role_inspect_gcp, "azure": _role_inspect_azure}
+    cloud = _cloud(args)
+    if cloud in handlers:
+        return handlers[cloud](args)
+    role = _flag(args, "--role-name") or ROLE_NAME
+    return _inspect_aws_trust(role, _aws_role(role))
 
 
 def cmd_role_ensure(args):
@@ -1381,7 +1387,9 @@ def cmd_user_inspect(args):
         print(f"no Keycloak user {email}")
         sys.exit(1)
     status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token)
-    groups = [g.get("name") for g in json.loads(body or b"[]")] if status == 200 else []
+    if status != 200:
+        die(3, f"Keycloak group lookup HTTP {status}: {body[:300]!r}")
+    groups = [g.get("name") for g in json.loads(body or b"[]")]
     if group not in groups:
         print(f"user {email} exists but is not in group {group}; groups={groups}")
         sys.exit(1)
@@ -1465,7 +1473,9 @@ def _reap_enumerate(tok, dc, email, minutes):
         after = f', after: "{cursor}"' if cursor else ""
         qy = ("query { auditLogEntries(first: 100" + after + ", filterBy: { " + fb + " }) "
               "{ nodes { action status performer { name } actionParameters } pageInfo { hasNextPage endCursor } } }")
-        data, _ = _gql(tok, dc, qy)
+        data, errs = _gql(tok, dc, qy)
+        if errs:
+            return out, f"audit enumeration failed: {errs[0].get('message', '?')}"
         conn = data.get("auditLogEntries") or {}
         for n in conn.get("nodes") or []:
             if (n.get("performer") or {}).get("name") != email or n.get("status") != "SUCCESS":
@@ -1476,7 +1486,11 @@ def _reap_enumerate(tok, dc, email, minutes):
         if not pi.get("hasNextPage"):
             break
         cursor, pages = pi.get("endCursor"), pages + 1
-    return out
+        if not cursor:
+            return out, "audit enumeration returned hasNextPage without an endCursor"
+    if pages == 30 and pi.get("hasNextPage"):
+        return out, "audit enumeration exceeded the 3,000-entry safety limit"
+    return out, None
 
 
 def _reap_find(tok, dc, h, name):
@@ -1512,19 +1526,21 @@ def _reap_one(tok, dc, action, name, commit):
     gone = _reap_find(tok, dc, h, name)[1] == 0
     tail = f" ({derr[0]['message']})" if derr else ""
     print(f"{'deleted' if gone else 'DELETE-FAILED'} {x} {name!r}{tail}")
-    return gone, None
+    alert = None if gone else f"ALERT {action} {name!r}: deletion did not remove the resource{tail}"
+    return gone, alert
 
 
 def _reap_sweep_type(tok, dc, x, stem, commit):
     """Prefix-sweep one type: delete resources whose name starts with the lease-unique stem. Returns
-    (reaped, alerted). Errors (type not searchable this way) are silent — the audit layer covers it."""
+    (reaped, alerted). A lookup error is an alert because it means the sweep did not complete."""
     h = _reap_handler(x)
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
           + ": " + json.dumps(stem) + extra + " }) { nodes { id name } } }")
     data, errs = _gql(tok, dc, qy)
     if errs:
-        return 0, 0
+        print(f"SWEEP-FAILED {x}: {errs[0].get('message', '?')}")
+        return 0, 1
     reaped = alerted = 0
     for n in (data.get(h["list"]) or {}).get("nodes") or []:
         nm = n.get("name") or ""
@@ -1557,7 +1573,11 @@ def cmd_reap(args):
     commit = "--commit" in args
     tok, dc, _ = token_and_dc()
     reaped = alerted = 0
-    for action, name in _reap_enumerate(tok, dc, email, minutes):
+    actions, enumeration_alert = _reap_enumerate(tok, dc, email, minutes)
+    if enumeration_alert:
+        print(f"ALERT {enumeration_alert}")
+        alerted += 1
+    for action, name in actions:
         did, alert = _reap_one(tok, dc, action, name, commit)
         if alert:
             print(alert)
@@ -1570,7 +1590,7 @@ def cmd_reap(args):
         alerted += a
     verb = "reaped" if commit else "to reap (dry-run)"
     print(f"# {reaped} {verb}, {alerted} alert(s) for {email} / {stem}*", file=sys.stderr)
-    sys.exit(0)
+    sys.exit(3 if commit and alerted else 0)
 
 
 def _flag(args, name):

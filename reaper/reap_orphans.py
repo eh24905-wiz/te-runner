@@ -19,6 +19,7 @@ TEAM = os.getenv("INSTRUQT_TEAM", "wiz")
 WINDOW_H = int(os.getenv("REAP_WINDOW_HOURS", "25"))  # rolling; re-runs are idempotent, so overlap is safe
 # tenant key (the WIZ_TENANT value wizlab keys creds on) -> the lab's Instruqt tag. Extend as tenants onboard.
 TENANTS = {"TBCMP": "tid:tbcmp"}
+PAGE_SIZE = 500
 
 
 def _die(msg):
@@ -43,12 +44,19 @@ def _instruqt(query, variables):
 def stopped_sessions(tag):
     now = datetime.now(UTC)
     frm = (now - timedelta(hours=WINDOW_H)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    q = ("query($team:String!, $tag:String!, $from:Time!, $to:Time!) {"
+    q = ("query($team:String!, $tag:String!, $from:Time!, $to:Time!, $skip:Int!, $take:Int!) {"
          " labPlayReports(input:{teamSlug:$team, tags:[$tag],"
-         " dateRangeFilter:{from:$from, to:$to}, pagination:{skip:0, take:500}})"
+         " dateRangeFilter:{from:$from, to:$to}, pagination:{skip:$skip, take:$take}})"
          " { items { id stoppedReason } } }")
-    variables = {"team": TEAM, "tag": tag, "from": frm, "to": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
-    items = _instruqt(q, variables)["labPlayReports"]["items"]
+    variables = {"team": TEAM, "tag": tag, "from": frm, "to": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "skip": 0, "take": PAGE_SIZE}
+    items = []
+    while True:
+        page = _instruqt(q, variables)["labPlayReports"]["items"]
+        items.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        variables = {**variables, "skip": variables["skip"] + PAGE_SIZE}
     return [it["id"] for it in items if it.get("stoppedReason")]
 
 
@@ -63,15 +71,17 @@ def _wizlab(tenant, *args):
 def _reap_session(tenant, sid, commit):
     if not commit:
         print(f"DRY-RUN {tenant}: reap lab-{sid}* + delete lab-{sid}@")
-        return
+        return True
     # Footprint first, user last: a crash leaves the user for the next run to retry.
-    _wizlab(tenant, "user", "reap", "--session", sid, "--commit")
-    _wizlab(tenant, "user", "delete", "--session", sid)
+    if _wizlab(tenant, "user", "reap", "--session", sid, "--commit") != 0:
+        print(f"reap_orphans: retaining lab-{sid}@ because Wiz cleanup failed", file=sys.stderr)
+        return False
+    return _wizlab(tenant, "user", "delete", "--session", sid) == 0
 
 
 def main():
     commit = "--commit" in sys.argv
-    total = 0
+    total = failed = 0
     # Manual override: reap explicit sids regardless of tag/window. For orphans that predate a track's
     # tid:<tenant> tag (labPlayReports captures tags at play time, so a late tag never back-fills), or
     # any one-off. `REAP_SESSIONS="sid1,sid2"`; reaped under REAP_SESSIONS_TENANT (default TBCMP).
@@ -81,14 +91,17 @@ def main():
         print(f"# manual: {len(manual)} session(s) under {mtenant}")
         for sid in manual:
             total += 1
-            _reap_session(mtenant, sid, commit)
+            failed += not _reap_session(mtenant, sid, commit)
     for tenant, tag in TENANTS.items():
         sids = stopped_sessions(tag)
         print(f"# tenant {tenant} ({tag}): {len(sids)} stopped session(s) in last {WINDOW_H}h")
         for sid in sids:
             total += 1
-            _reap_session(tenant, sid, commit)
-    print(f"# {total} session(s) {'reaped' if commit else 'to reap (dry-run)'}", file=sys.stderr)
+            failed += not _reap_session(tenant, sid, commit)
+    completed = total - failed
+    print(f"# {completed}/{total} session(s) {'reaped' if commit else 'ready to reap (dry-run)'}", file=sys.stderr)
+    if failed:
+        _die(f"{failed} session(s) failed cleanup; see preceding wizlab errors")
 
 
 if __name__ == "__main__":
