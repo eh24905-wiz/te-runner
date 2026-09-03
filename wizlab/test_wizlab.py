@@ -829,5 +829,107 @@ class OutpostGrading(unittest.TestCase):
         self.assertNotIn("deleteOutpost", " ".join(q for q, _ in calls))
 
 
+class OutpostConnectorBinding(unittest.TestCase):
+    """Locks phase 2 of the Outpost deploy. The failure it guards has no lifecycle signal at all: a
+    connector with no `outpost` still reaches CONNECTED, and its Outpost holds INITIALIZED with
+    clusters null and errorCode null, so every status a check could read says success."""
+
+    def _node(self, outpost=None):
+        return {"id": "c1", "name": "lab-x-connector", "enabled": True, "status": "CONNECTED",
+                "type": {"id": "aws"}, "outpost": outpost,
+                "config": {"customerRoleARN": "arn:aws:iam::111111111111:role/WizAccess-Role"}}
+
+    def _exit(self, fn, argv, node=None, outposts=None, api=None):
+        with mock.patch.object(wz, "find_connector", return_value=[node] if node else []), \
+             mock.patch.object(wz, "_resolve_outpost", return_value=outposts), \
+             mock.patch.object(wz, "api", side_effect=api or (lambda q, v: ({}, "tid"))), \
+             self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code
+
+    # --session, because resolving "which Outpost should this be bound to" goes through the same
+    # session stem the Outpost was named on.
+    ARGS: typing.ClassVar = ["--account-id", "111111111111", "--require", "outpost-bound",
+                             "--session", "x"]
+
+    def test_unbound_connector_fails_despite_being_connected(self):
+        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS, self._node(None),
+                                    {"id": "o1"}), 1)
+
+    def test_bound_to_someone_elses_outpost_fails(self):
+        # Two concurrent leases in one tenant: binding the neighbour's Outpost builds their cluster.
+        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS,
+                                    self._node({"id": "o2", "name": "lab-y"}), {"id": "o1"}), 1)
+
+    def test_bound_to_the_session_outpost_passes(self):
+        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS,
+                                    self._node({"id": "o1", "name": "lab-x"}), {"id": "o1"}), 0)
+
+    def test_explicit_outpost_id_needs_no_name_lookup(self):
+        with mock.patch.object(wz, "_resolve_outpost") as resolve:
+            self.assertEqual(self._exit(wz.cmd_connector_inspect,
+                                        [*self.ARGS, "--outpost-id", "o1"],
+                                        self._node({"id": "o1", "name": "lab-x"})), 0)
+        resolve.assert_not_called()
+
+    def test_no_outpost_at_all_is_exit_1_not_an_error(self):
+        # The learner skipped phase 1: a check, so 1 — never 2/3, which a lab would have to remap.
+        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS, self._node(None), None), 1)
+
+    def test_absent_connector_is_exit_1(self):
+        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS, None, {"id": "o1"}), 1)
+
+    def test_bad_require_is_exit_2(self):
+        self.assertEqual(self._exit(wz.cmd_connector_inspect,
+                                    ["--account-id", "111111111111", "--require", "bogus"]), 2)
+
+    def test_outpost_id_without_scanner_role_is_exit_2(self):
+        # Bound with no scanner role the connector converges and never scans a disk, so refuse to
+        # create one rather than ship a lab that grades CONNECTED and scans nothing.
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--outpost-id", "o1"]), 2)
+
+    def test_scanner_role_without_outpost_id_is_exit_2(self):
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--scanner-role-arn", "arn:s"]), 2)
+
+    def test_create_payload_carries_all_three_auth_params(self):
+        created = {"createConnector": {"connector": {"id": "c1", "name": "lab-x-connector",
+                                                     "status": "INITIAL"}}}
+        calls = []
+
+        def api(query, variables):
+            calls.append((query, variables))
+            return created, "tid"
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--session", "x",
+                                     "--role-arn", "arn:r", "--outpost-id", "o1",
+                                     "--scanner-role-arn", "arn:s"], api=api), 0)
+        auth = calls[0][1]["input"]["authParams"]
+        self.assertEqual(auth, {"customerRoleARN": "arn:r", "outpostId": "o1",
+                                "diskAnalyzer": {"scanner": {"roleARN": "arn:s"}}})
+
+    def test_ensure_is_a_no_op_when_already_bound_to_that_outpost(self):
+        with mock.patch.object(wz, "find_connector",
+                               return_value=[self._node({"id": "o1", "name": "lab-x"})]), \
+             mock.patch.object(wz, "api") as api, self.assertRaises(SystemExit) as cm:
+            wz.cmd_connector_ensure(["--account-id", "111111111111", "--outpost-id", "o1",
+                                     "--scanner-role-arn", "arn:s", "--role-arn",
+                                     "arn:aws:iam::111111111111:role/WizAccess-Role"])
+        self.assertEqual(cm.exception.code, 0)
+        api.assert_not_called()
+
+    def test_ensure_binds_an_existing_unbound_connector(self):
+        calls = []
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--outpost-id", "o1",
+                                     "--scanner-role-arn", "arn:s", "--role-arn", "arn:r"],
+                                    self._node(None),
+                                    api=lambda q, v: (calls.append((q, v)), ({}, "tid"))[1]), 0)
+        patch = calls[0][1]["input"]["patch"]["authParams"]
+        self.assertEqual(patch["outpostId"], "o1")
+        self.assertEqual(patch["diskAnalyzer"], {"scanner": {"roleARN": "arn:s"}})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

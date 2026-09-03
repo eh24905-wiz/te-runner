@@ -31,6 +31,10 @@ Runtime-Sensor labs — `sensor` and `detection`:
   not imply it scanned anything** (4 of 7 live ones had scanned nothing), and a direct delete fails.
   All measured — grade and reap off `measurements.yaml outpost_lifecycle.aws`, never off the status
   name's plain meaning.
+- `connector ensure|inspect|delete` — a Cloud Connector. AWS `ensure` sets
+  `authParams.customerRoleARN`; `--outpost-id` with `--scanner-role-arn` also sets
+  `authParams.outpostId` and `authParams.diskAnalyzer.scanner.roleARN` — the second phase of an Outpost
+  deploy, without which Wiz builds no scan cluster. `inspect --require exists|healthy|outpost-bound`.
 - `sensor ensure|delete|inspect` — a `type:SENSOR` service account is the sensor's credential
   (`ensure` mints it named on the session stem, emits `WIZ_API_CLIENT_ID/SECRET`; `delete` removes it;
   the reaper's ServiceAccount sweep also covers it). `inspect --require active` asserts the sensor
@@ -51,7 +55,9 @@ A change qualifies only if ALL hold:
 ## What may NOT
 - A verb or flag per scenario or per assertion — compose existing verbs instead.
 - Config-field assertions bolted onto `inspect --require` (which asserts lifecycle *state*); lean on
-  the system's own signal (e.g. CONNECTED) or read a general field in the check.
+  the system's own signal (e.g. CONNECTED) or read a general field in the check. Carve-out only where no
+  lifecycle state separates the cases: an Outpost-unbound connector still reaches CONNECTED while its
+  Outpost holds INITIALIZED with `errorCode` null, so `--require outpost-bound` reads `outpost.id`.
 - CSP **infrastructure** provisioning (VPCs, instances) — that is Terraform
   (`te-labkit-v2/template/infra/<csp>/`), not wizlab.
 - Anything a lab can already do by composing existing verbs.

@@ -60,55 +60,44 @@ GCP_WIZ_ROLES = (
     "roles/serviceusage.serviceUsageViewer",
 )
 
-FIND = """query FindConnector($ids: [String!]) {
-  connectors(filterBy: { cloudAccountExternalId: $ids }, first: 10) {
-    nodes {
+_NODE = """
       id name enabled status
       type { id }
+      outpost { id name }
       config {
         ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
         ... on ConnectorConfigGCP { projectId: project_id }
         ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
-      }
-    }
-    totalCount
-  }
-}"""
+      }"""
 
-BY_TYPE = """query ConnectorsByType($t: [String!]) {
-  connectors(filterBy: { connectorType: $t }, first: 100) {
-    nodes {
-      id name enabled status
-      type { id }
-      config {
-        ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
-        ... on ConnectorConfigGCP { projectId: project_id }
-        ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
-      }
-    }
+FIND = f"""query FindConnector($ids: [String!]) {{
+  connectors(filterBy: {{ cloudAccountExternalId: $ids }}, first: 10) {{
+    nodes {{{_NODE}
+    }}
     totalCount
-  }
-}"""
+  }}
+}}"""
+
+BY_TYPE = f"""query ConnectorsByType($t: [String!]) {{
+  connectors(filterBy: {{ connectorType: $t }}, first: 100) {{
+    nodes {{{_NODE}
+    }}
+    totalCount
+  }}
+}}"""
 BY_TYPE_PAGE = 100  # the page BY_TYPE asks for; past it, "not found" stops meaning "absent"
 
 # Server-side substring search on name (the Deployments page's own filter; `search` also backs the
 # reaper's prefix sweep). Bounded by the lab's own naming stem, so it has no page-size cliff — unlike
 # BY_TYPE. Verified live on TS_PROD: a full name and a half-name both matched, and it returns the
 # connector's CHILD deployments too ("GAR in <name>"), which is why _parents still filters by type.
-SEARCH = """query SearchConnectors($s: String!) {
-  connectors(filterBy: { search: $s }, first: 50) {
-    nodes {
-      id name enabled status
-      type { id }
-      config {
-        ... on ConnectorConfigAWS { customerRoleARN externalIdNonce }
-        ... on ConnectorConfigGCP { projectId: project_id }
-        ... on ConnectorConfigAzure { subscriptionId tenantId isManagedIdentity }
-      }
-    }
+SEARCH = f"""query SearchConnectors($s: String!) {{
+  connectors(filterBy: {{ search: $s }}, first: 50) {{
+    nodes {{{_NODE}
+    }}
     totalCount
-  }
-}"""
+  }}
+}}"""
 
 CREATE = """mutation CreateConnector($input: CreateConnectorInput!) {
   createConnector(input: $input) { connector { id name status } }
@@ -514,8 +503,8 @@ def cmd_connector_inspect(args):
     cloud = _cloud(args)
     account = _norm_account(_flag(args, "--account-id") or die(2, "connector inspect needs --account-id"))
     require = _flag(args, "--require") or "exists"
-    if require not in ("exists", "healthy"):
-        die(2, f"--require must be exists|healthy, got {require}")
+    if require not in ("exists", "healthy", "outpost-bound"):
+        die(2, f"--require must be exists|healthy|outpost-bound, got {require}")
     matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}")
@@ -524,6 +513,8 @@ def cmd_connector_inspect(args):
     print(f"connector {node['name']} ({node['id']}): enabled={node['enabled']} status={node['status']}")
     if require == "exists":
         sys.exit(0)
+    if require == "outpost-bound":
+        return _assert_outpost_bound(args, node)
     # healthy: role-first, a connector sits in INITIAL_SCANNING for ~2-3 min, then CONNECTED, never
     # ERROR. Require CONNECTED, not merely not-ERROR: INITIAL_SCANNING is the window before Wiz has
     # actually assumed the role, so not-ERROR there is a false pass.
@@ -606,6 +597,51 @@ def _ensure_azure(args, account):
     _create_connector(f"{_lab_stem(_session_id(args))}-connector", "azure", auth, extra)
 
 
+def _assert_outpost_bound(args, node):
+    """Assert the connector is bound to the session's Outpost.
+
+    An unbound connector is indistinguishable from a bound one by status: both reach CONNECTED, and the
+    Outpost stays INITIALIZED with clusters null forever. `outpost` is the only field that separates
+    them, which is why this is its own require rather than part of `healthy`."""
+    bound = node.get("outpost") or {}
+    want = _flag(args, "--outpost-id")
+    if not want:
+        name = _outpost_name(args)
+        want = (_resolve_outpost(name) or {}).get("id")
+        if not want:
+            print(f"no outpost named {name}; nothing for a connector to bind to")
+            sys.exit(1)
+    role = (node.get("config") or {}).get("customerRoleARN") or "(none)"
+    if not bound:
+        print(f"connector is bound to NO outpost (customerRoleARN={role}); it will never build a cluster")
+        sys.exit(1)
+    if bound.get("id") != want:
+        print(f"connector is bound to outpost {bound.get('name')} ({bound.get('id')}), not {want}")
+        sys.exit(1)
+    print(f"connector bound to outpost {bound.get('name')} ({bound['id']}), customerRoleARN={role}")
+    sys.exit(0)
+
+
+def _aws_auth_params(args, account):
+    """The connector's `authParams`. Binding an Outpost is what makes Wiz build the scan cluster;
+    unbound, the Outpost holds INITIALIZED with clusters null indefinitely. `outpostId` is the only
+    binding field — there is no extraConfig key for it. The scanner role is what the node pool assumes
+    to read a volume, so a connector bound without it reaches CONNECTED and still scans nothing, which
+    is why the two flags are required together."""
+    auth = {"customerRoleARN": _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"}
+    outpost_id = _flag(args, "--outpost-id")
+    scanner_arn = _flag(args, "--scanner-role-arn")
+    if outpost_id and not scanner_arn:
+        die(2, "connector ensure --outpost-id needs --scanner-role-arn: an outpost-bound connector "
+               "with no diskAnalyzer scanner role connects but never scans a disk")
+    if scanner_arn and not outpost_id:
+        die(2, "--scanner-role-arn is only meaningful with --outpost-id")
+    if outpost_id:
+        auth["outpostId"] = outpost_id
+        auth["diskAnalyzer"] = {"scanner": {"roleARN": scanner_arn}}
+    return auth
+
+
 def cmd_connector_ensure(args):
     """Idempotent converge: create the connector if absent, else correct its customerRoleARN if it
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
@@ -616,22 +652,27 @@ def cmd_connector_ensure(args):
         return _ensure_gcp(args, account)
     if cloud == "azure":
         return _ensure_azure(args, account)
-    role_arn = _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"
+    auth = _aws_auth_params(args, account)
+    role_arn, outpost_id = auth["customerRoleARN"], auth.get("outpostId")
     matches = find_connector(account, cloud, _stem_opt(args))
     if matches:
         n = matches[0]
         cur = (n.get("config") or {}).get("customerRoleARN") or ""
-        if cur == role_arn:
+        cur_outpost = (n.get("outpost") or {}).get("id") or ""
+        if cur == role_arn and (not outpost_id or cur_outpost == outpost_id):
             print(f"connector {n['name']} already targets {account} with {role_arn}; nothing to do")
             sys.exit(0)
-        api(UPDATE, {"input": {"id": n["id"], "patch": {"authParams": {"customerRoleARN": role_arn}}}})
-        print(f"connector {n['name']}: customerRoleARN {cur or '(none)'} -> {role_arn}")
+        # Only the create path above is proven against the API; a patch that adds outpostId to an
+        # existing connector is the repair case and is unexercised.
+        api(UPDATE, {"input": {"id": n["id"], "patch": {"authParams": auth}}})
+        print(f"connector {n['name']}: customerRoleARN {cur or '(none)'} -> {role_arn}"
+              + (f", outpost {cur_outpost or '(none)'} -> {outpost_id}" if outpost_id else ""))
         sys.exit(0)
     name = f"{_lab_stem(_session_id(args))}-connector"
     # customerRoleARN goes in authParams, NOT extraConfig; extraConfig carries only
     # skipOrganizationScan. The role need not exist yet — the connector sits in ERROR until task 2
     # deploys WizAccess-Role.
-    _create_connector(name, "aws", {"customerRoleARN": role_arn}, {"skipOrganizationScan": True})
+    _create_connector(name, "aws", auth, {"skipOrganizationScan": True})
 
 
 def cmd_connector_delete(args):
