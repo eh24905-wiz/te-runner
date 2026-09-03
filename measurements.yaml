@@ -3,8 +3,7 @@
 # This file exists so a track author stops counting seconds. Every figure below was measured on one
 # apply of the whole menu -- 73 AWS resources, one connector, three planes polled from a single
 # connector-created timestamp -- so the numbers are mutually consistent rather than gathered per track
-# and silently incomparable. The failure it replaces: a plan asserting "expect ~7 minutes" for a bucket
-# that arrives at 12.5, written the same night the 12.5 was measured.
+# and silently incomparable.
 #
 # HOW TO USE IT. Find the kind a check asserts on, take `solver_budget_min` for the plane that check
 # queries, and use it. Do not re-derive from `graph_min`/`crv2_min` -- the margin is already in it, and
@@ -12,9 +11,8 @@
 #
 # WHAT IT IS NOT. Every number is n=1. It is a reference, not an SLA, and this repo's own note is that
 # successive runs here keep getting slower. `verify` on each section is the command that re-establishes
-# the figure; a fact nobody can re-check is a fact nobody can ever delete, which is how a sheet like
-# this fills with things that used to be true. When a verify run disagrees, change the number -- do not
-# annotate it, because `git log` holds what it said and a reader who finds two versions trusts neither.
+# the figure; a fact nobody can re-check is a fact nobody can ever delete. When a verify run disagrees,
+# change the number -- do not annotate it.
 
 meta:
   n: 1
@@ -78,9 +76,8 @@ planes:
       # verify: after `role ensure`, `connector ensure --account-id <acct>`, then poll
       #   wizlab connector inspect --account-id <acct> --require healthy   # exit 1 until CONNECTED
       arn_patch_connected_min: [7, 9]  # REPAIR path only: ARN corrected on an existing ERROR connector →
-      # ERROR→INITIAL_SCANNING→CONNECTED. ~3-5x slower than role-first. n=1, aws-connector-repair-201
-      # validator run 2026-09-01 (acct 851725559513). Solver budget for the repair lab's condition 02
-      # should be >= 15 min (observed 13.5 min solve→re-check pass).
+      # ERROR→INITIAL_SCANNING→CONNECTED. ~3-5x slower than role-first, n=1. A repair-path solver budget
+      # must be >= 15 min: solve→re-check completes in 13.5.
 
   gcp:
     connector_health:
@@ -902,10 +899,10 @@ entity_types:
     # on, which is why challenge 2 of gcp-wizcraft-bootcamp-201 does not grade it.
     track_image_graph_min: null
 
-  # DSPM, measured from a `rescan --data-scan` on a bucket whose classifier was created minutes earlier.
-  # TWO clocks, and conflating them is why a guide first told learners to wait 13 minutes for something
-  # that takes 16: the data finding lands on dataFindingsV2 first, and the HAS_DATA_FINDING edge reaches
-  # the Security Graph about three minutes after that. A query run between the two returns nothing, which
+  # DSPM, from a `rescan --data-scan` on a bucket whose classifier was created minutes earlier.
+  # TWO clocks: the data finding lands on dataFindingsV2 first, and the HAS_DATA_FINDING edge reaches the
+  # Security Graph about three minutes after that -- 13 vs 16 min. A query run between the two returns
+  # nothing, which
   # reads to a learner as a query they built wrong.
   - cloud: gcp
     wiz_type: DATA_FINDING
@@ -1131,9 +1128,8 @@ lifecycle:
       destroy the root, then poll both planes for the same externalIds and watch status / deletedAt
 
   gcp:
-    # NOT MEASURED. The decay watch was skipped on GCP to save lease time, so nothing here is inherited
-    # from AWS: an absent section would read as "the AWS figures apply", and they are the one thing a
-    # reader would most want and least be entitled to assume.
+    # NOT MEASURED, and stated rather than omitted: an absent section reads as "the AWS figures apply".
+    # Nothing here is inherited from AWS.
     measured: false
     verify: |
       destroy the root, then poll both planes for the same externalIds and watch status / deletedAt
@@ -1143,97 +1139,99 @@ lifecycle:
       liveness on status on either cloud.
 
 # ---------------------------------------------------------------------------------------------------
-# Outpost control plane. Not an indexing plane: these are OutpostStatus transitions, measured with a
-# DELIBERATELY NON-ASSUMABLE role ARN (arn:aws:iam::123456789012:role/...), so no EKS was ever built.
-# That is what makes the first row load-bearing rather than trivia -- see initialized_proves.
+# Outpost control plane. Not an indexing plane: OutpostStatus transitions and the two-phase deploy they
+# depend on. Keys are grouped prerequisites -> failure states -> convergence -> queries. Key PATHS are
+# cited across tracks, so reorder freely but do not rename or re-nest them.
 # ---------------------------------------------------------------------------------------------------
 outpost_lifecycle:
   aws:
     tenant: TS_PROD
-    deployment_type: Automated        # useWizServiceAccount: true, createOutpost via wizlab outpost ensure
-    create_status: INITIALIZING       # what createOutpost returns synchronously
-    initializing_to_initialized_max_min: 4    # n=1, bracketed by polls; reached INITIALIZED with a BOGUS role
-    initialized_proves: object_registered_only
-    # The expensive correction. INITIALIZED does NOT mean the orchestrator role is assumable, the
-    # Terraform applied, or anything exists in AWS -- it means the Wiz side is ready to start trying
-    # (operator, 2026-09-02). An Outpost created against account 123456789012 with a role that cannot
-    # exist reached INITIALIZED with errorCode null and clusters null. So a check that grades
-    # `--require initialized` passes for a learner who never ran the TF apply. Grade the AWS side
-    # (role inspect) for "deployed", and CONNECTED for "healthy".
-    connected_proves: region_cluster_with_heartbeat   # clusters[].lastHeartbeat populated; the only real health
+    deployment_type: Automated        # useWizServiceAccount: true; createOutpost via wizlab outpost ensure
+
+    # -- Prerequisites -----------------------------------------------------------------------------
     cluster_requires_bound_connector: true
-    # The founding correction for any outpost track. An Outpost with the orchestrator TF applied and a
-    # VALID assumable role builds NOTHING on its own: 55 min at INITIALIZED, clusters null, 0 scans
-    # attempted, and a medium SHI "Outpost With No Connected Connectors ... this Outpost is in idle mode".
-    # Phase 1 (TF module + createOutpost) is half the deploy. Phase 2 is a Cloud Connector bound to the
-    # Outpost via `authParams.outpostId` on createConnector -- the ONLY binding field; there is no
-    # extraConfig key and no wizlab verb for it. Bind it and the cluster appears in 5m41s.
-    time_to_connected_min: 22         # n=1, from connector bind; NOT from createOutpost, which never converges
-    # Bracketed by 2-min polls on one lease: connector bound T0 -> Wiz cluster object T+5m41s -> EKS
-    # CreateCluster visible in-account T+8m -> control plane ACTIVE T+18..20m (9 node groups) ->
-    # status CONNECTED T+20..22m. The docs' "up to 24 hours" (aws-outpost-create.mdx) is a ceiling, not
-    # an expectation. A task grading CONNECTED needs >22 min of budget, and the lab's idle stop must be
-    # off or long -- the learner touches nothing for the whole wait.
-    phase2_roles:                     # both in the workload account; names are fixed by Wiz, do not stem them
-      read_only: WizAccess-Role       # connector's authParams.customerRoleARN; trusts the tenant delegator + externalId
+    # The deploy has two phases and phase 1 alone converges to nothing. Phase 1: the orchestrator TF
+    # module + createOutpost. Phase 2: a Cloud Connector bound to the Outpost via `authParams.outpostId`
+    # on createConnector -- the only binding field. No extraConfig key, no wizlab verb.
+    phase2_roles:                     # both in the workload account; names fixed by Wiz, do not stem them
+      read_only: WizAccess-Role       # authParams.customerRoleARN; trusts the tenant delegator + externalId
       scanner: WizScannerRole-<suffix>  # authParams.diskAnalyzer.scanner.roleARN
-    # Rendered from the vendor templates (wiz-aws-read-only-org.json, wiz-aws-scanner-org.json), which
-    # are the authority -- `wizlab role ensure` writes a trust policy IDENTICAL to the read-only one, but
-    # is trust-only by design and attaches no permissions. The read-only role needs ~20KB across 4
-    # documents: 2 fit the 10240-byte inline cap, 2 MUST be customer-managed policies. The scanner role
-    # trusts arn:aws:iam::<orchestratorAccount>:role/WizOrchestratorNodePoolRole with sts:ExternalId,
-    # so it depends on phase 1 having run. The docs' recommended path for both is a CloudFormation
-    # StackSet -- unusable on an Instruqt lease, where `cloudformation` is not an allowed service and is
-    # therefore an explicit deny. Use the Terraform variant or emit the roles from the runner.
-    role_last_used_is_useless: true
-    # Do NOT infer "Wiz never assumed the role" from an empty iam Role.RoleLastUsed. All five Wiz roles
-    # read NEVER while Wiz was demonstrably mid-CreateCluster in that account. It lags far past the
-    # window any check or diagnosis runs in.
-    uninstall_to_uninstalled_min:     # uninstallOutpost -> UNINSTALLED, no real infra to tear down
-      from_initialized: 1.7           # 103s, n=1
-      from_initializing: 5.9          # 354s, n=1 -- same no-infra case, 3.4x slower; do not assume a tight bound
-    delete_requires_uninstall: true
-    # deleteOutpost on a live (INITIALIZED) Outpost fails with a server-side "internal error" + a
-    # request id, NOT a validation error -- and fails again while UNINSTALLING. The only order that
-    # works is uninstall -> poll to UNINSTALLED -> delete. wizlab `outpost delete` does exactly that
-    # (--timeout 600 default, exits 0 on a stuck record because the EKS infra dies with the lease).
-    daily_reaper_covers_outposts: false
-    # The out-of-band audit-log reaper derives delete<Type> generically, so it attempts a direct
-    # deleteOutpost, gets the internal error, and ALERTS instead of reaping. A leftover Outpost is a
-    # human alert, not a silent leak -- acceptable, but it is not automatic cleanup.
-    scan_proof_query: resourceScanMetricsTrend
-    # The disk-scan assertion, and the only OUTPOST-SCOPED one: cloudResources/vulnerabilityFindings
-    # answer "is the account inventoried" (the connector's job); this counts scans performed BY one
-    # outpostId. Args (startDate, endDate, outpostId: String! -- not ID!); dataPoints are one bucket
-    # per UTC day, so sum the window. `wizlab outpost inspect --require scanned` is this query.
-    connected_without_scans_fraction: 4/7   # CONNECTED AWS Outposts reporting 0 scans over a 7d window
-    # So CONNECTED must NOT be read as "it scanned something" -- the two are independent assertions.
-    # `wizlab instance inspect` does not close that gap either: it is cloudResources totalCount, i.e.
-    # inventory presence, and it PRINTS the word "scanned". The EC2 satisfied it while this outpost's
-    # own scan count was still 0.
+    # One vendor template declares both: wiz-aws-standard-outpost.json, as WizAccessRoleReadOnly
+    # (RoleName from its WizRoleName param) and WizScannerRole-${RoleSuffix}. Its policies are
+    # ManagedPolicy resources and must be attached, not inlined -- the read-only set spans 4 documents
+    # against a 10240-byte aggregate inline cap per role. The scanner role trusts
+    # arn:aws:iam::<orchestratorAccount>:role/WizOrchestratorNodePoolRole with sts:ExternalId, so it
+    # requires phase 1. `cloudformation` is absent from the lease services allowlist, making the vendor's
+    # recommended StackSet path an explicit deny; render the template or use its Terraform variant.
+    # `wizlab role ensure` writes a trust policy identical to the read-only template's, permissions none.
     scan_needs_on_demand_trigger: true
-    time_to_first_scan_min: 5    # n=1, 4m50s from an ON_DEMAND connector scan request to SUCCESS
-    # CONNECTED does not start scanning. 37 min past CONNECTED the Outpost had attempted 0 disk scans
-    # (0 successful AND 0 failed) although the connector's own SCHEDULED scan had already run and
-    # succeeded -- that one inventories the account, it does not dispatch a disk scan. An on-demand
-    # rescan on the connector then produced resourceScanResults totalCount 1 / SUCCESS, and
-    # `--require scanned` flipped to exit 0. A graded scan is affordable ONLY if the lab triggers it;
-    # unprompted, the schedule is what the docs' "several hours" refers to. requestConnectorEntityScan
-    # is NOT that trigger: it returns OK, registers as a 1-second CLOUD_EVENT, and scans nothing.
     scan_trigger_mutation: requestConnectorScan   # input {id, omitDataScan: false, enableArchivedReposCodeScan}
+    # requestConnectorEntityScan is NOT a trigger: it returns OK and registers a 1-second CLOUD_EVENT
+    # connectorScan that dispatches nothing to the node pool.
     scan_trigger_quota_is_per_tenant: true
-    # The ceiling on any track that GRADES a disk scan, and the reason grading one is a fleet decision
-    # rather than a lab decision: the quota is 1 per 10 min, 5 per day, 30 per month PER TENANT, shared
-    # with every other concurrent lease and with any track that rescans for inventory (same quota).
-    # 5 graded plays a day fleet-wide, and a solver gets one attempt -- it must never loop. Carried from
-    # the v1 connector brick's rescan verb, which is where this verb is implemented; wizlab has none.
-    transient_snapshot: true
-    # The disk scan surfaces in the lease as an EBS snapshot alive for seconds (0->1->0 within 16s), so
-    # snapshot count is useless as a poll signal -- and reap has nothing to clean up after it.
+    # 1 per 10 min, 5 per day, 30 per month per TENANT, shared across concurrent leases and with
+    # inventory rescans. A solver gets one attempt and must not loop; grading a disk scan caps fleet
+    # concurrency at 5 plays/day.
+
+    # -- Failure & incomplete states ---------------------------------------------------------------
+    initialized_proves: object_registered_only
+    # INITIALIZED is reachable with a roleARN naming an account that cannot exist, with errorCode null
+    # and clusters null. It means Wiz is ready to start trying, not that the role is assumable or that
+    # any AWS resource exists, so `--require initialized` also passes for a learner who never applied the
+    # Terraform. Grade the AWS side (role inspect) for "deployed", CONNECTED for "healthy".
+    connected_proves: region_cluster_with_heartbeat   # clusters[].lastHeartbeat populated
+    unbound_outpost_symptoms:         # phase 1 applied, valid assumable role, no connector bound
+      status: INITIALIZED             # indefinitely; errorCode stays null
+      clusters: null
+      scans_attempted: 0              # 0 successful AND 0 failed -- all-zero is the tell it never tried
+      shi: medium                     # "Outpost With No Connected Connectors ... this Outpost is in idle mode"
     ui_active_is_not_connected: true
-    # The GUI showed the deploy as Active/connected while the API held status INITIALIZED with clusters
-    # null. UI wording tracks the connector and `enabled`, not OutpostStatus. Grade the enum; and do not
-    # write a learner-facing status table that equates the UI word with the API state.
+    # The GUI reads Active while the API holds INITIALIZED with clusters null: UI wording tracks the
+    # connector and `enabled`, not OutpostStatus. Grade the enum, and never publish a learner-facing
+    # status table equating the UI word with the API state.
+    connected_without_scans_fraction: 4/7   # CONNECTED AWS Outposts reporting 0 scans over a 7d window
+    # CONNECTED and "has scanned" are independent assertions. A CONNECTED Outpost with a bound connector
+    # attempts no disk scan until one is triggered: the SCHEDULED connector scan inventories the account
+    # and dispatches nothing to the node pool.
+    role_last_used_is_useless: true
+    # iam Role.RoleLastUsed reads NEVER on all five Wiz roles while Wiz is mid-CreateCluster in that
+    # account. It lags past any window a check or diagnosis runs in; never infer non-assumption from it.
+    delete_requires_uninstall: true
+    # deleteOutpost on a live (INITIALIZED) Outpost returns a server-side "internal error" with a request
+    # id -- not a validation error -- and fails again while UNINSTALLING. The only order that works is
+    # uninstall -> poll to UNINSTALLED -> delete. `wizlab outpost delete` does this (--timeout 600
+    # default, exits 0 on a stuck record because the EKS infra dies with the lease).
+    daily_reaper_covers_outposts: false
+    # The out-of-band audit-log reaper derives delete<Type> generically, so it hits that same internal
+    # error and ALERTS instead of reaping. A leftover Outpost is a human alert, not a silent leak.
+
+    # -- Convergence & latencies -------------------------------------------------------------------
+    create_status: INITIALIZING       # returned synchronously by createOutpost
+    initializing_to_initialized_max_min: 4   # n=1, with a non-assumable role, so no EKS is ever built
+    time_to_connected_min: 22         # n=1, from the connector bind; never from createOutpost
+    connect_ladder_min:               # from the connector bind, n=1
+      wiz_cluster_object: 6
+      in_account_CreateCluster: 8
+      eks_control_plane_ACTIVE: 20    # 9 node groups
+      status_CONNECTED: 22
+    # A task grading CONNECTED needs more than 22 min of budget and an idle stop longer than the wait:
+    # the learner touches nothing throughout. The docs' "up to 24 hours" is a ceiling, not an expectation.
+    time_to_first_scan_min: 5         # n=1, requestConnectorScan -> resourceScanResults SUCCESS
+    uninstall_to_uninstalled_min:     # no real infra to tear down
+      from_initialized: 1.7           # n=1
+      from_initializing: 5.9          # n=1, 3.4x slower in the same no-infra case; not a tight bound
+    transient_snapshot: true
+    # A disk scan appears in the workload account as an EBS snapshot alive for seconds (0->1->0 inside
+    # 16s), so snapshot count is not a usable poll signal and leaves nothing to reap.
+
+    # -- Queries -----------------------------------------------------------------------------------
+    scan_proof_query: resourceScanMetricsTrend
+    # The only OUTPOST-SCOPED scan assertion: it counts scans performed BY one outpostId, where
+    # cloudResources/vulnerabilityFindings answer "is the account inventoried" (the connector's job).
+    # Args (startDate, endDate, outpostId: String! -- not ID!); dataPoints are one bucket per UTC day, so
+    # sum the window. `wizlab outpost inspect --require scanned` is this query. `wizlab instance inspect`
+    # is no substitute: it is cloudResources totalCount and prints the word "scanned", which a lease EC2
+    # satisfies while the Outpost's own scan count is 0.
     verify: |
       wizlab outpost ensure --name lab-<id> --role-arn arn:aws:iam::123456789012:role/nonexistent
       wizlab outpost inspect --name lab-<id> --require initialized   # exit 1, then 0 within ~4 min
@@ -1245,8 +1243,8 @@ outpost_lifecycle:
       wizlab outpost inspect --require connected                     # exit 1 -- no connector, no cluster
       # then createConnector(type "aws", authParams{outpostId, customerRoleARN, diskAnalyzer.scanner.roleARN})
       wizlab outpost inspect --require connected                     # exit 0 within ~22 min
-      wizlab outpost inspect --require scanned                       # STILL exit 1, 37 min later
-      # then an on-demand rescan on that connector (GUI Rescan, or connectorScans triggerType ON_DEMAND)
+      wizlab outpost inspect --require scanned                       # exit 1 -- CONNECTED triggers nothing
+      # then requestConnectorScan(id: <connector>, omitDataScan: false) -- spends per-tenant quota
       wizlab outpost inspect --require scanned                       # exit 0 within ~5 min
 
 # ---------------------------------------------------------------------------------------------------
