@@ -1388,7 +1388,8 @@ def cmd_user_inspect(args):
         sys.exit(1)
     status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token)
     if status != 200:
-        die(3, f"Keycloak group lookup HTTP {status}: {body[:300]!r}")
+        die(3, f"Keycloak group lookup for {email} HTTP {status}: "
+               f"{body.decode(errors='replace')[:300]}")
     groups = [g.get("name") for g in json.loads(body or b"[]")]
     if group not in groups:
         print(f"user {email} exists but is not in group {group}; groups={groups}")
@@ -1507,32 +1508,41 @@ def _reap_find(tok, dc, h, name):
 
 
 def _reap_one(tok, dc, action, name, commit):
-    """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None)."""
+    """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None, blocked_bool). Blocked means
+    footprint provably remains; only that may fail the run. An alert we cannot act on (no name in the
+    input, no handler for the type) is NOT blocking: the generic plural+search handler misses most of
+    the ~34 create types we have not measured, so blocking on it would fail every single reap."""
     x = action[len("Create"):]
     if not name:
-        return False, f"ALERT {action}: no name in input — manual review"
+        return False, f"ALERT {action}: no name in input — manual review", False
     h = _reap_handler(x)
     rid, count, err = _reap_find(tok, dc, h, name)
     if err:
-        return False, f"ALERT {action} {name!r}: no handler ({err})"
-    if count != 1:
-        return False, f"ALERT {action} {name!r}: matched {count}, need exactly 1 — skipping"
+        return False, f"ALERT {action} {name!r}: no handler ({err})", False
+    if count == 0:
+        # Steady state, not a failure: a previous run reaped it (the reap window overlaps by design)
+        # or the learner deleted it themselves. The audit entry survives the resource either way.
+        print(f"already gone {x} {name!r}")
+        return False, None, False
+    if count > 1:
+        return False, f"ALERT {action} {name!r}: matched {count}, need exactly 1 — skipping", True
     soft = ", soft" if h["soft"] else ""
     if not commit:
         print(f"DRY-RUN would delete {x} {name!r} ({rid[:8]}{soft})")
-        return True, None
+        return True, None, False
     dq = "mutation { " + h["delete"] + '(input: { id: "' + rid + '" }) { _stub } }'
     _d, derr = _gql(tok, dc, dq)
     gone = _reap_find(tok, dc, h, name)[1] == 0
     tail = f" ({derr[0]['message']})" if derr else ""
     print(f"{'deleted' if gone else 'DELETE-FAILED'} {x} {name!r}{tail}")
     alert = None if gone else f"ALERT {action} {name!r}: deletion did not remove the resource{tail}"
-    return gone, alert
+    return gone, alert, not gone
 
 
 def _reap_sweep_type(tok, dc, x, stem, commit):
     """Prefix-sweep one type: delete resources whose name starts with the lease-unique stem. Returns
-    (reaped, alerted). A lookup error is an alert because it means the sweep did not complete."""
+    (reaped, alerted, blocked). A lookup error blocks: unlike _reap_one's per-type handler miss, every
+    type here is measured (see _SWEEP_TYPES), so an error means this sweep did not complete."""
     h = _reap_handler(x)
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
@@ -1540,8 +1550,8 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
     data, errs = _gql(tok, dc, qy)
     if errs:
         print(f"SWEEP-FAILED {x}: {errs[0].get('message', '?')}")
-        return 0, 1
-    reaped = alerted = 0
+        return 0, 1, 1
+    reaped = alerted = blocked = 0
     for n in (data.get(h["list"]) or {}).get("nodes") or []:
         nm = n.get("name") or ""
         if not nm.startswith(stem):
@@ -1554,10 +1564,11 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
         if derr:
             print(f"SWEEP-FAILED {x} {nm!r}: {derr[0]['message']}")
             alerted += 1
+            blocked += 1
         else:
             print(f"swept {x} {nm!r}")
             reaped += 1
-    return reaped, alerted
+    return reaped, alerted, blocked
 
 
 def cmd_reap(args):
@@ -1565,32 +1576,36 @@ def cmd_reap(args):
     session (--session/INSTRUQT_SESSION_ID): (1) audit-by-actor — SUCCESS Create* by the ephemeral
     user lab-<session_id>@, mapped to delete<Type>({id}) by exact name, catches free-form learner GUI
     creates; (2) prefix sweep — delete any known-type resource named lab-<session_id>*, catches solve /
-    service-account creates the audit layer can't attribute. Best-effort; pair with `user delete`."""
+    service-account creates the audit layer can't attribute. Pair with `user delete`. Exit 3 under
+    --commit means footprint provably remains, which is the reaper's signal to keep the user."""
     sid = _session_id(args)
     email = _flag(args, "--email") or _lab_user_email(args)[0]
     stem = _lab_stem(sid)
     minutes = int(_flag(args, "--last-min") or "1440")
     commit = "--commit" in args
     tok, dc, _ = token_and_dc()
-    reaped = alerted = 0
+    reaped = alerted = blocked = 0
     actions, enumeration_alert = _reap_enumerate(tok, dc, email, minutes)
     if enumeration_alert:
+        # Blocking: a truncated audit list hides creates we never even tried to delete.
         print(f"ALERT {enumeration_alert}")
         alerted += 1
+        blocked += 1
     for action, name in actions:
-        did, alert = _reap_one(tok, dc, action, name, commit)
+        did, alert, stuck = _reap_one(tok, dc, action, name, commit)
         if alert:
             print(alert)
             alerted += 1
-        elif did:
+        blocked += stuck
+        if did:
             reaped += 1
     for x in _SWEEP_TYPES:
-        r, a = _reap_sweep_type(tok, dc, x, stem, commit)
-        reaped += r
-        alerted += a
+        r, a, b = _reap_sweep_type(tok, dc, x, stem, commit)
+        reaped, alerted, blocked = reaped + r, alerted + a, blocked + b
     verb = "reaped" if commit else "to reap (dry-run)"
-    print(f"# {reaped} {verb}, {alerted} alert(s) for {email} / {stem}*", file=sys.stderr)
-    sys.exit(3 if commit and alerted else 0)
+    print(f"# {reaped} {verb}, {alerted} alert(s), {blocked} blocking for {email} / {stem}*",
+          file=sys.stderr)
+    sys.exit(3 if commit and blocked else 0)
 
 
 def _flag(args, name):
