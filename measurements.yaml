@@ -183,21 +183,23 @@ planes:
   sensor:
     # Cloudless Runtime-Sensor lab (te-wiz-sensor-101): the sensor installs on an Instruqt `vm`
     # sandbox (real kernel + systemd -- a container cannot run its engine) and grades on the
-    # `sensors`/`detections` planes, keyed by name = VM hostname = lab-<session_id>. n=1, one live
-    # play (session s3sd84thneqa, 2026-09-02). SensorStatus is ACTIVE/INACTIVE only.
+    # `sensors`/`detections` planes, keyed by name = VM hostname = lab-<session_id>. n=2, two live
+    # plays (s3sd84thneqa, njtac8zm3vdd). SensorStatus is ACTIVE/INACTIVE only.
     registration:
-      install_to_active_min: 3.6      # native install (systemd starts it) -> sensors(...).status ACTIVE
-      solver_budget_min: 12           # solve_wait_active polls to 720s -- wide margin over 3.6m
+      install_to_active_min: [3.6, 4.9] # native install (systemd starts it) -> sensors(...).status ACTIVE
+      solver_budget_min: 14            # solve_wait_active polls to 840s
+      # A check cannot wait for INACTIVE: the sensor is absent from the plane until it registers, then
+      # its first appearance already reads ACTIVE. Grade absence-then-ACTIVE, never a status transition.
     detection:
-      trigger_to_queryable_min: 1.2   # cat /proc/<pid>/mem -> detections(GENERATED_THREAT) totalCount>=1
-      match_only_lag_min: 0.05        # the MATCH_ONLY sibling lands with the GT (one keystroke, both rules)
+      trigger_to_queryable_min: [1.2, 1.7] # cat /proc/<pid>/mem -> detections(GENERATED_THREAT) totalCount>=1
+      match_only_lag_min: [0.05, 0.07] # the MATCH_ONLY sibling lands with the GT (one keystroke, both rules)
       solver_budget_min: 8            # solve_trigger polls to 480s
       # Grade the Detection plane scoped by sensorId (resolved from name), keyed on matchedRuleName +
       # type. Never a rule id (tenant-specific) and never a Threat/Issue (tenant-wide anti-burst cap).
     verify: |
       # On a connected te-wiz-sensor-101 play, from the grader (dev access on, SSH to the vm):
       wizlab sensor ensure   # mint type:SENSOR SA; install on the vm with WIZ_API_CLIENT_ID/SECRET
-      wizlab sensor inspect --require active                                             # -> 3.6m
+      wizlab sensor inspect --require active                                        # -> 3.6m / 4.9m
       # trigger `cat /proc/$$/mem` on the vm, then:
       wizlab detection inspect --rule-name "Process memory dump via common utilities"    # GENERATED_THREAT
       wizlab detection inspect --rule-name "Process memory data file was accessed" --match-only
