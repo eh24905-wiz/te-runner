@@ -139,6 +139,15 @@ class ExitCodeContract(unittest.TestCase):
             wz.main()
         self.assertEqual(cm.exception.code, 2)  # bug, not a raw traceback exiting 1
 
+    def test_user_inspect_group_transport_failure_is_environment_3(self):
+        session = wz._KcSession("https://kc", "realm", "tok", "lab-s1@example.com", "lab-s1")
+        with mock.patch.object(wz, "_kc_session", return_value=session), \
+             mock.patch.object(wz, "_kc_user_id", return_value="u1"), \
+             mock.patch.object(wz, "_kc_call", return_value=(503, b"unavailable")), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_user_inspect(["--session", "s1"])
+        self.assertEqual(cm.exception.code, 3)
+
 
 class RoleInspectGrading(unittest.TestCase):
     DELEGATOR = "arn:aws:iam::851725410668:role/prod-us100-AssumeRoleDelegator"
@@ -216,9 +225,71 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         # Shared-tenant safety: >1 name match must skip+alert, never delete — even with --commit.
         with mock.patch.object(wz, "_reap_handler", return_value={}), \
              mock.patch.object(wz, "_reap_find", return_value=(None, 2, None)):
-            did, alert = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
+            did, alert, blocked = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
         self.assertFalse(did)
         self.assertIn("matched 2", alert)
+        self.assertTrue(blocked)  # the resource is still there
+
+    def test_reap_one_treats_an_already_gone_resource_as_a_no_op(self):
+        # The reap window overlaps by design, so a second pass over a reaped session finds the audit
+        # Create with no resource behind it. That must not alert, and must not block the user delete.
+        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+            did, alert, blocked = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
+        self.assertEqual((did, alert, blocked), (False, None, False))
+
+    def test_reap_one_does_not_block_on_an_unmeasured_type(self):
+        # No handler for the type: unactionable, so alert a human but never fail the run — the generic
+        # plural+search handler misses most create types and this would otherwise fire every reap.
+        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+             mock.patch.object(wz, "_reap_find", return_value=(None, None, "no such field")):
+            did, alert, blocked = wz._reap_one("tok", "dc", "CreateWidget", "lab-s1-w", True)
+        self.assertFalse(did)
+        self.assertIn("no handler", alert)
+        self.assertFalse(blocked)
+
+    def test_reap_enumeration_surfaces_graphql_errors(self):
+        with mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
+            actions, alert = wz._reap_enumerate("tok", "dc", "lab-s1@example.com", 60)
+        self.assertEqual(actions, [])
+        self.assertIn("denied", alert)
+
+    def test_committed_reap_exits_3_when_enumeration_is_incomplete(self):
+        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "_reap_enumerate", return_value=([], "denied")), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 0, 0)), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_reap(["--session", "s1", "--commit"])
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_committed_reap_exits_3_when_a_sweep_lookup_fails(self):
+        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "_reap_enumerate", return_value=([], None)), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 1, 1)), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_reap(["--session", "s1", "--commit"])
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_committed_reap_exits_0_when_alerts_are_unactionable(self):
+        # An alert a human should read is not the same as cleanup that did not happen: exiting 3 here
+        # would make the reaper retain every lab-<sid>@ user it was built to delete.
+        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "_reap_enumerate", return_value=([("CreateWidget", "lab-s1-w")], None)), \
+             mock.patch.object(wz, "_reap_one", return_value=(False, "ALERT no handler", False)), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 0, 0)), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_reap(["--session", "s1", "--commit"])
+        self.assertEqual(cm.exception.code, 0)
+
+    def test_reap_one_alerts_when_delete_does_not_remove_resource(self):
+        found = [("id1", 1, None), ("id1", 1, None)]
+        with mock.patch.object(wz, "_reap_handler", return_value={"delete": "deleteReport", "soft": False}), \
+             mock.patch.object(wz, "_reap_find", side_effect=found), \
+             mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
+            did, alert, blocked = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
+        self.assertFalse(did)
+        self.assertIn("deletion did not remove", alert)
+        self.assertTrue(blocked)
 
     def test_kc_user_id_refuses_multiple_exact(self):
         dup = json.dumps([{"id": "1", "username": "lab-s1@titra-labs.ai"},
@@ -426,7 +497,7 @@ class AzureRoleInspect(unittest.TestCase):
     SUB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     OID = "11111111-2222-3333-4444-555555555555"
 
-    DEFAULT_ARGV = ["--cloud", "azure", "--account-id", SUB, "--role-name", "WizCustomRole"]
+    DEFAULT_ARGV: typing.ClassVar = ["--cloud", "azure", "--account-id", SUB, "--role-name", "WizCustomRole"]
 
     def _run(self, proc, argv=None, env=None):
         env = {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID} if env is None else env
@@ -569,7 +640,7 @@ class GcpRoleInspect(unittest.TestCase):
 
 
 class SensorDetectionGrading(unittest.TestCase):
-    ACTIVE = [{"id": "s1", "name": "lab-x", "status": "ACTIVE", "type": "LINUX_VIRTUAL_MACHINE"}]
+    ACTIVE: typing.ClassVar = [{"id": "s1", "name": "lab-x", "status": "ACTIVE", "type": "LINUX_VIRTUAL_MACHINE"}]
 
     def _api(self, sensor_nodes, det_count=0):
         def side(query, variables):

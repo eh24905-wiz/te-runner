@@ -13,5 +13,5 @@ labs pin (Instruqt pulls anonymously). A tag on `origin` (wiz-training) builds a
 environment. In learner checks, remap 2/3 to 1 (out-of-list codes brick the
 session — probe finding 2026-08-28); consume them raw in CI.
 
-Next actions: measure the post-role connector `healthy` enum on a live lease
-(TODO in `wizlab/wizlab`); add gcloud/az when pilot 2 needs them.
+Next action: measure the post-role connector `healthy` enum on a live lease
+(TODO in `wizlab/wizlab`).

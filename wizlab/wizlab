@@ -1077,17 +1077,7 @@ def _role_inspect_gcp(args):
     sys.exit(0)
 
 
-def cmd_role_inspect(args):
-    """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
-    reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
-    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
-    another data center's delegator looks almost identical and does not work."""
-    cloud = _cloud(args)
-    if cloud == "gcp":
-        return _role_inspect_gcp(args)
-    if cloud == "azure":
-        return _role_inspect_azure(args)
-    role = _flag(args, "--role-name") or ROLE_NAME
+def _aws_role(role):
     res = _aws("iam", "get-role", "--role-name", role, "--output", "json")
     if res.returncode != 0:
         # NoSuchEntity is the ONLY failure meaning "not found" (learner state, 1). Everything else
@@ -1097,7 +1087,10 @@ def cmd_role_inspect(args):
             print(f"role {role} not found")
             sys.exit(1)
         die(3, f"aws iam get-role failed probing {role}: {res.stderr.strip()}")
-    role_obj = json.loads(res.stdout or "{}").get("Role") or {}
+    return json.loads(res.stdout or "{}").get("Role") or {}
+
+
+def _inspect_aws_trust(role, role_obj):
     policy = _decode_trust_policy(role_obj.get("AssumeRolePolicyDocument"))
     if policy is None:
         print(f"role {role} exists but its trust policy could not be decoded")
@@ -1124,6 +1117,19 @@ def cmd_role_inspect(args):
         sys.exit(1)
     print(f"role {role}: trust valid (assume-role to {delegator or 'Wiz delegator'}, externalId={tid})")
     sys.exit(0)
+
+
+def cmd_role_inspect(args):
+    """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
+    reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
+    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
+    another data center's delegator looks almost identical and does not work."""
+    handlers = {"gcp": _role_inspect_gcp, "azure": _role_inspect_azure}
+    cloud = _cloud(args)
+    if cloud in handlers:
+        return handlers[cloud](args)
+    role = _flag(args, "--role-name") or ROLE_NAME
+    return _inspect_aws_trust(role, _aws_role(role))
 
 
 def cmd_role_ensure(args):
@@ -1381,7 +1387,10 @@ def cmd_user_inspect(args):
         print(f"no Keycloak user {email}")
         sys.exit(1)
     status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token)
-    groups = [g.get("name") for g in json.loads(body or b"[]")] if status == 200 else []
+    if status != 200:
+        die(3, f"Keycloak group lookup for {email} HTTP {status}: "
+               f"{body.decode(errors='replace')[:300]}")
+    groups = [g.get("name") for g in json.loads(body or b"[]")]
     if group not in groups:
         print(f"user {email} exists but is not in group {group}; groups={groups}")
         sys.exit(1)
@@ -1465,7 +1474,9 @@ def _reap_enumerate(tok, dc, email, minutes):
         after = f', after: "{cursor}"' if cursor else ""
         qy = ("query { auditLogEntries(first: 100" + after + ", filterBy: { " + fb + " }) "
               "{ nodes { action status performer { name } actionParameters } pageInfo { hasNextPage endCursor } } }")
-        data, _ = _gql(tok, dc, qy)
+        data, errs = _gql(tok, dc, qy)
+        if errs:
+            return out, f"audit enumeration failed: {errs[0].get('message', '?')}"
         conn = data.get("auditLogEntries") or {}
         for n in conn.get("nodes") or []:
             if (n.get("performer") or {}).get("name") != email or n.get("status") != "SUCCESS":
@@ -1476,7 +1487,11 @@ def _reap_enumerate(tok, dc, email, minutes):
         if not pi.get("hasNextPage"):
             break
         cursor, pages = pi.get("endCursor"), pages + 1
-    return out
+        if not cursor:
+            return out, "audit enumeration returned hasNextPage without an endCursor"
+    if pages == 30 and pi.get("hasNextPage"):
+        return out, "audit enumeration exceeded the 3,000-entry safety limit"
+    return out, None
 
 
 def _reap_find(tok, dc, h, name):
@@ -1493,39 +1508,50 @@ def _reap_find(tok, dc, h, name):
 
 
 def _reap_one(tok, dc, action, name, commit):
-    """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None)."""
+    """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None, blocked_bool). Blocked means
+    footprint provably remains; only that may fail the run. An alert we cannot act on (no name in the
+    input, no handler for the type) is NOT blocking: the generic plural+search handler misses most of
+    the ~34 create types we have not measured, so blocking on it would fail every single reap."""
     x = action[len("Create"):]
     if not name:
-        return False, f"ALERT {action}: no name in input — manual review"
+        return False, f"ALERT {action}: no name in input — manual review", False
     h = _reap_handler(x)
     rid, count, err = _reap_find(tok, dc, h, name)
     if err:
-        return False, f"ALERT {action} {name!r}: no handler ({err})"
-    if count != 1:
-        return False, f"ALERT {action} {name!r}: matched {count}, need exactly 1 — skipping"
+        return False, f"ALERT {action} {name!r}: no handler ({err})", False
+    if count == 0:
+        # Steady state, not a failure: a previous run reaped it (the reap window overlaps by design)
+        # or the learner deleted it themselves. The audit entry survives the resource either way.
+        print(f"already gone {x} {name!r}")
+        return False, None, False
+    if count > 1:
+        return False, f"ALERT {action} {name!r}: matched {count}, need exactly 1 — skipping", True
     soft = ", soft" if h["soft"] else ""
     if not commit:
         print(f"DRY-RUN would delete {x} {name!r} ({rid[:8]}{soft})")
-        return True, None
+        return True, None, False
     dq = "mutation { " + h["delete"] + '(input: { id: "' + rid + '" }) { _stub } }'
     _d, derr = _gql(tok, dc, dq)
     gone = _reap_find(tok, dc, h, name)[1] == 0
     tail = f" ({derr[0]['message']})" if derr else ""
     print(f"{'deleted' if gone else 'DELETE-FAILED'} {x} {name!r}{tail}")
-    return gone, None
+    alert = None if gone else f"ALERT {action} {name!r}: deletion did not remove the resource{tail}"
+    return gone, alert, not gone
 
 
 def _reap_sweep_type(tok, dc, x, stem, commit):
     """Prefix-sweep one type: delete resources whose name starts with the lease-unique stem. Returns
-    (reaped, alerted). Errors (type not searchable this way) are silent — the audit layer covers it."""
+    (reaped, alerted, blocked). A lookup error blocks: unlike _reap_one's per-type handler miss, every
+    type here is measured (see _SWEEP_TYPES), so an error means this sweep did not complete."""
     h = _reap_handler(x)
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
           + ": " + json.dumps(stem) + extra + " }) { nodes { id name } } }")
     data, errs = _gql(tok, dc, qy)
     if errs:
-        return 0, 0
-    reaped = alerted = 0
+        print(f"SWEEP-FAILED {x}: {errs[0].get('message', '?')}")
+        return 0, 1, 1
+    reaped = alerted = blocked = 0
     for n in (data.get(h["list"]) or {}).get("nodes") or []:
         nm = n.get("name") or ""
         if not nm.startswith(stem):
@@ -1538,10 +1564,11 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
         if derr:
             print(f"SWEEP-FAILED {x} {nm!r}: {derr[0]['message']}")
             alerted += 1
+            blocked += 1
         else:
             print(f"swept {x} {nm!r}")
             reaped += 1
-    return reaped, alerted
+    return reaped, alerted, blocked
 
 
 def cmd_reap(args):
@@ -1549,28 +1576,36 @@ def cmd_reap(args):
     session (--session/INSTRUQT_SESSION_ID): (1) audit-by-actor — SUCCESS Create* by the ephemeral
     user lab-<session_id>@, mapped to delete<Type>({id}) by exact name, catches free-form learner GUI
     creates; (2) prefix sweep — delete any known-type resource named lab-<session_id>*, catches solve /
-    service-account creates the audit layer can't attribute. Best-effort; pair with `user delete`."""
+    service-account creates the audit layer can't attribute. Pair with `user delete`. Exit 3 under
+    --commit means footprint provably remains, which is the reaper's signal to keep the user."""
     sid = _session_id(args)
     email = _flag(args, "--email") or _lab_user_email(args)[0]
     stem = _lab_stem(sid)
     minutes = int(_flag(args, "--last-min") or "1440")
     commit = "--commit" in args
     tok, dc, _ = token_and_dc()
-    reaped = alerted = 0
-    for action, name in _reap_enumerate(tok, dc, email, minutes):
-        did, alert = _reap_one(tok, dc, action, name, commit)
+    reaped = alerted = blocked = 0
+    actions, enumeration_alert = _reap_enumerate(tok, dc, email, minutes)
+    if enumeration_alert:
+        # Blocking: a truncated audit list hides creates we never even tried to delete.
+        print(f"ALERT {enumeration_alert}")
+        alerted += 1
+        blocked += 1
+    for action, name in actions:
+        did, alert, stuck = _reap_one(tok, dc, action, name, commit)
         if alert:
             print(alert)
             alerted += 1
-        elif did:
+        blocked += stuck
+        if did:
             reaped += 1
     for x in _SWEEP_TYPES:
-        r, a = _reap_sweep_type(tok, dc, x, stem, commit)
-        reaped += r
-        alerted += a
+        r, a, b = _reap_sweep_type(tok, dc, x, stem, commit)
+        reaped, alerted, blocked = reaped + r, alerted + a, blocked + b
     verb = "reaped" if commit else "to reap (dry-run)"
-    print(f"# {reaped} {verb}, {alerted} alert(s) for {email} / {stem}*", file=sys.stderr)
-    sys.exit(0)
+    print(f"# {reaped} {verb}, {alerted} alert(s), {blocked} blocking for {email} / {stem}*",
+          file=sys.stderr)
+    sys.exit(3 if commit and blocked else 0)
 
 
 def _flag(args, name):
