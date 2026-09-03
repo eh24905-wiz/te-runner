@@ -1161,7 +1161,34 @@ outpost_lifecycle:
     # `--require initialized` passes for a learner who never ran the TF apply. Grade the AWS side
     # (role inspect) for "deployed", and CONNECTED for "healthy".
     connected_proves: region_cluster_with_heartbeat   # clusters[].lastHeartbeat populated; the only real health
-    time_to_connected_min: null       # UNMEASURED -- needs a real assumable role + EKS build; docs say up to 24h
+    cluster_requires_bound_connector: true
+    # The founding correction for any outpost track. An Outpost with the orchestrator TF applied and a
+    # VALID assumable role builds NOTHING on its own: 55 min at INITIALIZED, clusters null, 0 scans
+    # attempted, and a medium SHI "Outpost With No Connected Connectors ... this Outpost is in idle mode".
+    # Phase 1 (TF module + createOutpost) is half the deploy. Phase 2 is a Cloud Connector bound to the
+    # Outpost via `authParams.outpostId` on createConnector -- the ONLY binding field; there is no
+    # extraConfig key and no wizlab verb for it. Bind it and the cluster appears in 5m41s.
+    time_to_connected_min: 22         # n=1, from connector bind; NOT from createOutpost, which never converges
+    # Bracketed by 2-min polls on one lease: connector bound T0 -> Wiz cluster object T+5m41s -> EKS
+    # CreateCluster visible in-account T+8m -> control plane ACTIVE T+18..20m (9 node groups) ->
+    # status CONNECTED T+20..22m. The docs' "up to 24 hours" (aws-outpost-create.mdx) is a ceiling, not
+    # an expectation. A task grading CONNECTED needs >22 min of budget, and the lab's idle stop must be
+    # off or long -- the learner touches nothing for the whole wait.
+    phase2_roles:                     # both in the workload account; names are fixed by Wiz, do not stem them
+      read_only: WizAccess-Role       # connector's authParams.customerRoleARN; trusts the tenant delegator + externalId
+      scanner: WizScannerRole-<suffix>  # authParams.diskAnalyzer.scanner.roleARN
+    # Rendered from the vendor templates (wiz-aws-read-only-org.json, wiz-aws-scanner-org.json), which
+    # are the authority -- `wizlab role ensure` writes a trust policy IDENTICAL to the read-only one, but
+    # is trust-only by design and attaches no permissions. The read-only role needs ~20KB across 4
+    # documents: 2 fit the 10240-byte inline cap, 2 MUST be customer-managed policies. The scanner role
+    # trusts arn:aws:iam::<orchestratorAccount>:role/WizOrchestratorNodePoolRole with sts:ExternalId,
+    # so it depends on phase 1 having run. The docs' recommended path for both is a CloudFormation
+    # StackSet -- unusable on an Instruqt lease, where `cloudformation` is not an allowed service and is
+    # therefore an explicit deny. Use the Terraform variant or emit the roles from the runner.
+    role_last_used_is_useless: true
+    # Do NOT infer "Wiz never assumed the role" from an empty iam Role.RoleLastUsed. All five Wiz roles
+    # read NEVER while Wiz was demonstrably mid-CreateCluster in that account. It lags far past the
+    # window any check or diagnosis runs in.
     uninstall_to_uninstalled_min:     # uninstallOutpost -> UNINSTALLED, no real infra to tear down
       from_initialized: 1.7           # 103s, n=1
       from_initializing: 5.9          # 354s, n=1 -- same no-infra case, 3.4x slower; do not assume a tight bound
@@ -1181,6 +1208,13 @@ outpost_lifecycle:
     # per UTC day, so sum the window. `wizlab outpost inspect --require scanned` is this query.
     connected_without_scans_fraction: 4/7   # CONNECTED AWS Outposts reporting 0 scans over a 7d window
     # So CONNECTED must NOT be read as "it scanned something" -- the two are independent assertions.
+    # `wizlab instance inspect` does not close that gap either: it is cloudResources totalCount, i.e.
+    # inventory presence, and it PRINTS the word "scanned". The EC2 satisfied it while this outpost's
+    # own scan count was still 0.
+    ui_active_is_not_connected: true
+    # The GUI showed the deploy as Active/connected while the API held status INITIALIZED with clusters
+    # null. UI wording tracks the connector and `enabled`, not OutpostStatus. Grade the enum; and do not
+    # write a learner-facing status table that equates the UI word with the API state.
     verify: |
       wizlab outpost ensure --name lab-<id> --role-arn arn:aws:iam::123456789012:role/nonexistent
       wizlab outpost inspect --name lab-<id> --require initialized   # exit 1, then 0 within ~4 min
@@ -1188,6 +1222,10 @@ outpost_lifecycle:
       # 78 successful scans -> exit 0; a CONNECTED-but-idle Outpost -> exit 1
       wizlab outpost inspect --name Stan-Outpost-Standalone-Test --require scanned --lookback-days 7
       wizlab outpost inspect --name CT-Outpost --require scanned --lookback-days 7
+      # time_to_connected_min + cluster_requires_bound_connector, on a lease with phase 1 applied:
+      wizlab outpost inspect --require connected                     # exit 1 -- no connector, no cluster
+      # then createConnector(type "aws", authParams{outpostId, customerRoleARN, diskAnalyzer.scanner.roleARN})
+      wizlab outpost inspect --require connected                     # exit 0 within ~22 min
 
 # ---------------------------------------------------------------------------------------------------
 # Tag filtering. The only lease-scoping mechanism that works at all, since AWS-side enumeration is
