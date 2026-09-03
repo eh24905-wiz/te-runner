@@ -1162,8 +1162,15 @@ outpost_lifecycle:
     # against a 10240-byte aggregate inline cap per role. The scanner role trusts
     # arn:aws:iam::<orchestratorAccount>:role/WizOrchestratorNodePoolRole with sts:ExternalId, so it
     # requires phase 1. `cloudformation` is absent from the lease services allowlist, making the vendor's
-    # recommended StackSet path an explicit deny; render the template or use its Terraform variant.
+    # recommended StackSet path an explicit deny. The vendor Terraform (the wiz-aws-native-terraform
+    # module) emits the read-only role ONLY, so the scanner role has to be authored; it needs one
+    # AWS-managed policy, job-function/ViewOnlyAccess, and nothing custom.
     # `wizlab role ensure` writes a trust policy identical to the read-only template's, permissions none.
+    binding_has_no_readback: true
+    # authParams is write-only on Connector: neither outpostId nor diskAnalyzer.scanner.roleARN reads
+    # back. `Connector.outpost { id name }` is the only field distinguishing a bound connector from an
+    # unbound one, and both reach status CONNECTED. Nothing Wiz-side validates the scanner ARN it is
+    # handed either, so assert that role in the cloud account.
     scan_needs_on_demand_trigger: true
     scan_trigger_mutation: requestConnectorScan   # input {id, omitDataScan: false, enableArchivedReposCodeScan}
     # requestConnectorEntityScan is NOT a trigger: it returns OK and registers a 1-second CLOUD_EVENT
