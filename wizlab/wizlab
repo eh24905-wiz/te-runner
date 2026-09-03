@@ -597,6 +597,18 @@ def _ensure_azure(args, account):
     _create_connector(f"{_lab_stem(_session_id(args))}-connector", "azure", auth, extra)
 
 
+def _outpost_target(args):
+    """(id, name) of the Outpost a connector binds to or is asserted against. `--outpost-name` (default:
+    the session stem) is the name the console's Outpost dropdown shows, so it is how a learner picks one
+    and how a solve mirrors them; `--outpost-id` skips the lookup. id is None when no such Outpost
+    exists."""
+    oid = _flag(args, "--outpost-id")
+    if oid:
+        return oid, oid
+    name = _flag(args, "--outpost-name") or _lab_stem(_session_id(args))
+    return (_resolve_outpost(name) or {}).get("id"), name
+
+
 def _assert_outpost_bound(args, node):
     """Assert the connector is bound to the session's Outpost.
 
@@ -604,13 +616,10 @@ def _assert_outpost_bound(args, node):
     Outpost stays INITIALIZED with clusters null forever. `outpost` is the only field that separates
     them, which is why this is its own require rather than part of `healthy`."""
     bound = node.get("outpost") or {}
-    want = _flag(args, "--outpost-id")
+    want, name = _outpost_target(args)
     if not want:
-        name = _outpost_name(args)
-        want = (_resolve_outpost(name) or {}).get("id")
-        if not want:
-            print(f"no outpost named {name}; nothing for a connector to bind to")
-            sys.exit(1)
+        print(f"no outpost named {name}; nothing for a connector to bind to")
+        sys.exit(1)
     role = (node.get("config") or {}).get("customerRoleARN") or "(none)"
     if not bound:
         print(f"connector is bound to NO outpost (customerRoleARN={role}); it will never build a cluster")
@@ -629,16 +638,20 @@ def _aws_auth_params(args, account):
     to read a volume, so a connector bound without it reaches CONNECTED and still scans nothing, which
     is why the two flags are required together."""
     auth = {"customerRoleARN": _flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{ROLE_NAME}"}
-    outpost_id = _flag(args, "--outpost-id")
     scanner_arn = _flag(args, "--scanner-role-arn")
-    if outpost_id and not scanner_arn:
-        die(2, "connector ensure --outpost-id needs --scanner-role-arn: an outpost-bound connector "
-               "with no diskAnalyzer scanner role connects but never scans a disk")
-    if scanner_arn and not outpost_id:
-        die(2, "--scanner-role-arn is only meaningful with --outpost-id")
-    if outpost_id:
-        auth["outpostId"] = outpost_id
-        auth["diskAnalyzer"] = {"scanner": {"roleARN": scanner_arn}}
+    bind = _flag(args, "--outpost-id") or _flag(args, "--outpost-name")
+    if bind and not scanner_arn:
+        die(2, "binding an outpost needs --scanner-role-arn: an outpost-bound connector with no "
+               "diskAnalyzer scanner role connects but never scans a disk")
+    if scanner_arn and not bind:
+        die(2, "--scanner-role-arn is only meaningful with --outpost-id or --outpost-name")
+    if not bind:
+        return auth
+    oid, name = _outpost_target(args)
+    if not oid:
+        die(3, f"no outpost named {name}: nothing to bind this connector to")
+    auth["outpostId"] = oid
+    auth["diskAnalyzer"] = {"scanner": {"roleARN": scanner_arn}}
     return auth
 
 

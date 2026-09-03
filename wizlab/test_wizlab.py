@@ -909,6 +909,28 @@ class OutpostConnectorBinding(unittest.TestCase):
         self.assertEqual(auth, {"customerRoleARN": "arn:r", "outpostId": "o1",
                                 "diskAnalyzer": {"scanner": {"roleARN": "arn:s"}}})
 
+    def test_ensure_binds_by_name_the_way_the_console_dropdown_does(self):
+        created = {"createConnector": {"connector": {"id": "c1", "name": "lab-x-connector",
+                                                     "status": "INITIAL"}}}
+        calls = []
+
+        def api(query, variables):
+            calls.append((query, variables))
+            return created, "tid"
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--session", "x",
+                                     "--outpost-name", "lab-x", "--scanner-role-arn", "arn:s"],
+                                    outposts={"id": "o1"}, api=api), 0)
+        self.assertEqual(calls[0][1]["input"]["authParams"]["outpostId"], "o1")
+
+    def test_ensure_refuses_to_create_an_unbindable_connector(self):
+        # Phase 1 never happened. Exit 3, not 1: this is a solve/setup path, and a connector created
+        # unbound here would reach CONNECTED and quietly scan nothing.
+        self.assertEqual(self._exit(wz.cmd_connector_ensure,
+                                    ["--account-id", "111111111111", "--session", "x",
+                                     "--outpost-name", "lab-x", "--scanner-role-arn", "arn:s"],
+                                    outposts=None), 3)
+
     def test_ensure_is_a_no_op_when_already_bound_to_that_outpost(self):
         with mock.patch.object(wz, "find_connector",
                                return_value=[self._node({"id": "o1", "name": "lab-x"})]), \

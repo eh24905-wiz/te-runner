@@ -32,9 +32,10 @@ Runtime-Sensor labs — `sensor` and `detection`:
   All measured — grade and reap off `measurements.yaml outpost_lifecycle.aws`, never off the status
   name's plain meaning.
 - `connector ensure|inspect|delete` — a Cloud Connector. AWS `ensure` sets
-  `authParams.customerRoleARN`; `--outpost-id` with `--scanner-role-arn` also sets
-  `authParams.outpostId` and `authParams.diskAnalyzer.scanner.roleARN` — the second phase of an Outpost
-  deploy, without which Wiz builds no scan cluster. `inspect --require exists|healthy|outpost-bound`.
+  `authParams.customerRoleARN`; `--outpost-id`, or `--outpost-name` (default: the session stem, the name
+  the console dropdown shows), with `--scanner-role-arn` also sets `authParams.outpostId` and
+  `authParams.diskAnalyzer.scanner.roleARN` — the second phase of an Outpost deploy, without which Wiz
+  builds no scan cluster. `inspect --require exists|healthy|outpost-bound`.
 - `sensor ensure|delete|inspect` — a `type:SENSOR` service account is the sensor's credential
   (`ensure` mints it named on the session stem, emits `WIZ_API_CLIENT_ID/SECRET`; `delete` removes it;
   the reaper's ServiceAccount sweep also covers it). `inspect --require active` asserts the sensor
