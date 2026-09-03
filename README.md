@@ -1,6 +1,6 @@
 # te-runner
 
-The one Docker image TE 2.0 labs reference (`te-labkit-v2/PRD.md` rock 2).
+The one Docker image TE 2.0 labs reference.
 Carries `wizlab` (`/usr/local/bin/wizlab`), the measured-facts catalog
 (`/opt/te/measurements.yaml`), AWS CLI v2, Terraform 1.9.8, python 3.12, jq.
 
@@ -10,8 +10,8 @@ labs pin (Instruqt pulls anonymously). A tag on `origin` (wiz-training) builds a
 **private** org package labs can't pull — `manifest unknown`/401. Never `latest`.
 
 `wizlab` exit codes: 0 satisfied · 1 not satisfied · 2 invocation · 3
-environment. In learner checks, remap 2/3 to 1 (out-of-list codes brick the
-session — probe finding 2026-08-28); consume them raw in CI.
+environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
+session in a terminal `validating_error`); consume them raw in CI.
 
 Next action: measure the post-role connector `healthy` enum on a live lease
 (TODO in `wizlab/wizlab`).
