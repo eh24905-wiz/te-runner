@@ -18,7 +18,7 @@ on:
 jobs:
   reap:
     runs-on: ubuntu-latest
-    container: ghcr.io/eh24905-wiz/te-runner:v0.1.30 # the reaper-bearing tag; bump when the reaper changes
+    container: ghcr.io/eh24905-wiz/te-runner:v0.1.32 # the reaper-bearing tag; bump when the reaper changes
     steps:
       - name: reap orphans
         env:
