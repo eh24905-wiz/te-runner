@@ -12,6 +12,7 @@ with the env-health check as its own leading `check` block. In CI, consume 2/3 d
 Queries and auth are mined from te-labkit/bricks/connector.py (proven on live leases), not invented.
 """
 
+import datetime
 import json
 import os
 import re
@@ -150,6 +151,50 @@ SENSORS_Q = """query Sensors($s: String!) {
 # filter, which IS the track's Threats-vs-Detections lesson. sensorId scopes to one lab's sensor.
 DETECTIONS_Q = """query Dets($f: DetectionFilters) {
   detections(first: 1, filterBy: $f) { totalCount }
+}"""
+
+# --- Wiz Outpost (Automated deploy on the customer's own account). Scope by name via `search`
+# (OutpostFilters has no account/region field), exactly like the sensor plane. `status` is the
+# OutpostStatus lifecycle enum: CONNECTED = a region scan cluster with a heartbeat (healthy
+# terminal), INITIALIZED = the object is registered and NOTHING MORE — measured 2026-09-02, an Outpost
+# whose roleARN names an account that is not ours still reaches INITIALIZED with errorCode null, so it
+# is not evidence any AWS resource exists (measurements.yaml outpost_lifecycle.aws). The
+# serviceType filter is a LIST. createOutpost/uninstallOutpost/deleteOutpost payloads are the
+# operator GUI-capture in tracks/wiz-outpost-aws-201/research.md; useWizServiceAccount:true means
+# createOutpost returns a null serviceAccount. Shapes introspected live on TS_PROD 2026-09-02. ---
+OUTPOSTS_Q = """query Outposts($s: String) {
+  outposts(first: 50, filterBy: { search: $s, serviceType: [AWS] }) {
+    nodes { id name status inAccountOutpostType serviceType }
+    totalCount
+  }
+}"""
+
+OUTPOST_Q = """query Outpost($id: ID!) {
+  outpost(id: $id) { id name status }
+}"""
+
+CREATE_OUTPOST = """mutation CreateOutpost($input: CreateOutpostInput!) {
+  createOutpost(input: $input) { outpost { id name status } }
+}"""
+
+UNINSTALL_OUTPOST = """mutation UninstallOutpost($input: UninstallOutpostInput!) {
+  uninstallOutpost(input: $input) { outpost { id status } }
+}"""
+
+DELETE_OUTPOST = """mutation DeleteOutpost($input: DeleteOutpostInput!) {
+  deleteOutpost(input: $input) { _stub }
+}"""
+
+# The only OUTPOST-SCOPED proof that a disk was actually scanned, and the reason this lab needs no
+# cloud connector: cloudResources/vulnerabilityFindings answer "is the account inventoried", which is
+# the connector's job, whereas this counts scans performed BY one outpostId. Buckets are one point per
+# UTC day, so sum the window. outpostId is String! (not ID!) — measured on TS_PROD 2026-09-02, where
+# 3 of 7 CONNECTED AWS Outposts reported nonzero and CONNECTED-with-zero is common (CONNECTED means
+# the cluster has a heartbeat, not that it has scanned anything).
+SCAN_METRICS = """query ScanMetrics($s: DateTime!, $e: DateTime!, $o: String!) {
+  resourceScanMetricsTrend(startDate: $s, endDate: $e, outpostId: $o) {
+    dataPoints { timestamp aggregatedMetrics { totalScansCount successfulScansCount failedScansCount } }
+  }
 }"""
 
 # Schema-explorer spike: find the audit-log/activity query that could drive a reaper, and drill into
@@ -722,6 +767,156 @@ def cmd_detection_inspect(args):
     n = (data.get("detections") or {}).get("totalCount") or 0
     print(f"detection inspect: {n} {dtype} for rule {rule!r} on sensor {name} ({node['id']})")
     sys.exit(0 if n > 0 else 1)
+
+
+def _outpost_name(args):
+    # The Outpost's Wiz name, pinned to the session stem so the reaper's `search` finds it and
+    # concurrent leases never collide. --name overrides for a manual/dev run.
+    return _flag(args, "--name") or _lab_stem(_session_id(args))
+
+
+def _resolve_outpost(name):
+    """The AWS Outpost whose name exactly matches (search is substring, so filter to ==),
+    CONNECTED-first so a healthy one outranks a stale UNINSTALLED record on a recycled name."""
+    data, _ = api(OUTPOSTS_Q, {"s": name})
+    nodes = [n for n in ((data.get("outposts") or {}).get("nodes") or []) if n.get("name") == name]
+    return sorted(nodes, key=lambda n: n.get("status") != "CONNECTED")[0] if nodes else None
+
+
+_OUTPOST_REQUIRE = {"exists", "initialized", "connected", "scanned"}
+
+
+def cmd_outpost_inspect(args):
+    """Assert the session's Outpost is known to Wiz (--require exists), has reached INITIALIZED (the
+    object is registered — NOT that the orchestrator role works; see the note above the queries), is
+    CONNECTED (a region scan cluster with a heartbeat — the healthy terminal, and the only status that
+    proves the deploy), or has SCANNED at least one disk (--require scanned, the workload-scan proof;
+    CONNECTED alone does not imply it). The UI word 'Active' maps to CONNECTED, so grade the enum,
+    not the label."""
+    name = _outpost_name(args)
+    require = _flag(args, "--require") or "exists"
+    if require not in _OUTPOST_REQUIRE:
+        die(2, f"--require must be {'|'.join(sorted(_OUTPOST_REQUIRE))}, got {require}")
+    node = _resolve_outpost(name)
+    if not node:
+        print(f"no outpost named {name}")
+        sys.exit(1)
+    st = node["status"]
+    print(f"outpost {node['name']} ({node['id']}): status={st}")
+    if require == "exists":
+        sys.exit(0)
+    if require == "connected":
+        sys.exit(0 if st == "CONNECTED" else 1)
+    if require == "scanned":
+        sys.exit(_scan_counts(node["id"], int(_flag(args, "--lookback-days") or 2)))
+    # initialized: CONNECTED is a strict superset (a connected outpost passed through INITIALIZED),
+    # so accept both — a check demanding exactly INITIALIZED would flip back to failure the moment
+    # the scan cluster comes up.
+    sys.exit(0 if st in ("INITIALIZED", "CONNECTED") else 1)
+
+
+def _scan_counts(oid, lookback_days):
+    """Exit code for '--require scanned': 0 iff this Outpost completed >=1 successful workload scan in
+    the window. Failed-only counts as not satisfied but is printed — a nonzero failedScansCount is the
+    signal that the cluster is up and the node pool cannot snapshot (an SCP/KMS gap), which reads very
+    differently to an operator than 'nothing has happened yet'."""
+    now = datetime.datetime.now(datetime.UTC)
+    data, _ = api(SCAN_METRICS, {"s": (now - datetime.timedelta(days=lookback_days)).isoformat(),
+                                 "e": now.isoformat(), "o": oid})
+    points = ((data.get("resourceScanMetricsTrend") or {}).get("dataPoints") or [])
+    agg = [p.get("aggregatedMetrics") or {} for p in points]
+    ok = sum(m.get("successfulScansCount") or 0 for m in agg)
+    failed = sum(m.get("failedScansCount") or 0 for m in agg)
+    print(f"outpost scans in {lookback_days}d: {ok} successful, {failed} failed")
+    return 0 if ok > 0 else 1
+
+
+def cmd_outpost_ensure(args):
+    """Create the AWS Automated Outpost named on the session stem, idempotent by name. Needs the
+    orchestrator role ARN (--role-arn, the output of the Wiz orchestrator TF module) — Wiz assumes it
+    to build the EKS scan cluster + network in the leased account. useWizServiceAccount so no
+    per-outpost SA is minted. Solve/setup only. createOutpost input = operator capture (research.md)."""
+    name = _outpost_name(args)
+    role_arn = _flag(args, "--role-arn") or die(
+        2, "outpost ensure needs --role-arn (the orchestrator role ARN from the TF module)")
+    region = _flag(args, "--region") or "us-east-1"
+    existing = _resolve_outpost(name)
+    if existing:
+        print(f"outpost {name} already exists ({existing['id']}) status={existing['status']}; nothing to do")
+        sys.exit(0)
+    # allowedRegions pins the scan cluster to the workload region (the EC2's). The capture used []
+    # (unrestricted); [region] is the deterministic form — the validator confirms the cluster lands
+    # in <region>. awsConfig keys are the capture's exact shape (roleARN is caps).
+    inp = {
+        "name": name,
+        "serviceType": "AWS",
+        "enabled": True,
+        "selfManaged": False,
+        "useWizServiceAccount": True,
+        "forceHttp1": False,
+        "awsConfig": {"disableNatGateway": True, "enablePrivateCluster": False, "roleARN": role_arn},
+        "managedConfig": {"kubernetesLoggingEnabled": False, "kubernetesCloudMonitoringEnabled": False,
+                          "deploySensor": False},
+        "allowedRegions": [region],
+    }
+    data, _ = api(CREATE_OUTPOST, {"input": inp})
+    o = (data.get("createOutpost") or {}).get("outpost") or {}
+    if not o:
+        die(3, "createOutpost returned no outpost")
+    print(f"created outpost {o['name']} ({o['id']}) status={o.get('status')}")
+    sys.exit(0)
+
+
+_OUTPOST_DELETABLE = ("UNINSTALLED", "UNINSTALLATION_FAILED")
+
+
+def cmd_outpost_delete(args):
+    """Best-effort reap of the session's Outpost. Measured on TS_PROD 2026-09-02: deleteOutpost on a
+    live Outpost fails with a server-side internal error, and still fails while UNINSTALLING — the
+    only working order is uninstall -> wait for UNINSTALLED -> delete (uninstall took 103s with no
+    real infra; real EKS teardown is longer, hence --timeout). Exits 0 even when the object outlives
+    the wait: the EKS infra dies with the lease, so a lingering UNINSTALLED record is cosmetic and
+    the out-of-band daily reaper sweeps it. Resolve by --id or the session-stem name."""
+    oid, name = _flag(args, "--id"), None
+    if not oid:
+        name = _outpost_name(args)
+        node = _resolve_outpost(name)
+        if not node:
+            print(f"no outpost named {name}; nothing to delete")
+            sys.exit(0)
+        oid, status = node["id"], node["status"]
+    else:
+        status = (_outpost_by_id(oid) or {}).get("status")
+    if status not in _OUTPOST_DELETABLE:
+        if status != "UNINSTALLING":
+            api(UNINSTALL_OUTPOST, {"input": {"id": oid}})
+            print(f"uninstalling outpost {oid} (was {status})")
+        status = _await_uninstalled(oid, int(_flag(args, "--timeout") or 600))
+        if status == "GONE":
+            print(f"outpost {oid} no longer exists; nothing left to delete")
+            sys.exit(0)
+        if status not in _OUTPOST_DELETABLE:
+            print(f"outpost {oid} still {status} after the wait; leaving the record for the daily reaper")
+            sys.exit(0)
+    api(DELETE_OUTPOST, {"input": {"id": oid}})
+    print(f"deleted outpost {oid}")
+    sys.exit(0)
+
+
+def _outpost_by_id(oid):
+    data, _ = api(OUTPOST_Q, {"id": oid})
+    return data.get("outpost")
+
+
+def _await_uninstalled(oid, timeout):
+    """Poll until the uninstall reaches a deletable terminal state; returns the last status seen."""
+    deadline, status = time.time() + timeout, "UNINSTALLING"
+    while time.time() < deadline:
+        time.sleep(20)
+        status = (_outpost_by_id(oid) or {}).get("status") or "GONE"
+        if status in _OUTPOST_DELETABLE or status == "GONE":
+            break
+    return status
 
 
 # --- role trust-policy helpers, ported from te-labkit clouds/aws.py (proven on live leases). IAM
@@ -1397,6 +1592,9 @@ VERBS = {
     ("sensor", "delete"): cmd_sensor_delete,
     ("sensor", "inspect"): cmd_sensor_inspect,
     ("detection", "inspect"): cmd_detection_inspect,
+    ("outpost", "inspect"): cmd_outpost_inspect,
+    ("outpost", "ensure"): cmd_outpost_ensure,
+    ("outpost", "delete"): cmd_outpost_delete,
     ("role", "inspect"): cmd_role_inspect,
     ("role", "ensure"): cmd_role_ensure,
     ("user", "ensure"): cmd_user_ensure,

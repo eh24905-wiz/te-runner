@@ -1141,6 +1141,53 @@ lifecycle:
       liveness on status on either cloud.
 
 # ---------------------------------------------------------------------------------------------------
+# Outpost control plane. Not an indexing plane: these are OutpostStatus transitions, measured with a
+# DELIBERATELY NON-ASSUMABLE role ARN (arn:aws:iam::123456789012:role/...), so no EKS was ever built.
+# That is what makes the first row load-bearing rather than trivia -- see initialized_proves.
+# ---------------------------------------------------------------------------------------------------
+outpost_lifecycle:
+  aws:
+    tenant: TS_PROD
+    deployment_type: Automated        # useWizServiceAccount: true, createOutpost via wizlab outpost ensure
+    create_status: INITIALIZING       # what createOutpost returns synchronously
+    initializing_to_initialized_max_min: 4    # n=1, bracketed by polls; reached INITIALIZED with a BOGUS role
+    initialized_proves: object_registered_only
+    # The expensive correction. INITIALIZED does NOT mean the orchestrator role is assumable, the
+    # Terraform applied, or anything exists in AWS -- it means the Wiz side is ready to start trying
+    # (operator, 2026-09-02). An Outpost created against account 123456789012 with a role that cannot
+    # exist reached INITIALIZED with errorCode null and clusters null. So a check that grades
+    # `--require initialized` passes for a learner who never ran the TF apply. Grade the AWS side
+    # (role inspect) for "deployed", and CONNECTED for "healthy".
+    connected_proves: region_cluster_with_heartbeat   # clusters[].lastHeartbeat populated; the only real health
+    time_to_connected_min: null       # UNMEASURED -- needs a real assumable role + EKS build; docs say up to 24h
+    uninstall_to_uninstalled_min:     # uninstallOutpost -> UNINSTALLED, no real infra to tear down
+      from_initialized: 1.7           # 103s, n=1
+      from_initializing: 5.9          # 354s, n=1 -- same no-infra case, 3.4x slower; do not assume a tight bound
+    delete_requires_uninstall: true
+    # deleteOutpost on a live (INITIALIZED) Outpost fails with a server-side "internal error" + a
+    # request id, NOT a validation error -- and fails again while UNINSTALLING. The only order that
+    # works is uninstall -> poll to UNINSTALLED -> delete. wizlab `outpost delete` does exactly that
+    # (--timeout 600 default, exits 0 on a stuck record because the EKS infra dies with the lease).
+    daily_reaper_covers_outposts: false
+    # The out-of-band audit-log reaper derives delete<Type> generically, so it attempts a direct
+    # deleteOutpost, gets the internal error, and ALERTS instead of reaping. A leftover Outpost is a
+    # human alert, not a silent leak -- acceptable, but it is not automatic cleanup.
+    scan_proof_query: resourceScanMetricsTrend
+    # The disk-scan assertion, and the only OUTPOST-SCOPED one: cloudResources/vulnerabilityFindings
+    # answer "is the account inventoried" (the connector's job); this counts scans performed BY one
+    # outpostId. Args (startDate, endDate, outpostId: String! -- not ID!); dataPoints are one bucket
+    # per UTC day, so sum the window. `wizlab outpost inspect --require scanned` is this query.
+    connected_without_scans_fraction: 4/7   # CONNECTED AWS Outposts reporting 0 scans over a 7d window
+    # So CONNECTED must NOT be read as "it scanned something" -- the two are independent assertions.
+    verify: |
+      wizlab outpost ensure --name lab-<id> --role-arn arn:aws:iam::123456789012:role/nonexistent
+      wizlab outpost inspect --name lab-<id> --require initialized   # exit 1, then 0 within ~4 min
+      time wizlab outpost delete --name lab-<id>                     # uninstall -> wait -> delete, exit 0
+      # 78 successful scans -> exit 0; a CONNECTED-but-idle Outpost -> exit 1
+      wizlab outpost inspect --name Stan-Outpost-Standalone-Test --require scanned --lookback-days 7
+      wizlab outpost inspect --name CT-Outpost --require scanned --lookback-days 7
+
+# ---------------------------------------------------------------------------------------------------
 # Tag filtering. The only lease-scoping mechanism that works at all, since AWS-side enumeration is
 # impossible on these leases: tag:GetResources is SCP-denied.
 # ---------------------------------------------------------------------------------------------------

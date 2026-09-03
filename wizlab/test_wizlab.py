@@ -625,5 +625,138 @@ class SensorDetectionGrading(unittest.TestCase):
             self._exit(wz.cmd_detection_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 2)
 
 
+class OutpostGrading(unittest.TestCase):
+    """Locks the OutpostStatus grading table and the uninstall->wait->delete order, both measured on
+    TS_PROD 2026-09-02 (see cmd_outpost_delete). A refactor that reorders the reap would silently
+    leave an Outpost record behind, which no lab check would catch."""
+
+    def _api(self, status, after=None, scans=None):
+        """after: statuses `outpost(id)` returns on successive polls, for the uninstall wait.
+        scans: one (successful, failed) pair per daily bucket the scan-metrics trend reports."""
+        seq, calls = list(after or []), []
+
+        def side(query, variables):
+            calls.append((query, variables))
+            if "resourceScanMetricsTrend" in query:
+                pts = [{"timestamp": f"d{i}",
+                        "aggregatedMetrics": {"totalScansCount": s + f, "successfulScansCount": s,
+                                              "failedScansCount": f}}
+                       for i, (s, f) in enumerate(scans or [])]
+                return {"resourceScanMetricsTrend": {"dataPoints": pts}}, "tid"
+            if "outposts(" in query:
+                nodes = [] if status is None else [{"id": "o1", "name": "lab-x", "status": status}]
+                return {"outposts": {"nodes": nodes, "totalCount": len(nodes)}}, "tid"
+            if "outpost(id:" in query:
+                st = seq.pop(0) if seq else status
+                return {"outpost": None if st == "GONE" else {"id": "o1", "status": st}}, "tid"
+            if "createOutpost" in query:
+                return {"createOutpost": {"outpost": {"id": "o1", "name": "lab-x", "status": "INITIALIZING"}}}, "tid"
+            return {}, "tid"
+        return side, calls
+
+    def _exit(self, fn, argv, side):
+        # A fake clock, not just a no-op sleep: the uninstall wait is bounded by time.time(), so a
+        # patched-out sleep alone would spin on the real clock for the whole --timeout.
+        clock = {"t": 1000.0}
+        with mock.patch.object(wz, "api", side_effect=side), \
+                mock.patch.object(wz.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)), \
+                mock.patch.object(wz.time, "time", lambda: clock["t"]), \
+                self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code
+
+    def test_inspect_grades_the_enum_not_the_ui_word(self):
+        for status, require, want in [
+            ("CONNECTED", "connected", 0),
+            ("CONNECTED", "initialized", 0),      # CONNECTED is a superset of INITIALIZED
+            ("INITIALIZED", "connected", 1),
+            ("INITIALIZED", "initialized", 0),
+            ("INITIALIZING", "initialized", 1),   # measured: a fresh createOutpost lands here
+            ("UNINSTALLED", "initialized", 1),
+            ("UNINSTALLED", "exists", 0),
+            ("ERROR", "connected", 1),
+        ]:
+            side, _ = self._api(status)
+            self.assertEqual(
+                self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", require], side), want,
+                f"{status} --require {require}")
+
+    def test_inspect_absent_exit_1(self):
+        side, _ = self._api(None)
+        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], side), 1)
+
+    def test_scanned_needs_a_successful_scan_not_just_connected(self):
+        # Measured on TS_PROD 2026-09-02: 4 of 7 CONNECTED AWS Outposts had scanned nothing, so
+        # CONNECTED must not satisfy --require scanned. Failed-only is also not satisfied (it means
+        # the node pool cannot snapshot), and the daily buckets are summed across the window.
+        for scans, want in [([], 1), ([(0, 0), (0, 0)], 1), ([(0, 3)], 1), ([(0, 0), (1, 0)], 0),
+                            ([(5, 2)], 0)]:
+            side, _ = self._api("CONNECTED", scans=scans)
+            self.assertEqual(
+                self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"], side),
+                want, f"scans={scans}")
+
+    def test_scanned_absent_outpost_never_queries_metrics(self):
+        side, calls = self._api(None, scans=[(9, 0)])
+        self.assertEqual(
+            self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"], side), 1)
+        self.assertFalse([c for c in calls if "resourceScanMetricsTrend" in c[0]])
+
+    def test_inspect_bad_require_exit_2(self):
+        side, _ = self._api("CONNECTED")
+        self.assertEqual(
+            self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "bogus"], side), 2)
+
+    def test_inspect_name_matches_exactly_not_substring(self):
+        # `search` is substring server-side; a neighbour session's longer name must not grade this one.
+        def side(query, variables):
+            return {"outposts": {"nodes": [{"id": "o2", "name": "lab-xyz", "status": "CONNECTED"}]}}, "tid"
+        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], side), 1)
+
+    def test_ensure_needs_role_arn(self):
+        side, _ = self._api(None)
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x"], side), 2)
+
+    def test_ensure_is_idempotent_by_name_and_never_recreates(self):
+        side, calls = self._api("CONNECTED")
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "a"], side), 0)
+        self.assertNotIn("createOutpost", " ".join(q for q, _ in calls))
+
+    def test_ensure_posts_role_arn_inside_aws_config(self):
+        side, calls = self._api(None)
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "arn:r"], side), 0)
+        inp = next(v["input"] for q, v in calls if "createOutpost" in q)
+        self.assertEqual(inp["awsConfig"]["roleARN"], "arn:r")   # caps, nested — the capture's shape
+        self.assertEqual(inp["allowedRegions"], ["us-east-1"])
+
+    def test_delete_uninstalls_first_then_waits_then_deletes(self):
+        side, calls = self._api("INITIALIZED", after=["UNINSTALLING", "UNINSTALLED"])
+        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
+        order = [q.split("(")[0].split()[-1] for q, _ in calls if "mutation" in q]
+        self.assertEqual(order, ["UninstallOutpost", "DeleteOutpost"])
+
+    def test_delete_never_deletes_a_live_outpost_directly(self):
+        # deleteOutpost on a live Outpost is a server-side internal error, so it must not be attempted.
+        side, calls = self._api("CONNECTED", after=["UNINSTALLED"])
+        self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side)
+        first = next(q for q, _ in calls if "mutation" in q)
+        self.assertIn("UninstallOutpost", first)
+
+    def test_delete_skips_uninstall_when_already_uninstalled(self):
+        side, calls = self._api("UNINSTALLED")
+        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
+        self.assertNotIn("uninstallOutpost", " ".join(q for q, _ in calls))
+
+    def test_delete_absent_is_exit_0(self):
+        side, _ = self._api(None)
+        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
+
+    def test_delete_exits_0_when_uninstall_outlives_the_wait(self):
+        # Best-effort: the EKS infra dies with the lease, so a stuck record must not fail the reaper.
+        side, calls = self._api("INITIALIZED", after=["UNINSTALLING"] * 40)
+        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x", "--timeout", "60"], side), 0)
+        self.assertNotIn("deleteOutpost", " ".join(q for q, _ in calls))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
