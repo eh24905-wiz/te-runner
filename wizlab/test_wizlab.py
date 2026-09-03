@@ -173,7 +173,7 @@ class RoleInspectGrading(unittest.TestCase):
 
     def test_missing_creds_exit_3_not_1(self):
         # Anything but NoSuchEntity is environment: "no credentials" must never grade as
-        # "learner wrong" (the v1 LIVENESS class).
+        # "learner wrong".
         self.assertEqual(self._run(_proc(255, "", "Unable to locate credentials")), 3)
         self.assertEqual(self._run(_proc(255, "", "ExpiredToken: token is expired")), 3)
 
@@ -238,7 +238,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             did, alert, blocked = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
         self.assertEqual((did, alert, blocked), (False, None, False))
 
-    def test_reap_one_does_not_block_on_an_unmeasured_type(self):
+    def test_reap_one_does_not_block_on_an_unhandled_type(self):
         # No handler for the type: unactionable, so alert a human but never fail the run — the generic
         # plural+search handler misses most create types and this would otherwise fire every reap.
         with mock.patch.object(wz, "_reap_handler", return_value={}), \
@@ -360,7 +360,7 @@ class CloudSelection(unittest.TestCase):
         self.assertTrue(all(v == [] for v in payload["extraConfig"].values()))
         self.assertNotIn("customerRoleARN", json.dumps(payload))
 
-    def test_unproven_paths_refuse_rather_than_guess(self):
+    def test_unsupported_paths_refuse_rather_than_guess(self):
         with self.assertRaises(SystemExit) as cm:
             wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", "sub-1"])
         self.assertEqual(cm.exception.code, 2)
@@ -697,9 +697,9 @@ class SensorDetectionGrading(unittest.TestCase):
 
 
 class OutpostGrading(unittest.TestCase):
-    """Locks the OutpostStatus grading table and the uninstall->wait->delete order, both measured on
-    TS_PROD 2026-09-02 (see cmd_outpost_delete). A refactor that reorders the reap would silently
-    leave an Outpost record behind, which no lab check would catch."""
+    """Locks the OutpostStatus grading table and the uninstall->wait->delete order. A refactor that
+    reorders the reap would silently leave an Outpost record behind, which no lab check would
+    catch."""
 
     def _api(self, status, after=None, scans=None):
         """after: statuses `outpost(id)` returns on successive polls, for the uninstall wait.
@@ -742,7 +742,7 @@ class OutpostGrading(unittest.TestCase):
             ("CONNECTED", "initialized", 0),      # CONNECTED is a superset of INITIALIZED
             ("INITIALIZED", "connected", 1),
             ("INITIALIZED", "initialized", 0),
-            ("INITIALIZING", "initialized", 1),   # measured: a fresh createOutpost lands here
+            ("INITIALIZING", "initialized", 1),   # a fresh createOutpost lands here
             ("UNINSTALLED", "initialized", 1),
             ("UNINSTALLED", "exists", 0),
             ("ERROR", "connected", 1),
@@ -757,9 +757,9 @@ class OutpostGrading(unittest.TestCase):
         self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], side), 1)
 
     def test_scanned_needs_a_successful_scan_not_just_connected(self):
-        # Measured on TS_PROD 2026-09-02: 4 of 7 CONNECTED AWS Outposts had scanned nothing, so
-        # CONNECTED must not satisfy --require scanned. Failed-only is also not satisfied (it means
-        # the node pool cannot snapshot), and the daily buckets are summed across the window.
+        # A CONNECTED Outpost commonly has scanned nothing, so CONNECTED must not satisfy --require
+        # scanned. Failed-only is also not satisfied (it means the node pool cannot snapshot), and
+        # the daily buckets are summed across the window.
         for scans, want in [([], 1), ([(0, 0), (0, 0)], 1), ([(0, 3)], 1), ([(0, 0), (1, 0)], 0),
                             ([(5, 2)], 0)]:
             side, _ = self._api("CONNECTED", scans=scans)

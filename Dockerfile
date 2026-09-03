@@ -1,6 +1,6 @@
 # te-runner: the one image every TE 2.0 lab container/VM references, built only in CI.
-# Per-instance state baked into a shared image caused three v1 incidents (te-labkit-v2/PRD.md
-# rock 2); building from scratch each tag makes that class hard to recreate.
+# Never bake per-instance state into this shared image: building from scratch each tag keeps that
+# class of bug hard to recreate.
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,8 +13,8 @@ RUN ARCH=$(uname -m) && \
     unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
 
 # Terraform: labs stage CSP infra from a runner container (the native terraform resource has no
-# egress — te-labkit-v2 lab-patterns). Pinned; version bumps via a new image tag. HashiCorp names
-# archives amd64/arm64, so dpkg --print-architecture (not uname -m, which the AWS CLI uses).
+# egress). Pinned; version bumps via a new image tag. HashiCorp names archives amd64/arm64, so
+# dpkg --print-architecture (not uname -m, which the AWS CLI uses).
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSfL "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_${ARCH}.zip" -o /tmp/tf.zip && \
     unzip -q /tmp/tf.zip -d /usr/local/bin && rm /tmp/tf.zip

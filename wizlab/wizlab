@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """wizlab: the TE lab runtime. Owns every Wiz fact; content decides which fact means success.
 
-Exit codes are the contract (te-labkit-v2/PRD.md rock 1):
+Exit codes are the contract:
   0 condition satisfied | 1 learner state not satisfied | 2 invocation error | 3 environment error
 
 In learner-facing check scripts, never let 2/3 reach the platform: an exit code outside the
 declared success/failure lists lands in a terminal validating_error state that bricks the
-session (probe-verified 2026-08-28). Wrap: `wizlab ... ; case $? in 0) exit 0;; *) exit 1;; esac`
-with the env-health check as its own leading `check` block. In CI, consume 2/3 directly.
-
-Queries and auth are mined from te-labkit/bricks/connector.py (proven on live leases), not invented.
+session. Wrap: `wizlab ... ; case $? in 0) exit 0;; *) exit 1;; esac` with the env-health check
+as its own leading `check` block. In CI, consume 2/3 directly.
 """
 
 import datetime
@@ -28,7 +26,7 @@ from collections import namedtuple
 AUTH_URL = "https://auth.app.wiz.io/oauth/token"
 
 # The delegator ARN is per-tenant and its `prod-<dc>` segment varies by data center, so it is never
-# a constant — resolved live from managedIdentityParameters.aws.roleArn (v1 connector.py:934).
+# a constant — resolved live from managedIdentityParameters.aws.roleArn.
 IDENTITY = """query ManagedIdentityParameters {
   managedIdentityParameters {
     aws { roleArn defaultEnvironment }
@@ -38,7 +36,7 @@ IDENTITY = """query ManagedIdentityParameters {
 }"""
 _DELEGATOR_RE = re.compile(r"role/prod-[A-Za-z0-9_-]+-AssumeRoleDelegator", re.IGNORECASE)
 ROLE_NAME = "WizAccess-Role"
-HEALTHY_STATUSES = {"CONNECTED"}  # measured terminal state; INITIAL_SCANNING is transient, ERROR is failure
+HEALTHY_STATUSES = {"CONNECTED"}  # terminal state; INITIAL_SCANNING is transient, ERROR is failure
 CLOUDS = ("aws", "gcp", "azure")
 # Azure subscription ids are GUIDs, and Wiz stores them lowercase: an UPPERCASED id returns
 # totalCount 0 silently rather than erroring, which grades a healthy subscription as "nothing found".
@@ -125,7 +123,7 @@ UPDATE = """mutation UpdateConnector($input: UpdateConnectorInput!) {
 }"""
 
 # Inventory presence check: a scanned cloud resource of a type, filtered to the lease account.
-# subscriptionExternalId is the CSP account number (measured on TS_PROD); type is the Wiz graph type.
+# subscriptionExternalId is the CSP account number; type is the Wiz graph type.
 INSTANCES = """query Instances($f: CloudResourceFilters) {
   cloudResources(first: 1, filterBy: $f) { totalCount }
 }"""
@@ -133,8 +131,7 @@ INSTANCES = """query Instances($f: CloudResourceFilters) {
 # --- Runtime Sensor (connectorless). A type:SENSOR service account is the sensor's credential; the
 # installed sensor registers under the HOST name (a lab sets the host name to the session stem, so the
 # stem scopes both planes). Neither SensorFilters nor DetectionFilters carries a cloud-account/instance
-# field, so `search` by name is the only session key; detections then scope by the resolved sensorId.
-# Shapes introspected live on TS_PROD 2026-09-02 (createSA payload, DetectionType, SensorStatus). ---
+# field, so `search` by name is the only session key; detections then scope by the resolved sensorId. ---
 SA_FIND = """query FindSA($n: String!) {
   serviceAccounts(first: 50, filterBy: { name: $n, deleted: false }) { nodes { id name } }
 }"""
@@ -156,12 +153,10 @@ DETECTIONS_Q = """query Dets($f: DetectionFilters) {
 # --- Wiz Outpost (Automated deploy on the customer's own account). Scope by name via `search`
 # (OutpostFilters has no account/region field), exactly like the sensor plane. `status` is the
 # OutpostStatus lifecycle enum: CONNECTED = a region scan cluster with a heartbeat (healthy
-# terminal), INITIALIZED = the object is registered and NOTHING MORE — measured 2026-09-02, an Outpost
-# whose roleARN names an account that is not ours still reaches INITIALIZED with errorCode null, so it
-# is not evidence any AWS resource exists (measurements.yaml outpost_lifecycle.aws). The
-# serviceType filter is a LIST. createOutpost/uninstallOutpost/deleteOutpost payloads are the
-# operator GUI-capture in tracks/wiz-outpost-aws-201/research.md; useWizServiceAccount:true means
-# createOutpost returns a null serviceAccount. Shapes introspected live on TS_PROD 2026-09-02. ---
+# terminal), INITIALIZED = the object is registered and NOTHING MORE — an Outpost whose roleARN names
+# an account that is not ours still reaches INITIALIZED with errorCode null, so it is not evidence any
+# AWS resource exists. The serviceType filter is a LIST. useWizServiceAccount:true means createOutpost
+# returns a null serviceAccount. ---
 OUTPOSTS_Q = """query Outposts($s: String) {
   outposts(first: 50, filterBy: { search: $s, serviceType: [AWS] }) {
     nodes { id name status inAccountOutpostType serviceType }
@@ -188,9 +183,8 @@ DELETE_OUTPOST = """mutation DeleteOutpost($input: DeleteOutpostInput!) {
 # The only OUTPOST-SCOPED proof that a disk was actually scanned, and the reason this lab needs no
 # cloud connector: cloudResources/vulnerabilityFindings answer "is the account inventoried", which is
 # the connector's job, whereas this counts scans performed BY one outpostId. Buckets are one point per
-# UTC day, so sum the window. outpostId is String! (not ID!) — measured on TS_PROD 2026-09-02, where
-# 3 of 7 CONNECTED AWS Outposts reported nonzero and CONNECTED-with-zero is common (CONNECTED means
-# the cluster has a heartbeat, not that it has scanned anything).
+# UTC day, so sum the window. outpostId is String! (not ID!). CONNECTED-with-zero is common: CONNECTED
+# means the cluster has a heartbeat, not that it has scanned anything.
 SCAN_METRICS = """query ScanMetrics($s: DateTime!, $e: DateTime!, $o: String!) {
   resourceScanMetricsTrend(startDate: $s, endDate: $e, outpostId: $o) {
     dataPoints { timestamp aggregatedMetrics { totalScansCount successfulScansCount failedScansCount } }
@@ -374,8 +368,8 @@ def _verify_csp(cloud):
 
 def cmd_session_verify(args):
     _tok, dc, tid = token_and_dc()
-    # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is proven
-    # (FIND uses it). This confirms the token is accepted by the API, not just minted by auth.
+    # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is. This confirms
+    # the token is accepted by the API, not just minted by auth.
     api("query { connectors(first: 1) { totalCount } }", {})
     cloud = _flag(args, "--cloud")
     if cloud:
@@ -530,9 +524,9 @@ def cmd_connector_inspect(args):
     print(f"connector {node['name']} ({node['id']}): enabled={node['enabled']} status={node['status']}")
     if require == "exists":
         sys.exit(0)
-    # healthy: measured role-first on TBCMP (measurements.yaml aws.connector) -- INITIAL_SCANNING for
-    # ~2-3 min, then CONNECTED, never ERROR. Require CONNECTED, not merely not-ERROR: INITIAL_SCANNING
-    # is the window before Wiz has actually assumed the role, so not-ERROR there is a false pass.
+    # healthy: role-first, a connector sits in INITIAL_SCANNING for ~2-3 min, then CONNECTED, never
+    # ERROR. Require CONNECTED, not merely not-ERROR: INITIAL_SCANNING is the window before Wiz has
+    # actually assumed the role, so not-ERROR there is a false pass.
     sys.exit(0 if node["enabled"] and node["status"] in HEALTHY_STATUSES else 1)
 
 
@@ -572,8 +566,7 @@ def _ensure_gcp(args, account):
     if matches:
         print(f"connector {matches[0]['name']} already targets project {account}; nothing to do")
         sys.exit(0)
-    # Live-proven payload (v1 bricks/connector.py:499-508) and the readback shape of every live GCP
-    # connector: project scope means every scope list is empty, NOT absent.
+    # Project scope means every scope list is empty, NOT absent.
     extra = {
         "projects": [],
         "excludedProjects": [],
@@ -588,10 +581,10 @@ def _ensure_gcp(args, account):
 
 def _ensure_azure(args, account):
     """Create-if-absent, like GCP: an azure connector carries the subscription and Wiz's own managed
-    identity, so there is nothing that can drift. authParams shape is the readback of 89 live azure
-    connectors (isManagedIdentity on all 89, subscriptionId on the 55 at subscription scope) and v1's
-    live-proven create. The authParams/extraConfig BOUNDARY is inferred by analogy to aws+gcp:
-    testConnectorConfig answers success:true even for a bogus key, so it cannot prove the split."""
+    identity, so there is nothing that can drift. isManagedIdentity is always set; subscriptionId
+    only at subscription scope. The authParams/extraConfig BOUNDARY is inferred by analogy to
+    aws+gcp: testConnectorConfig answers success:true even for a bogus key, so it cannot prove the
+    split."""
     tenant_id = _flag(args, "--tenant-id") or os.getenv("ARM_TENANT_ID")
     if not tenant_id:
         die(2, "connector ensure --cloud azure needs --tenant-id (or ARM_TENANT_ID): the connector "
@@ -635,9 +628,9 @@ def cmd_connector_ensure(args):
         print(f"connector {n['name']}: customerRoleARN {cur or '(none)'} -> {role_arn}")
         sys.exit(0)
     name = f"{_lab_stem(_session_id(args))}-connector"
-    # Proven shape (v1 clouds/aws.py connector_payload): customerRoleARN goes in authParams,
-    # NOT extraConfig; extraConfig carries only skipOrganizationScan. The role need not exist
-    # yet — the connector sits in ERROR until task 2 deploys WizAccess-Role.
+    # customerRoleARN goes in authParams, NOT extraConfig; extraConfig carries only
+    # skipOrganizationScan. The role need not exist yet — the connector sits in ERROR until task 2
+    # deploys WizAccess-Role.
     _create_connector(name, "aws", {"customerRoleARN": role_arn}, {"skipOrganizationScan": True})
 
 
@@ -656,8 +649,7 @@ def cmd_connector_delete(args):
 
 def cmd_instance_inspect(args):
     """Assert a scanned cloud resource of --type (default VIRTUAL_MACHINE) exists in Wiz for the
-    account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check. Measured shape:
-    cloudResources(filterBy subscriptionExternalId + type) on TS_PROD."""
+    account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check."""
     account = _norm_account(_flag(args, "--account-id") or die(2, "instance inspect needs --account-id"))
     rtype = _flag(args, "--type") or "VIRTUAL_MACHINE"
     data, _ = api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
@@ -835,7 +827,7 @@ def cmd_outpost_ensure(args):
     """Create the AWS Automated Outpost named on the session stem, idempotent by name. Needs the
     orchestrator role ARN (--role-arn, the output of the Wiz orchestrator TF module) — Wiz assumes it
     to build the EKS scan cluster + network in the leased account. useWizServiceAccount so no
-    per-outpost SA is minted. Solve/setup only. createOutpost input = operator capture (research.md)."""
+    per-outpost SA is minted. Solve/setup only."""
     name = _outpost_name(args)
     role_arn = _flag(args, "--role-arn") or die(
         2, "outpost ensure needs --role-arn (the orchestrator role ARN from the TF module)")
@@ -871,12 +863,12 @@ _OUTPOST_DELETABLE = ("UNINSTALLED", "UNINSTALLATION_FAILED")
 
 
 def cmd_outpost_delete(args):
-    """Best-effort reap of the session's Outpost. Measured on TS_PROD 2026-09-02: deleteOutpost on a
-    live Outpost fails with a server-side internal error, and still fails while UNINSTALLING — the
-    only working order is uninstall -> wait for UNINSTALLED -> delete (uninstall took 103s with no
-    real infra; real EKS teardown is longer, hence --timeout). Exits 0 even when the object outlives
-    the wait: the EKS infra dies with the lease, so a lingering UNINSTALLED record is cosmetic and
-    the out-of-band daily reaper sweeps it. Resolve by --id or the session-stem name."""
+    """Best-effort reap of the session's Outpost. deleteOutpost on a live Outpost fails with a
+    server-side internal error, and still fails while UNINSTALLING — the only working order is
+    uninstall -> wait for UNINSTALLED -> delete (uninstall takes ~100s with no real infra; real EKS
+    teardown is longer, hence --timeout). Exits 0 even when the object outlives the wait: the EKS
+    infra dies with the lease, so a lingering UNINSTALLED record is cosmetic and the out-of-band
+    daily reaper sweeps it. Resolve by --id or the session-stem name."""
     oid, name = _flag(args, "--id"), None
     if not oid:
         name = _outpost_name(args)
@@ -919,9 +911,9 @@ def _await_uninstalled(oid, timeout):
     return status
 
 
-# --- role trust-policy helpers, ported from te-labkit clouds/aws.py (proven on live leases). IAM
-# policy docs write plurals as scalar-or-list and hand back the trust doc either decoded or
-# percent-encoded depending on the CLI build, so accept every shape or the assertion flickers. ---
+# --- role trust-policy helpers. IAM policy docs write plurals as scalar-or-list and hand back the
+# trust doc either decoded or percent-encoded depending on the CLI build, so accept every shape or
+# the assertion flickers. ---
 def _as_list(v):
     if v is None:
         return []
@@ -1033,7 +1025,7 @@ def _role_inspect_azure(args):
         die(2, "role inspect --cloud azure requires --role-name <display-name> (session-scoped; no default is safe)")
     # --fill-principal-name false is NOT optional: it defaults TRUE and resolves names through
     # Microsoft Graph, which Entra denies here — the call would fail for a reason unrelated to the
-    # learner's state (v1 passed only --assignee-object-id and would break on this lease).
+    # learner's state.
     res = _az("role", "assignment", "list", "--scope", f"/subscriptions/{sub}",
               "--assignee-object-id", _wiz_azure_object_id(), "--fill-principal-name", "false",
               "--query", "[].roleDefinitionName", "-o", "json")
@@ -1122,8 +1114,8 @@ def _inspect_aws_trust(role, role_obj):
 def cmd_role_inspect(args):
     """Existence is NOT the assertion: a role that trusts nobody is exactly the state a learner
     reaches by creating the role and stopping, and it reports the same connector ERROR forever. So
-    verify the trust policy too (v1 aws.py:129). Delegator+tid resolved live for an EXACT match —
-    another data center's delegator looks almost identical and does not work."""
+    verify the trust policy too. Delegator+tid resolved live for an EXACT match — another data
+    center's delegator looks almost identical and does not work."""
     handlers = {"gcp": _role_inspect_gcp, "azure": _role_inspect_azure}
     cloud = _cloud(args)
     if cloud in handlers:
@@ -1138,8 +1130,7 @@ def cmd_role_ensure(args):
     task 3's need and unverified against TBCMP health — added when there's a live health signal."""
     if _cloud(args) != "aws":
         # No GCP twin by design: GCP's grant is custom-role creation + setIamPolicy, i.e. CSP
-        # provisioning, which SPEC.md §"What may NOT" keeps in Terraform
-        # (te-labkit-v2 template/infra/gcp/wiz-connector-roles). Fail loudly rather than no-op.
+        # provisioning, which stays in Terraform. Fail loudly rather than no-op.
         die(2, "role ensure is aws-only; on GCP the vendor Terraform module binds the roles")
     role = _flag(args, "--role-name") or ROLE_NAME
     delegator, tid = _wiz_delegator()
@@ -1176,9 +1167,8 @@ def cmd_role_ensure(args):
     sys.exit(0)
 
 
-# --- lab user (Keycloak), ported from te-labkit keycloak/{auth,user}.py (proven; probe 2026-08-29
-# reached realm wiz-labs, group global-contributor). requests -> stdlib urllib. Backs Wiz SSO for a
-# learner. Realm/endpoint come from grader-only env, never hardcoded (probe found realm=wiz-labs). ---
+# --- lab user (Keycloak): backs Wiz SSO for a learner. Realm/endpoint come from grader-only env,
+# never hardcoded. ---
 def _kc_env():
     vals = {}
     for k in ("LAB_KEYCLOAK_ENDPOINT", "LAB_KEYCLOAK_REALM", "LAB_KEYCLOAK_ADMIN_USER", "LAB_KEYCLOAK_ADMIN_PWD"):
@@ -1239,7 +1229,7 @@ def _kc_call(method, url, token, body=None):
 def _kc_user_id(endpoint, realm, token, email):
     # `search` is a substring match: a prefix collision (bob@x vs bob@x.io) would return the wrong
     # learner and a group-join/DELETE would hit them, so filter to an exact username/email and refuse
-    # to guess on >1 (v1 keycloak/user.py get_keycloak_user_id).
+    # to guess on >1.
     q = urllib.parse.urlencode({"exact": "true", "briefRepresentation": "true", "search": email})
     status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users?{q}", token)
     if status != 200:
@@ -1262,7 +1252,7 @@ def _kc_group_id(endpoint, realm, token, group):
 
 
 def _gen_password(length=14):
-    # upper+lower+digit guaranteed so it clears a typical Keycloak policy (v1 misc.generate_password).
+    # upper+lower+digit guaranteed so it clears a typical Keycloak policy.
     pool = string.ascii_uppercase + string.ascii_lowercase + string.digits
     chars = [
         secrets.choice(string.ascii_uppercase),
@@ -1281,9 +1271,9 @@ def _lab_user_email(args):
     return f"{stem}@{domain}", stem
 
 
-# Per-tenant SSO constants that CANNOT be derived (v1 credentials_tab.py:52): the suffix Wiz appends
-# to the tenant id in its Cognito domain, and the SSO app client id. The tenant id itself IS derived
-# (JWT `tid`), so it is not stored here — one source, no drift.
+# Per-tenant SSO constants that CANNOT be derived: the suffix Wiz appends to the tenant id in its
+# Cognito domain, and the SSO app client id. The tenant id itself IS derived (JWT `tid`), so it is
+# not stored here — one source, no drift.
 _TENANT_SSO = {
     "TBCMP": {"cognito_suffix": "34dq", "client_id": "4lgopniht2g4j58sirh4kh5gtl"},
     "TE_TENANT": {"cognito_suffix": "o8cy", "client_id": "54snbgo7lek43ct9ph3coc5484"},
@@ -1295,8 +1285,8 @@ def _wiz_login_url():
     """The tenant's IdP-initiated Cognito authorize URL, or None if it cannot be built.
 
     A `lab_*` Keycloak user CANNOT sign in at app.wiz.io — that renders a real login page the account
-    fails against, and the learner blames their creds (v1 credentials_tab.py:47). Only this IdP-init
-    URL routes them straight to the lab's Keycloak. Full-URL env overrides win so a track can pin it.
+    fails against, and the learner blames their creds. Only this IdP-init URL routes them straight
+    to the lab's Keycloak. Full-URL env overrides win so a track can pin it.
     """
     tenant = os.getenv("WIZ_TENANT", "TBCMP")
     override = os.getenv("WIZ_LOGIN_URL") or os.getenv(f"WIZ_{tenant}_LOGIN_URL")
@@ -1424,7 +1414,7 @@ def cmd_user_login_url(args):
 
 # reap: delete a lab user's Wiz footprint from the audit log. Delete is uniform delete<Type>(input:{id})
 # across ~34 of 36 create types; correlation (find by name) is per-type — the generic handler
-# (plural+search, hard verify) covers the norm, _REAP_OVERRIDES holds the exceptions we measured.
+# (plural+search, hard verify) covers the norm, _REAP_OVERRIDES holds the exceptions.
 _REAP_OVERRIDES = {
     "ServiceAccount": {"list": "serviceAccounts", "filter": "name", "soft": True},
 }
@@ -1496,7 +1486,7 @@ def _reap_enumerate(tok, dc, email, minutes):
 
 def _reap_find(tok, dc, h, name):
     # Returns (id_if_exactly_one, exact_count, error). Exact-name guard is load-bearing: list filters
-    # are substring (measured on serviceAccounts.name), so a shared tenant demands ==1 before delete.
+    # are substring, so a shared tenant demands ==1 before delete.
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 50, filterBy: { " + h["filter"]
           + ": " + json.dumps(name) + extra + " }) { nodes { id name } } }")
@@ -1511,7 +1501,7 @@ def _reap_one(tok, dc, action, name, commit):
     """Reap one caught Create*. Returns (reaped_bool, alert_msg_or_None, blocked_bool). Blocked means
     footprint provably remains; only that may fail the run. An alert we cannot act on (no name in the
     input, no handler for the type) is NOT blocking: the generic plural+search handler misses most of
-    the ~34 create types we have not measured, so blocking on it would fail every single reap."""
+    the ~34 create types, so blocking on it would fail every single reap."""
     x = action[len("Create"):]
     if not name:
         return False, f"ALERT {action}: no name in input — manual review", False
@@ -1542,7 +1532,7 @@ def _reap_one(tok, dc, action, name, commit):
 def _reap_sweep_type(tok, dc, x, stem, commit):
     """Prefix-sweep one type: delete resources whose name starts with the lease-unique stem. Returns
     (reaped, alerted, blocked). A lookup error blocks: unlike _reap_one's per-type handler miss, every
-    type here is measured (see _SWEEP_TYPES), so an error means this sweep did not complete."""
+    type swept here has a known handler, so an error means this sweep did not complete."""
     h = _reap_handler(x)
     extra = ", deleted: false" if h["soft"] else ""
     qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]

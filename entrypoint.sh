@@ -6,7 +6,7 @@
 if [ -n "${TS_AUTHKEY:-}" ]; then
   # No TUN device in a container → userspace networking. Ephemeral state: a fresh node per boot is
   # correct for a throwaway dev lease. Tailscale SSH is deliberately NOT used — it needs a TUN and
-  # hangs in userspace mode (proven 2026-08-31); we run a real sshd and reach it over the tailnet IP.
+  # hangs in userspace mode; we run a real sshd and reach it over the tailnet IP.
   mkdir -p /var/run/tailscale
   tailscaled --tun=userspace-networking --state=mem: --socks5-server=localhost:1055 \
     >/var/log/tailscaled.log 2>&1 &
