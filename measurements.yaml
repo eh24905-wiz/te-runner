@@ -1211,6 +1211,18 @@ outpost_lifecycle:
     # `wizlab instance inspect` does not close that gap either: it is cloudResources totalCount, i.e.
     # inventory presence, and it PRINTS the word "scanned". The EC2 satisfied it while this outpost's
     # own scan count was still 0.
+    scan_needs_on_demand_trigger: true
+    time_to_first_scan_min: 5    # n=1, 4m50s from an ON_DEMAND connector scan request to SUCCESS
+    # CONNECTED does not start scanning. 37 min past CONNECTED the Outpost had attempted 0 disk scans
+    # (0 successful AND 0 failed) although the connector's own SCHEDULED scan had already run and
+    # succeeded -- that one inventories the account, it does not dispatch a disk scan. An on-demand
+    # rescan on the connector then produced resourceScanResults totalCount 1 / SUCCESS, and
+    # `--require scanned` flipped to exit 0. A graded scan is affordable ONLY if the lab triggers it;
+    # unprompted, the schedule is what the docs' "several hours" refers to. requestConnectorEntityScan
+    # is NOT that trigger: it returns OK, registers as a 1-second CLOUD_EVENT, and scans nothing.
+    transient_snapshot: true
+    # The disk scan surfaces in the lease as an EBS snapshot alive for seconds (0->1->0 within 16s), so
+    # snapshot count is useless as a poll signal -- and reap has nothing to clean up after it.
     ui_active_is_not_connected: true
     # The GUI showed the deploy as Active/connected while the API held status INITIALIZED with clusters
     # null. UI wording tracks the connector and `enabled`, not OutpostStatus. Grade the enum; and do not
@@ -1226,6 +1238,9 @@ outpost_lifecycle:
       wizlab outpost inspect --require connected                     # exit 1 -- no connector, no cluster
       # then createConnector(type "aws", authParams{outpostId, customerRoleARN, diskAnalyzer.scanner.roleARN})
       wizlab outpost inspect --require connected                     # exit 0 within ~22 min
+      wizlab outpost inspect --require scanned                       # STILL exit 1, 37 min later
+      # then an on-demand rescan on that connector (GUI Rescan, or connectorScans triggerType ON_DEMAND)
+      wizlab outpost inspect --require scanned                       # exit 0 within ~5 min
 
 # ---------------------------------------------------------------------------------------------------
 # Tag filtering. The only lease-scoping mechanism that works at all, since AWS-side enumeration is
