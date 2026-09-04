@@ -52,6 +52,13 @@ Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceacco
   env names) to stdout + `$EXEC_OUTPUT`, idempotent by name (secret shown once). `inspect --require
   exists`; `delete` by `--id` or name. Shares one `createServiceAccount`/`deleteServiceAccount` path
   with `sensor` (parameterized over type + scopes); the reaper's ServiceAccount sweep also covers it.
+- `policy ensure|inspect|delete --name N` — the BLOCK CI/CD IaC scan policy a code-scan gate needs.
+  `ensure` is idempotent by name; absent, it creates a `type:IAC` policy with `enforcementMethod
+  BLOCK` on `deploymentLifecycle CLI`, scoped (`iacParams.cloudConfigurationRules`) to the builtin
+  Dockerfile control 'Last User Is root' (resolved live via `cloudConfigurationRules`, never
+  hard-coded; `--rule-id`/`--severity`/`--count-threshold` override), `default:false` so only a
+  `wizcli --policies <name>` scan is gated. `inspect --require exists` verifies setup; `delete`
+  removes it. A SHARED, PERSISTENT fixture — the reaper never touches it (not session-scoped).
 - `code-scan inspect --require published|pass` — asserts a Wiz Code CI/CD scan for this session,
   scoped by the `session` tag (`--tag-key`/`--tag-value`, default value the session stem), latest scan
   wins. `published` = ≥1 scan exists; `pass` = latest `status.verdict == PASSED_BY_POLICY`

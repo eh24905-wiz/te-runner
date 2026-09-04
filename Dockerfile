@@ -37,6 +37,13 @@ RUN ARCH=$(dpkg --print-architecture) && TSVER=1.102.3 && \
     mv "/tmp/tailscale_${TSVER}_${ARCH}/tailscale" "/tmp/tailscale_${TSVER}_${ARCH}/tailscaled" /usr/local/bin/ && \
     rm -rf /tmp/ts.tgz "/tmp/tailscale_${TSVER}_${ARCH}"
 
+# wizcli: the grader runs Wiz Code scans for code-scan labs (publishes the session-tagged CICDScan a
+# check grades). Unpinned like the CSP CLIs — the image tag is the pin. Wiz names linux-amd64/arm64,
+# matching dpkg --print-architecture.
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sSfL "https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-${ARCH}" -o /usr/local/bin/wizcli && \
+    chmod +x /usr/local/bin/wizcli
+
 COPY wizlab/wizlab /usr/local/bin/wizlab
 COPY measurements.yaml /opt/te/measurements.yaml
 COPY reaper/reap_orphans.py /opt/reaper/reap_orphans.py

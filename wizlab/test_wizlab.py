@@ -1058,5 +1058,70 @@ class CodeScanGrading(unittest.TestCase):
         self.assertEqual(self._exit(["--tag-value", "bad value!"], self._cicd_api([None])), 2)
 
 
+class PolicyGrading(unittest.TestCase):
+    """policy ensure builds a BLOCK/CLI IaC policy scoped to the live-resolved Dockerfile control.
+    Lock idempotency, the input shape (enforcement + single-rule scope), and the exit contract."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+    CTL: typing.ClassVar = [{"id": "ctl-1", "name": "Last User Is 'root'", "severity": "HIGH"}]
+
+    def _api(self, existing=False, control=None, created_id="pol-1"):
+        control = self.CTL if control is None else control
+        self.created = {}
+
+        def side(query, variables):
+            if "cicdScanPolicies(" in query:
+                nodes = [{"id": "pol-1", "name": "block-root"}] if existing else []
+                return {"cicdScanPolicies": {"nodes": nodes}}, "tid"
+            if "cloudConfigurationRules(" in query:
+                return {"cloudConfigurationRules": {"nodes": control}}, "tid"
+            if "createCICDScanPolicy" in query:
+                self.created = variables
+                sp = {"id": created_id, "name": "block-root"} if created_id else {}
+                return {"createCICDScanPolicy": {"scanPolicy": sp}}, "tid"
+            if "deleteCICDScanPolicy" in query:
+                return {"deleteCICDScanPolicy": {"id": "pol-1"}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _exit(self, fn, argv, side):
+        with mock.patch.dict(wz.os.environ, self.ENV, clear=True), \
+             mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code
+
+    def test_ensure_idempotent_when_present(self):
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "block-root"], self._api(existing=True)), 0)
+
+    def test_ensure_creates_scoped_block_cli_policy(self):
+        side = self._api(existing=False)
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "block-root"], side), 0)
+        inp = self.created["input"]
+        self.assertEqual(inp["policyLifecycleEnforcements"],
+                         [{"enforcementMethod": "BLOCK", "deploymentLifecycle": "CLI"}])
+        self.assertEqual(inp["iacParams"]["cloudConfigurationRules"], ["ctl-1"])
+        self.assertEqual(inp["iacParams"]["severityThreshold"], "HIGH")
+        self.assertFalse(inp["default"])
+
+    def test_ensure_control_absent_is_environment_3(self):
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], self._api(existing=False, control=[])), 3)
+
+    def test_ensure_create_no_id_is_environment_3(self):
+        side = self._api(existing=False, created_id=None)
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], side), 3)
+
+    def test_inspect_exists_absent_and_bad_require(self):
+        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "block-root"], self._api(existing=True)), 0)
+        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "block-root"], self._api(existing=False)), 1)
+        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "b", "--require", "x"], self._api(True)), 2)
+
+    def test_delete_found_and_noop_when_absent(self):
+        self.assertEqual(self._exit(wz.cmd_policy_delete, ["--name", "block-root"], self._api(existing=True)), 0)
+        self.assertEqual(self._exit(wz.cmd_policy_delete, ["--name", "block-root"], self._api(existing=False)), 0)
+
+    def test_missing_name_is_invocation_error_2(self):
+        self.assertEqual(self._exit(wz.cmd_policy_inspect, [], self._api(existing=True)), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
