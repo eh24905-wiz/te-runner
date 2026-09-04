@@ -831,42 +831,91 @@ def cmd_detection_inspect(args):
     sys.exit(0 if n > 0 else 1)
 
 
-# --- Wiz CLI service account: the on-the-fly credential `wizcli auth` uses in a code-scan lab. Same
-# createServiceAccount mutation as the sensor, parameterized to type:CLI with the two wizcli scopes.
-# Named <stem>-cli so the reaper's ServiceAccount prefix sweep deletes it. ---
-CLI_SA_SCOPES = ["create:security_scans", "read:scan_policies"]
+# --- Wiz CLI credential for `wizcli auth`, minted via a CLI DEPLOYMENT (not createServiceAccount:
+# type:CLI accounts are internal and that mutation rejects them). createCliDeployment returns the
+# client secret ONCE, so `ensure` converges to one fresh deployment (delete-then-mint, like the
+# sensor). The SA it creates is named "<deployment-name>-deployment-<uuid>", so the reaper's
+# ServiceAccount lab-<id>* prefix sweep still catches it; `delete` removes the deployment itself. ---
+CLI_DEPLOYMENTS_Q = """query CliDeployments($f: DeploymentFilters) {
+  deployments(first: 50, filterBy: $f) { nodes { id name type } }
+}"""
+
+CREATE_CLI_DEPLOYMENT = """mutation CreateCliDeployment($input: CreateCliDeploymentInput!) {
+  createCliDeployment(input: $input) {
+    clientSecret
+    deployment { id name type object { ... on WizCLI { serviceAccount { name clientId } } } }
+  }
+}"""
 
 
-def _cli_sa_name(args):
+def _cli_dep_name(args):
     return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}-cli"
 
 
+def _find_cli_deployment(name):
+    """The WIZ_CLI deployment whose name matches exactly (search is substring, so filter to ==)."""
+    data, _ = api(CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": name}})
+    return next((n for n in ((data.get("deployments") or {}).get("nodes") or []) if n.get("name") == name), None)
+
+
+def _delete_cli_deployment(dep_id):
+    api('mutation { deleteCliDeployment(input: { id: "' + dep_id + '" }) { id } }', {})
+
+
 def cmd_serviceaccount_ensure(args):
-    """Mint a type:CLI service account for wizcli, emitting WIZ_CLIENT_ID / WIZ_CLIENT_SECRET (wizcli's
-    own env-var names) to stdout and $EXEC_OUTPUT. Scopes default to create:security_scans +
-    read:scan_policies; --scopes overrides (comma-separated). Solve/setup only — prints a secret."""
-    scopes = _flag(args, "--scopes")
-    scopes = [s for s in scopes.split(",") if s] if scopes else CLI_SA_SCOPES
-    _ensure_sa(_cli_sa_name(args), "CLI", scopes, "WIZ_CLIENT_ID", "WIZ_CLIENT_SECRET", "wiz cli")
+    """Mint the on-the-fly wizcli credential via a CLI deployment, emitting WIZ_CLIENT_ID /
+    WIZ_CLIENT_SECRET (wizcli's own env-var names) to stdout and $EXEC_OUTPUT. The client secret is
+    shown once, so this converges to ONE fresh deployment: any existing one on this name is deleted
+    first, then a fresh one created. Solve/setup only — never a learner check (it prints a secret)."""
+    name = _cli_dep_name(args)
+    existing = _find_cli_deployment(name)
+    if existing:
+        _delete_cli_deployment(existing["id"])
+    data, _ = api(CREATE_CLI_DEPLOYMENT, {"input": {"name": name, "projectIDs": [], "expiresAt": None}})
+    payload = data.get("createCliDeployment") or {}
+    dep = payload.get("deployment") or {}
+    sa = (dep.get("object") or {}).get("serviceAccount") or {}
+    cid, sec = sa.get("clientId"), payload.get("clientSecret")
+    if not cid or not sec:
+        die(3, "createCliDeployment returned no client credentials")
+    lines = f"WIZ_CLIENT_ID={cid}\nWIZ_CLIENT_SECRET={sec}\n"
+    sys.stdout.write(lines)
+    out = os.getenv("EXEC_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(lines)
+    print(f"created wiz cli deployment {name} ({dep.get('id')})", file=sys.stderr)
+    sys.exit(0)
 
 
 def cmd_serviceaccount_inspect(args):
-    """Assert the session's Wiz CLI service account exists (--require exists)."""
+    """Assert the session's Wiz CLI deployment exists (--require exists)."""
     require = _flag(args, "--require") or "exists"
     if require != "exists":
         die(2, f"--require must be exists, got {require}")
-    name = _cli_sa_name(args)
-    node = _find_sa(name)
+    name = _cli_dep_name(args)
+    node = _find_cli_deployment(name)
     if not node:
-        print(f"no service account named {name}")
+        print(f"no wiz cli deployment named {name}")
         sys.exit(1)
-    print(f"service account {node['name']} ({node['id']})")
+    print(f"wiz cli deployment {node['name']} ({node['id']})")
     sys.exit(0)
 
 
 def cmd_serviceaccount_delete(args):
-    """Delete the session's Wiz CLI service account (see _delete_sa)."""
-    _delete_sa(args, _cli_sa_name(args))
+    """Delete the session's Wiz CLI deployment, by --id or (default) the session-stem name. The
+    reaper's ServiceAccount prefix sweep also catches the SA the deployment created."""
+    dep_id = _flag(args, "--id")
+    if not dep_id:
+        name = _cli_dep_name(args)
+        node = _find_cli_deployment(name)
+        if not node:
+            print(f"no wiz cli deployment named {name}; nothing to delete")
+            sys.exit(0)
+        dep_id = node["id"]
+    _delete_cli_deployment(dep_id)
+    print(f"deleted wiz cli deployment {dep_id}")
+    sys.exit(0)
 
 
 # --- Wiz Code CI/CD scan, published by `wizcli scan dir --tags session=<stem>`. A learner check must
@@ -983,12 +1032,11 @@ def cmd_policy_ensure(args):
         "default": False,
         "lifecycleTargets": ["DEPLOY", "BUILD", "CODE"],
         "policyLifecycleEnforcements": [{"enforcementMethod": "BLOCK", "deploymentLifecycle": "CLI"}],
-        # countThreshold is "fail when findings exceed this count", so 0 => any single HIGH hit fails
-        # (the plan's "threshold 1" phrasing; the live scan confirms the >0 semantics, RISK-1). Scoped
-        # to the one control so no unrelated IaC finding trips it.
+        # countThreshold must be positive (0 is rejected live). 1 fails on the first HIGH hit from the
+        # scoped control; scoping to the one control means no unrelated IaC finding trips it.
         "iacParams": {
             "severityThreshold": _flag(args, "--severity") or "HIGH",
-            "countThreshold": int(_flag(args, "--count-threshold") or "0"),
+            "countThreshold": int(_flag(args, "--count-threshold") or "1"),
             "cloudConfigurationRules": [rule_id],
         },
     }

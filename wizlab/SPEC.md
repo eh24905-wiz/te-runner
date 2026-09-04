@@ -46,12 +46,15 @@ Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceacco
   `matchedRuleName` + `type` + the resolved `sensorId`. Never a rule id (tenant-specific) and never an
   Issue/Threat object (tenant-wide anti-burst cap). Default type `GENERATED_THREAT`; `--match-only`
   queries the sibling that matched and raised no threat.
-- `serviceaccount ensure|inspect|delete` — an on-the-fly `type:CLI` service account, the credential
-  `wizcli auth` uses. `ensure` mints it named `<stem>-cli` with scopes `create:security_scans` +
-  `read:scan_policies` (`--scopes` overrides), emits `WIZ_CLIENT_ID/WIZ_CLIENT_SECRET` (wizcli's own
-  env names) to stdout + `$EXEC_OUTPUT`, idempotent by name (secret shown once). `inspect --require
-  exists`; `delete` by `--id` or name. Shares one `createServiceAccount`/`deleteServiceAccount` path
-  with `sensor` (parameterized over type + scopes); the reaper's ServiceAccount sweep also covers it.
+- `serviceaccount ensure|inspect|delete` — the on-the-fly credential `wizcli auth` uses, minted via a
+  CLI DEPLOYMENT (`createCliDeployment`), NOT `createServiceAccount`: `type:CLI` accounts are internal
+  and that mutation rejects them. `ensure` names it `<stem>-cli` and converges to one fresh deployment
+  (delete-then-mint, since the secret is shown once), emitting `WIZ_CLIENT_ID` (the deployment SA's
+  `clientId`) + `WIZ_CLIENT_SECRET` (the payload's `clientSecret`) to stdout + `$EXEC_OUTPUT`.
+  `inspect --require exists` and `delete` (by `--id` or name) go through `deployments(type:WIZ_CLI)` /
+  `deleteCliDeployment`. The deployment's SA is named `<stem>-cli-deployment-<uuid>`, so the reaper's
+  `ServiceAccount` `lab-<id>*` sweep also catches it. The `sensor` path stays on
+  `createServiceAccount(type:SENSOR)`, unchanged.
 - `policy ensure|inspect|delete --name N` — the BLOCK CI/CD IaC scan policy a code-scan gate needs.
   `ensure` is idempotent by name; absent, it creates a `type:IAC` policy with `enforcementMethod
   BLOCK` on `deploymentLifecycle CLI`, scoped (`iacParams.cloudConfigurationRules`) to the builtin

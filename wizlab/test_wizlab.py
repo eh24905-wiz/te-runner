@@ -955,22 +955,26 @@ class OutpostConnectorBinding(unittest.TestCase):
 
 
 class ServiceAccountGrading(unittest.TestCase):
-    """The on-the-fly Wiz CLI SA (type:CLI) shares the createServiceAccount path with the sensor;
-    lock the idempotency, the WIZ_CLIENT_ID/SECRET emit, and the exit contract."""
+    """The on-the-fly wizcli credential is a CLI DEPLOYMENT (createCliDeployment) — createServiceAccount
+    (type:CLI) is rejected live. Lock the delete-then-mint convergence, the WIZ_CLIENT_ID/SECRET emit
+    (clientId from the deployment's SA, secret from the payload), and the exit contract."""
 
     ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
 
-    def _sa_api(self, existing=False, created=("cid", "sec")):
+    def _api(self, existing=False, cid="cidX", sec="secX"):
+        self.calls = []
+
         def side(query, variables):
-            if "serviceAccounts(" in query:
-                nodes = [{"id": "sa1", "name": "lab-x-cli"}] if existing else []
-                return {"serviceAccounts": {"nodes": nodes}}, "tid"
-            if "createServiceAccount" in query:
-                cid, sec = created
-                return {"createServiceAccount": {"serviceAccount": {
-                    "id": "sa1", "name": "lab-x-cli", "clientId": cid, "clientSecret": sec}}}, "tid"
-            if "deleteServiceAccount" in query:
-                return {"deleteServiceAccount": {"_stub": True}}, "tid"
+            self.calls.append(query)
+            if "deployments(" in query:
+                nodes = [{"id": "dep1", "name": "lab-x-cli", "type": "WIZ_CLI"}] if existing else []
+                return {"deployments": {"nodes": nodes}}, "tid"
+            if "createCliDeployment" in query:
+                return {"createCliDeployment": {"clientSecret": sec, "deployment": {
+                    "id": "dep2", "name": "lab-x-cli", "type": "WIZ_CLI",
+                    "object": {"serviceAccount": {"name": "lab-x-cli-deployment-u", "clientId": cid}}}}}, "tid"
+            if "deleteCliDeployment" in query:
+                return {"deleteCliDeployment": {"id": "dep1"}}, "tid"
             return {}, "tid"
         return side
 
@@ -983,28 +987,29 @@ class ServiceAccountGrading(unittest.TestCase):
         return cm.exception.code, out.getvalue()
 
     def test_ensure_creates_and_emits_client_creds(self):
-        code, out = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=False))
+        code, out = self._run(wz.cmd_serviceaccount_ensure, [], self._api(existing=False))
         self.assertEqual(code, 0)
-        self.assertIn("WIZ_CLIENT_ID=cid", out)
-        self.assertIn("WIZ_CLIENT_SECRET=sec", out)
+        self.assertIn("WIZ_CLIENT_ID=cidX", out)
+        self.assertIn("WIZ_CLIENT_SECRET=secX", out)
 
-    def test_ensure_idempotent_no_secret_reissued(self):
-        code, out = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=True))
+    def test_ensure_deletes_existing_before_minting(self):
+        code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._api(existing=True))
         self.assertEqual(code, 0)
-        self.assertNotIn("WIZ_CLIENT_ID", out)
+        self.assertTrue(any("deleteCliDeployment" in q for q in self.calls))
+        self.assertTrue(any("createCliDeployment" in q for q in self.calls))
 
     def test_ensure_missing_creds_is_environment_3(self):
-        code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=False, created=(None, None)))
+        code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._api(existing=False, cid=None))
         self.assertEqual(code, 3)
 
     def test_inspect_exists_absent_and_bad_require(self):
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._sa_api(existing=True))[0], 0)
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._sa_api(existing=False))[0], 1)
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, ["--require", "bogus"], self._sa_api(True))[0], 2)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._api(existing=True))[0], 0)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._api(existing=False))[0], 1)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, ["--require", "bogus"], self._api(True))[0], 2)
 
     def test_delete_by_name_and_noop_when_absent(self):
-        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._sa_api(existing=True))[0], 0)
-        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._sa_api(existing=False))[0], 0)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._api(existing=True))[0], 0)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._api(existing=False))[0], 0)
 
 
 class CodeScanGrading(unittest.TestCase):
@@ -1101,6 +1106,7 @@ class PolicyGrading(unittest.TestCase):
                          [{"enforcementMethod": "BLOCK", "deploymentLifecycle": "CLI"}])
         self.assertEqual(inp["iacParams"]["cloudConfigurationRules"], ["ctl-1"])
         self.assertEqual(inp["iacParams"]["severityThreshold"], "HIGH")
+        self.assertEqual(inp["iacParams"]["countThreshold"], 1)  # 0 is rejected live
         self.assertFalse(inp["default"])
 
     def test_ensure_control_absent_is_environment_3(self):
