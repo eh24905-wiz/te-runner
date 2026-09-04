@@ -18,8 +18,8 @@ wrappers (one `wizlab` call + an exit-code remap). Change it only within this co
 Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1.
 
 ## Nouns
-`session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, and — for connectorless
-Runtime-Sensor labs — `sensor` and `detection`:
+`session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, for connectorless
+Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceaccount` and `code-scan`:
 - `outpost ensure|delete|inspect` — a Wiz Outpost (Automated deploy in the customer account). `ensure`
   createsOutpost named on the session stem, given `--role-arn` (the orchestrator TF module output Wiz
   assumes); `inspect --require exists|initialized|connected` asserts the `OutpostStatus` enum and
@@ -46,6 +46,18 @@ Runtime-Sensor labs — `sensor` and `detection`:
   `matchedRuleName` + `type` + the resolved `sensorId`. Never a rule id (tenant-specific) and never an
   Issue/Threat object (tenant-wide anti-burst cap). Default type `GENERATED_THREAT`; `--match-only`
   queries the sibling that matched and raised no threat.
+- `serviceaccount ensure|inspect|delete` — an on-the-fly `type:CLI` service account, the credential
+  `wizcli auth` uses. `ensure` mints it named `<stem>-cli` with scopes `create:security_scans` +
+  `read:scan_policies` (`--scopes` overrides), emits `WIZ_CLIENT_ID/WIZ_CLIENT_SECRET` (wizcli's own
+  env names) to stdout + `$EXEC_OUTPUT`, idempotent by name (secret shown once). `inspect --require
+  exists`; `delete` by `--id` or name. Shares one `createServiceAccount`/`deleteServiceAccount` path
+  with `sensor` (parameterized over type + scopes); the reaper's ServiceAccount sweep also covers it.
+- `code-scan inspect --require published|pass` — asserts a Wiz Code CI/CD scan for this session,
+  scoped by the `session` tag (`--tag-key`/`--tag-value`, default value the session stem), latest scan
+  wins. `published` = ≥1 scan exists; `pass` = latest `status.verdict == PASSED_BY_POLICY`
+  (`FAILED_BY_POLICY` exits 1 at once). Grades the TENANT verdict, not the CLI exit code, because
+  `WARN_BY_POLICY` exits 0 — only a blocking policy distinguishes a finding from a pass. Polls every
+  `--interval` to `--timeout` (default 180s) since publish latency is unmeasured.
 
 ## What may be added
 A change qualifies only if ALL hold:

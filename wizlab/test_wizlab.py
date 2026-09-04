@@ -2,6 +2,7 @@
 # Stdlib-only harness (no external deps, matching wizlab). Locks the load-bearing invariants so
 # refactors are safe without re-playing a lab: the 0/1/2/3 exit-code contract, IAM-trust parsing
 # breadth, flag edges, and the main() dispatch guard. Run: python wizlab/test_wizlab.py
+import contextlib
 import io
 import json
 import pathlib
@@ -951,6 +952,110 @@ class OutpostConnectorBinding(unittest.TestCase):
         patch = calls[0][1]["input"]["patch"]["authParams"]
         self.assertEqual(patch["outpostId"], "o1")
         self.assertEqual(patch["diskAnalyzer"], {"scanner": {"roleARN": "arn:s"}})
+
+
+class ServiceAccountGrading(unittest.TestCase):
+    """The on-the-fly Wiz CLI SA (type:CLI) shares the createServiceAccount path with the sensor;
+    lock the idempotency, the WIZ_CLIENT_ID/SECRET emit, and the exit contract."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+
+    def _sa_api(self, existing=False, created=("cid", "sec")):
+        def side(query, variables):
+            if "serviceAccounts(" in query:
+                nodes = [{"id": "sa1", "name": "lab-x-cli"}] if existing else []
+                return {"serviceAccounts": {"nodes": nodes}}, "tid"
+            if "createServiceAccount" in query:
+                cid, sec = created
+                return {"createServiceAccount": {"serviceAccount": {
+                    "id": "sa1", "name": "lab-x-cli", "clientId": cid, "clientSecret": sec}}}, "tid"
+            if "deleteServiceAccount" in query:
+                return {"deleteServiceAccount": {"_stub": True}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _run(self, fn, argv, side):
+        out = io.StringIO()
+        with mock.patch.dict(wz.os.environ, self.ENV, clear=True), \
+             mock.patch.object(wz, "api", side_effect=side), \
+             contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code, out.getvalue()
+
+    def test_ensure_creates_and_emits_client_creds(self):
+        code, out = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=False))
+        self.assertEqual(code, 0)
+        self.assertIn("WIZ_CLIENT_ID=cid", out)
+        self.assertIn("WIZ_CLIENT_SECRET=sec", out)
+
+    def test_ensure_idempotent_no_secret_reissued(self):
+        code, out = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=True))
+        self.assertEqual(code, 0)
+        self.assertNotIn("WIZ_CLIENT_ID", out)
+
+    def test_ensure_missing_creds_is_environment_3(self):
+        code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._sa_api(existing=False, created=(None, None)))
+        self.assertEqual(code, 3)
+
+    def test_inspect_exists_absent_and_bad_require(self):
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._sa_api(existing=True))[0], 0)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._sa_api(existing=False))[0], 1)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, ["--require", "bogus"], self._sa_api(True))[0], 2)
+
+    def test_delete_by_name_and_noop_when_absent(self):
+        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._sa_api(existing=True))[0], 0)
+        self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._sa_api(existing=False))[0], 0)
+
+
+class CodeScanGrading(unittest.TestCase):
+    """code-scan inspect grades the TENANT verdict (WARN_BY_POLICY exits 0 at the CLI, so the exit
+    code can't tell a finding from a pass). Lock published/pass/fail + the bounded poll."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+
+    def _cicd_api(self, seq):
+        it = iter(seq)  # one node-or-None per successive cicdScans call
+
+        def side(query, variables):
+            if "cicdScans(" in query:
+                node = next(it)
+                return {"cicdScans": {"nodes": ([node] if node else []), "totalCount": (1 if node else 0)}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _node(self, state="DONE", verdict=None):
+        return {"id": "c1", "status": {"state": state, "verdict": verdict}}
+
+    def _exit(self, argv, side):
+        with mock.patch.dict(wz.os.environ, self.ENV, clear=True), \
+             mock.patch.object(wz, "api", side_effect=side), \
+             mock.patch.object(wz.time, "sleep", lambda *_: None), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_codescan_inspect(argv)
+        return cm.exception.code
+
+    def test_published_any_scan_exit_0(self):
+        side = self._cicd_api([self._node(verdict="FAILED_BY_POLICY")])
+        self.assertEqual(self._exit(["--require", "published"], side), 0)
+
+    def test_published_none_within_timeout_exit_1(self):
+        self.assertEqual(self._exit(["--require", "published", "--timeout", "0"], self._cicd_api([None])), 1)
+
+    def test_pass_passed_exit_0(self):
+        self.assertEqual(self._exit(["--require", "pass"], self._cicd_api([self._node(verdict="PASSED_BY_POLICY")])), 0)
+
+    def test_pass_failed_exits_1_without_waiting(self):
+        self.assertEqual(self._exit(["--require", "pass"], self._cicd_api([self._node(verdict="FAILED_BY_POLICY")])), 1)
+
+    def test_pass_polls_running_then_passed(self):
+        seq = [self._node(state="IN_PROGRESS", verdict=None), self._node(verdict="PASSED_BY_POLICY")]
+        self.assertEqual(self._exit(["--require", "pass", "--interval", "0"], self._cicd_api(seq)), 0)
+
+    def test_bad_require_exit_2(self):
+        self.assertEqual(self._exit(["--require", "bogus"], self._cicd_api([None])), 2)
+
+    def test_unsafe_tag_value_exit_2(self):
+        self.assertEqual(self._exit(["--tag-value", "bad value!"], self._cicd_api([None])), 2)
 
 
 if __name__ == "__main__":

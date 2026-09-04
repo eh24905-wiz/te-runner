@@ -729,48 +729,64 @@ def _resolve_sensor(name):
     return sorted(nodes, key=lambda n: n.get("status") != "ACTIVE")[0] if nodes else None
 
 
-def cmd_sensor_ensure(args):
-    """Create the type:SENSOR service account the Runtime Sensor authenticates with, named on the
-    session stem so the reaper sweeps it. Idempotent by name: the client secret is shown once and is
-    not re-fetchable, so a re-run reports the existing account rather than minting a duplicate. Emits
-    WIZ_API_CLIENT_ID / WIZ_API_CLIENT_SECRET (the install one-liner's own variable names) to stdout
-    and $EXEC_OUTPUT. Solve/setup only — never a learner check (it prints a secret)."""
-    name = _sa_name(args)
+def _find_sa(name):
+    """The service account whose name matches exactly (the filter is substring, so filter to ==)."""
     data, _ = api(SA_FIND, {"n": name})
-    exact = [n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name]
-    if exact:
-        print(f"service account {name} already exists ({exact[0]['id']}); secret not re-fetchable", file=sys.stderr)
+    return next((n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name), None)
+
+
+def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
+    """Create a service account named on the session stem so the reaper sweeps it, parameterized over
+    type + scopes (SENSOR takes none; a CLI account takes create:security_scans etc.). Idempotent by
+    name: the client secret is shown once and is not re-fetchable, so a re-run reports the existing
+    account rather than minting a duplicate. Emits <id_var>/<secret_var> to stdout and $EXEC_OUTPUT.
+    Solve/setup only — never a learner check (it prints a secret)."""
+    if _find_sa(name):
+        print(f"service account {name} already exists; secret not re-fetchable", file=sys.stderr)
         sys.exit(0)
-    data, _ = api(CREATE_SA, {"input": {"name": name, "type": "SENSOR"}})
+    inp = {"name": name, "type": sa_type}
+    if scopes:
+        inp["scopes"] = scopes
+    data, _ = api(CREATE_SA, {"input": inp})
     sa = (data.get("createServiceAccount") or {}).get("serviceAccount") or {}
     cid, sec = sa.get("clientId"), sa.get("clientSecret")
     if not cid or not sec:
         die(3, "createServiceAccount returned no client credentials")
-    lines = f"WIZ_API_CLIENT_ID={cid}\nWIZ_API_CLIENT_SECRET={sec}\n"
+    lines = f"{id_var}={cid}\n{secret_var}={sec}\n"
     sys.stdout.write(lines)
     out = os.getenv("EXEC_OUTPUT")
     if out:
         with open(out, "a") as f:
             f.write(lines)
-    print(f"created sensor service account {name} ({sa['id']})", file=sys.stderr)
+    print(f"created {label} service account {name} ({sa['id']})", file=sys.stderr)
     sys.exit(0)
 
 
-def cmd_sensor_delete(args):
-    """Delete the sensor service account, by --id or (default) by the session-stem name. The reaper's
-    prefix sweep already covers ServiceAccount, so this is for a solve/explicit teardown."""
+def _delete_sa(args, name):
+    """Delete a service account by --id or (default) the given session-stem name. The reaper's prefix
+    sweep already covers ServiceAccount, so this is for a solve/explicit teardown."""
     sid = _flag(args, "--id")
     if not sid:
-        name = _sa_name(args)
-        data, _ = api(SA_FIND, {"n": name})
-        exact = [n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name]
-        if not exact:
+        node = _find_sa(name)
+        if not node:
             print(f"no service account named {name}; nothing to delete")
             sys.exit(0)
-        sid = exact[0]["id"]
+        sid = node["id"]
     api('mutation { deleteServiceAccount(input: { id: "' + sid + '" }) { _stub } }', {})
     print(f"deleted service account {sid}")
     sys.exit(0)
+
+
+def cmd_sensor_ensure(args):
+    """Mint the type:SENSOR service account the Runtime Sensor authenticates with, emitting
+    WIZ_API_CLIENT_ID / WIZ_API_CLIENT_SECRET (the install one-liner's own variable names). See
+    _ensure_sa for the shared idempotency + emit contract."""
+    _ensure_sa(_sa_name(args), "SENSOR", None, "WIZ_API_CLIENT_ID", "WIZ_API_CLIENT_SECRET", "sensor")
+
+
+def cmd_sensor_delete(args):
+    """Delete the sensor service account (see _delete_sa)."""
+    _delete_sa(args, _sa_name(args))
 
 
 def cmd_sensor_inspect(args):
@@ -813,6 +829,100 @@ def cmd_detection_inspect(args):
     n = (data.get("detections") or {}).get("totalCount") or 0
     print(f"detection inspect: {n} {dtype} for rule {rule!r} on sensor {name} ({node['id']})")
     sys.exit(0 if n > 0 else 1)
+
+
+# --- Wiz CLI service account: the on-the-fly credential `wizcli auth` uses in a code-scan lab. Same
+# createServiceAccount mutation as the sensor, parameterized to type:CLI with the two wizcli scopes.
+# Named <stem>-cli so the reaper's ServiceAccount prefix sweep deletes it. ---
+CLI_SA_SCOPES = ["create:security_scans", "read:scan_policies"]
+
+
+def _cli_sa_name(args):
+    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}-cli"
+
+
+def cmd_serviceaccount_ensure(args):
+    """Mint a type:CLI service account for wizcli, emitting WIZ_CLIENT_ID / WIZ_CLIENT_SECRET (wizcli's
+    own env-var names) to stdout and $EXEC_OUTPUT. Scopes default to create:security_scans +
+    read:scan_policies; --scopes overrides (comma-separated). Solve/setup only — prints a secret."""
+    scopes = _flag(args, "--scopes")
+    scopes = [s for s in scopes.split(",") if s] if scopes else CLI_SA_SCOPES
+    _ensure_sa(_cli_sa_name(args), "CLI", scopes, "WIZ_CLIENT_ID", "WIZ_CLIENT_SECRET", "wiz cli")
+
+
+def cmd_serviceaccount_inspect(args):
+    """Assert the session's Wiz CLI service account exists (--require exists)."""
+    require = _flag(args, "--require") or "exists"
+    if require != "exists":
+        die(2, f"--require must be exists, got {require}")
+    name = _cli_sa_name(args)
+    node = _find_sa(name)
+    if not node:
+        print(f"no service account named {name}")
+        sys.exit(1)
+    print(f"service account {node['name']} ({node['id']})")
+    sys.exit(0)
+
+
+def cmd_serviceaccount_delete(args):
+    """Delete the session's Wiz CLI service account (see _delete_sa)."""
+    _delete_sa(args, _cli_sa_name(args))
+
+
+# --- Wiz Code CI/CD scan, published by `wizcli scan dir --tags session=<stem>`. A learner check must
+# grade the tenant-side scan, not the CLI exit code: WARN_BY_POLICY exits 0, so only the published
+# verdict tells a blocking finding from a pass. Scoped by the session tag; the latest scan wins.
+# Publish latency is unmeasured, so --require polls to --timeout. ---
+_TAG_OK = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _cicd_latest(tag_key, tag_value):
+    """The most recent CICDScan carrying tag key=value. Inlined (not a typed variable) so a wrong
+    input-type name can't error the query; the tag is validated to a safe charset first."""
+    if not (_TAG_OK.match(tag_key) and _TAG_OK.match(tag_value)):
+        die(2, "code-scan tag key/value must match [A-Za-z0-9._-]+")
+    qy = (
+        'query { cicdScans(first: 5, filterBy: { tag: { key: "' + tag_key + '", value: "' + tag_value + '" } }, '
+        "orderBy: { field: CREATED_AT, direction: DESC }) "
+        "{ nodes { id status { state verdict } } totalCount } }"
+    )
+    data, _ = api(qy, {})
+    nodes = (data.get("cicdScans") or {}).get("nodes") or []
+    return nodes[0] if nodes else None
+
+
+def cmd_codescan_inspect(args):
+    """Assert a Wiz CLI scan for this session. --require published (>=1 scan tagged session=<stem>) or
+    pass (latest scan verdict PASSED_BY_POLICY). Polls every --interval up to --timeout (default 180s)
+    because publish latency is unmeasured; a definitive FAILED_BY_POLICY exits 1 without waiting."""
+    require = _flag(args, "--require") or "published"
+    if require not in ("published", "pass"):
+        die(2, f"--require must be published|pass, got {require}")
+    tag_key = _flag(args, "--tag-key") or "session"
+    tag_value = _flag(args, "--tag-value") or _lab_stem(_session_id(args))
+    timeout = int(_flag(args, "--timeout") or "180")
+    interval = int(_flag(args, "--interval") or "10")
+    deadline = time.monotonic() + timeout
+    while True:
+        node = _cicd_latest(tag_key, tag_value)
+        if node:
+            st = node.get("status") or {}
+            state, verdict = st.get("state"), st.get("verdict")
+            if require == "published":
+                print(f"code-scan: {node['id']} present ({tag_key}={tag_value}) state={state} verdict={verdict}")
+                sys.exit(0)
+            if verdict == "PASSED_BY_POLICY":
+                print(f"code-scan: {node['id']} PASSED_BY_POLICY")
+                sys.exit(0)
+            if verdict == "FAILED_BY_POLICY":
+                print(f"code-scan: {node['id']} FAILED_BY_POLICY")
+                sys.exit(1)
+            # verdict not yet set (scan still running) — keep polling
+        if time.monotonic() >= deadline:
+            waited = "passing " if require == "pass" else ""
+            print(f"code-scan: no {waited}scan for {tag_key}={tag_value} within {timeout}s")
+            sys.exit(1)
+        time.sleep(interval)
 
 
 def _outpost_name(args):
@@ -1670,6 +1780,10 @@ VERBS = {
     ("sensor", "ensure"): cmd_sensor_ensure,
     ("sensor", "delete"): cmd_sensor_delete,
     ("sensor", "inspect"): cmd_sensor_inspect,
+    ("serviceaccount", "ensure"): cmd_serviceaccount_ensure,
+    ("serviceaccount", "inspect"): cmd_serviceaccount_inspect,
+    ("serviceaccount", "delete"): cmd_serviceaccount_delete,
+    ("code-scan", "inspect"): cmd_codescan_inspect,
     ("detection", "inspect"): cmd_detection_inspect,
     ("outpost", "inspect"): cmd_outpost_inspect,
     ("outpost", "ensure"): cmd_outpost_ensure,
