@@ -82,6 +82,12 @@ class FlagParsing(unittest.TestCase):
             wz._flag(["role", "inspect", "--role-name"], "--role-name")
         self.assertEqual(cm.exception.code, 2)
 
+    def test_the_next_flag_is_never_the_value(self):
+        # `reap --session --commit` must not reap a session named "--commit" with commit silently off.
+        with self.assertRaises(SystemExit) as cm:
+            wz._flag(["--session", "--commit"], "--session")
+        self.assertEqual(cm.exception.code, 2)
+
 
 class CliHelper(unittest.TestCase):
     def test_missing_binary_is_environment_3(self):
@@ -180,6 +186,29 @@ class RoleInspectGrading(unittest.TestCase):
         # "learner wrong".
         self.assertEqual(self._run(_proc(255, "", "Unable to locate credentials")), 3)
         self.assertEqual(self._run(_proc(255, "", "ExpiredToken: token is expired")), 3)
+
+    @staticmethod
+    def _stmt(principal, external_id):
+        return {"Effect": "Allow", "Principal": {"AWS": principal}, "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"sts:ExternalId": external_id}}}
+
+    def _multi(self, *statements):
+        role = {"Role": {"AssumeRolePolicyDocument": {"Statement": list(statements)}}}
+        return self._run(_proc(0, json.dumps(role)))
+
+    def test_a_split_principal_and_external_id_do_not_combine(self):
+        # AWS evaluates a statement as a unit: the delegator under a wrong external id, plus the right
+        # external id for someone else, authorizes nobody — and used to grade 0.
+        self.assertEqual(self._multi(self._stmt(self.DELEGATOR, "WRONG-ID"),
+                                     self._stmt("arn:aws:iam::222222222222:role/Other", self.TID)), 1)
+
+    def test_one_fully_correct_statement_among_others_is_valid(self):
+        self.assertEqual(self._multi(self._stmt("arn:aws:iam::222222222222:role/Other", "OTHER-ID"),
+                                     self._stmt(self.DELEGATOR, self.TID)), 0)
+
+    def test_the_delegators_own_statement_must_carry_the_condition(self):
+        unconditioned = {"Effect": "Allow", "Principal": {"AWS": self.DELEGATOR}, "Action": "sts:AssumeRole"}
+        self.assertEqual(self._multi(unconditioned, self._stmt("arn:aws:iam::2:role/O", self.TID)), 1)
 
 
 class Naming(unittest.TestCase):
@@ -609,6 +638,44 @@ class SessionVerifyCsp(unittest.TestCase):
              self.assertRaises(SystemExit) as cm:
             wz.cmd_session_verify(["--cloud", "aws"])
         self.assertEqual(cm.exception.code, 0)
+
+    def _verify(self, cloud, env, proc, args=()):
+        binary = {"aws": "_aws", "gcp": "_gcp", "azure": "_az"}[cloud]
+        with self._mock_wiz(), self._mock_api(), \
+             mock.patch.dict(wz.os.environ, env, clear=True), \
+             mock.patch.object(wz, binary, return_value=proc), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--cloud", cloud, *args])
+        return cm.exception.code
+
+    GCP_ENV: typing.ClassVar = {"GOOGLE_CREDENTIALS": "{}", "GOOGLE_PROJECT": "wiz-lab-42"}
+    AWS_ENV: typing.ClassVar = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
+
+    def test_gcp_with_no_active_account_is_environment_3(self):
+        # `gcloud auth list` exits 0 with `[]` when nothing activated, which used to pass verification
+        # and left a terraform apply mid-lab to discover there are no credentials.
+        self.assertEqual(self._verify("gcp", self.GCP_ENV, _proc(0, "[]")), 3)
+        revoked = '[{"account": "a@b.iam.gserviceaccount.com", "status": ""}]'
+        self.assertEqual(self._verify("gcp", self.GCP_ENV, _proc(0, revoked)), 3)
+
+    def test_gcp_with_an_active_account_exits_0(self):
+        active = '[{"account": "a@b.iam.gserviceaccount.com", "status": "ACTIVE"}]'
+        self.assertEqual(self._verify("gcp", self.GCP_ENV, _proc(0, active)), 0)
+
+    def test_unparseable_identity_is_environment_3(self):
+        self.assertEqual(self._verify("gcp", self.GCP_ENV, _proc(0, "Updates are available")), 3)
+        self.assertEqual(self._verify("aws", self.AWS_ENV, _proc(0, "")), 3)
+
+    def test_aws_credentials_for_another_account_cannot_pass(self):
+        proc = _proc(0, '{"Account": "999999999999"}')
+        self.assertEqual(self._verify("aws", self.AWS_ENV, proc, ["--account-id", "123456789012"]), 3)
+        self.assertEqual(self._verify("aws", self.AWS_ENV, proc, ["--account-id", "999999999999"]), 0)
+
+    def test_azure_must_be_logged_in_to_the_declared_subscription(self):
+        env = {"ARM_CLIENT_ID": "c", "ARM_CLIENT_SECRET": "s", "ARM_TENANT_ID": "t",
+               "ARM_SUBSCRIPTION_ID": "5da4a5ee-0000-0000-0000-000000000001"}
+        self.assertEqual(self._verify("azure", env, _proc(0, '{"id": "other-subscription"}')), 3)
+        self.assertEqual(self._verify("azure", env, _proc(0, '{"id": "5DA4A5EE-0000-0000-0000-000000000001"}')), 0)
 
 
 class GcpRoleInspect(unittest.TestCase):
@@ -1115,6 +1182,22 @@ class PolicyGrading(unittest.TestCase):
     def test_ensure_control_absent_is_environment_3(self):
         self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], self._api(existing=False, control=[])), 3)
 
+    def test_ensure_refuses_a_control_that_is_not_the_documented_one(self):
+        # `search` is a server-side contains. Scoping the policy to whatever it returned first built a
+        # fixture that blocks on another condition while the lab still tells the learner to fix USER.
+        other = [{"id": "ctl-9", "name": "Last User Is Not Declared", "severity": "HIGH"}]
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], self._api(False, control=other)), 3)
+
+    def test_ensure_refuses_two_controls_with_the_documented_name(self):
+        dupes = [dict(self.CTL[0]), {"id": "ctl-2", "name": "Last User Is 'root'", "severity": "HIGH"}]
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], self._api(False, control=dupes)), 3)
+
+    def test_rule_id_override_scopes_without_a_lookup(self):
+        side = self._api(existing=False, control=[])
+        argv = ["--name", "block-root", "--rule-id", "ctl-chosen"]
+        self.assertEqual(self._exit(wz.cmd_policy_ensure, argv, side), 0)
+        self.assertEqual(self.created["input"]["iacParams"]["cloudConfigurationRules"], ["ctl-chosen"])
+
     def test_ensure_create_no_id_is_environment_3(self):
         side = self._api(existing=False, created_id=None)
         self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], side), 3)
@@ -1203,8 +1286,8 @@ class LeaseDevAccess(unittest.TestCase):
         return cm.exception.code, out.getvalue() + err.getvalue()
 
     def test_ensure_publishes_both_halves_and_logs_no_key_material(self):
-        keys = [{"id": "kOLD", "description": "dev-te-dev-aws-aaaa"},
-                {"id": "kOTHER", "description": "dev-te-wiz-code-201-bbbb"}]
+        keys = [{"id": "kOLD", "description": "dev-te-dev-aws-aaaaaaaa"},
+                {"id": "kOTHER", "description": "dev-te-wiz-code-201-bbbbbbbb"}]
         revoked, sent = [], []
         code, logged = self._ensure(self._ts_stub(keys, revoked), lambda q, v: sent.append(v) or {},
                                    ["--lab", "te-dev-aws", "--timelimit-seconds", "3600"])
@@ -1253,12 +1336,32 @@ class LeaseDevAccess(unittest.TestCase):
         def ts(method, path, body=None):
             if method == "DELETE":
                 order.append("revoke")
-            return {"keys": [{"id": "kNEW", "description": "dev-te-dev-aws-cccc"}]}
+            return {"keys": [{"id": "kNEW", "description": "dev-te-dev-aws-cccccccc"}]}
 
         with mock.patch.object(wz, "_ts", ts), \
              mock.patch.object(wz, "_iq", lambda q, v, **k: order.append(v["n"]) or {}):
             self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
         self.assertEqual(order, ["revoke", "TS_AUTHKEY_DEV_AWS", "TE_DEV_SSH_PUBKEY_DEV_AWS"])
+
+    def test_ensure_leaves_a_similarly_prefixed_labs_key_alone(self):
+        # `dev-te-dev-aws-` prefixes `dev-te-dev-aws-extra-<tag>`: a prefix test revoked the other lab's
+        # key while its play was running.
+        keys = [{"id": "kOWN", "description": "dev-te-dev-aws-aaaaaaaa"},
+                {"id": "kEXTRA", "description": "dev-te-dev-aws-extra-bbbbbbbb"}]
+        revoked = []
+        code, _ = self._ensure(self._ts_stub(keys, revoked), lambda q, v: {}, ["--lab", "te-dev-aws"])
+        self.assertEqual(code, 0)
+        self.assertEqual(revoked, ["kOWN"])
+
+    def test_delete_revokes_every_key_this_lab_owns_and_only_those(self):
+        keys = [{"id": "kA", "description": "dev-te-dev-aws-aaaaaaaa"},
+                {"id": "kB", "description": "dev-te-dev-aws-dddddddd"},
+                {"id": "kEXTRA", "description": "dev-te-dev-aws-extra-bbbbbbbb"}]
+        revoked = []
+        with mock.patch.object(wz, "_ts", self._ts_stub(keys, revoked)), \
+             mock.patch.object(wz, "_iq", lambda q, v, **k: {}):
+            self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+        self.assertEqual(revoked, ["kA", "kB"])  # leaving one live leaves a way onto the tailnet
 
     def test_delete_removes_the_local_private_key(self):
         with tempfile.TemporaryDirectory() as d:

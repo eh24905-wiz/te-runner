@@ -338,22 +338,39 @@ _CSP_REQUIRED_VARS = {
 }
 
 
-def _verify_csp(cloud):
+def _csp_json(r, cmd):
+    """Exit 0 is not the assertion — each of these commands exits 0 while reporting no identity at all
+    (`gcloud auth list` prints `[]` when nothing activated), so a returncode check passes verification
+    and leaves a terraform apply mid-lab to hit the real failure."""
+    if r.returncode != 0:
+        die(3, f"{cmd} failed: {r.stderr.strip()}")
+    try:
+        return json.loads(r.stdout or "null")
+    except json.JSONDecodeError:
+        die(3, f"{cmd} returned no parseable identity: {r.stdout.strip()[:200]!r}")
+
+
+def _verify_csp(cloud, args=()):
     missing = [v for v in _CSP_REQUIRED_VARS[cloud] if not os.getenv(v)]
     if missing:
         die(3, f"CSP credentials missing from environment: {', '.join(missing)}")
     if cloud == "aws":
-        r = _aws("sts", "get-caller-identity")
-        if r.returncode != 0:
-            die(3, f"aws sts get-caller-identity failed: {r.stderr.strip()}")
+        ident = _csp_json(_aws("sts", "get-caller-identity"), "aws sts get-caller-identity") or {}
+        account = str(ident.get("Account") or "")
+        if not account:
+            die(3, "aws sts get-caller-identity named no Account")
+        want = _flag(args, "--account-id")
+        if want and account != want:
+            die(3, f"AWS credentials are for account {account}, not the {want} this lease grades")
     elif cloud == "gcp":
-        r = _gcp("auth", "list", "--format=json")
-        if r.returncode != 0:
-            die(3, f"gcloud auth list failed: {r.stderr.strip()}")
+        accounts = _csp_json(_gcp("auth", "list", "--format=json"), "gcloud auth list") or []
+        if not [a for a in accounts if a.get("status") == "ACTIVE"]:
+            die(3, f"gcloud holds no ACTIVE account ({len(accounts)} listed); GOOGLE_CREDENTIALS did not activate")
     elif cloud == "azure":
-        r = _az("account", "show")
-        if r.returncode != 0:
-            die(3, f"az account show failed: {r.stderr.strip()}")
+        sub = (_csp_json(_az("account", "show", "-o", "json"), "az account show") or {}).get("id") or ""
+        want = os.getenv("ARM_SUBSCRIPTION_ID")
+        if sub.lower() != want.lower():
+            die(3, f"az is logged in to subscription {sub or '(none)'}, not ARM_SUBSCRIPTION_ID {want}")
 
 
 def cmd_session_verify(args):
@@ -365,7 +382,7 @@ def cmd_session_verify(args):
     if cloud:
         if cloud not in _CSP_REQUIRED_VARS:
             die(2, f"session verify --cloud: unknown value {cloud!r}; choose aws, gcp, azure")
-        _verify_csp(cloud)
+        _verify_csp(cloud, args)
     print(f"ok: authenticated to dc={dc} tenant={tid}")
     sys.exit(0)
 
@@ -1005,18 +1022,25 @@ def _find_policy(name):
 
 
 def _resolve_dockerfile_control(search):
-    """Resolve the builtin Dockerfile control live — its id is tenant-specific, never hard-coded."""
+    """Resolve the builtin Dockerfile control live — its id is tenant-specific, never hard-coded. The
+    name must match EXACTLY and once: `search` is a server-side contains, so its first hit can be a
+    different control, scoping the policy to a condition the lab never asks the learner to fix.
+    `--rule-id` is the way to scope to anything else."""
     data, _ = api(CONFIG_RULE_Q, {"f": {"search": search, "matcherType": ["DOCKER_FILE"]}})
     nodes = (data.get("cloudConfigurationRules") or {}).get("nodes") or []
     exact = [n for n in nodes if n.get("name") == ROOT_DOCKERFILE_CONTROL]
-    return (exact or nodes or [None])[0]
+    if len(exact) > 1:
+        die(3, f"tenant holds {len(exact)} DOCKER_FILE controls named {ROOT_DOCKERFILE_CONTROL!r}; "
+               f"pass --rule-id to name the one to scope to")
+    return exact[0] if exact else None
 
 
 def cmd_policy_ensure(args):
     """Ensure the BLOCK CI/CD IaC scan policy named --name exists (idempotent by name). Scoped to the
     builtin Dockerfile control 'Last User Is root' so `wizcli scan dir --policies <name>` FAILS
     (exit 4) on a root Dockerfile and passes once fixed. Shared, persistent fixture — the reaper never
-    deletes it. --rule-id / --control-search / --severity / --count-threshold override the defaults."""
+    deletes it. --severity / --count-threshold override the defaults; --rule-id scopes to a different
+    control outright, while --control-search only narrows the lookup for the documented one."""
     name = _policy_name(args)
     existing = _find_policy(name)
     if existing:
@@ -1269,6 +1293,13 @@ def _principals(stmt):
     return []
 
 
+def _trusts_delegator(stmt, delegator):
+    principals = _principals(stmt)
+    if delegator:
+        return delegator in principals
+    return any(_DELEGATOR_RE.search(p) for p in principals)
+
+
 def _external_ids(stmt):
     # Only equality pins the value: a StringLike or Null condition would pass a role Wiz can't assume.
     cond = stmt.get("Condition") or {}
@@ -1407,17 +1438,22 @@ def _inspect_aws_trust(role, role_obj):
     if not grants:
         print(f"role {role}: trust policy grants no sts:AssumeRole (trusts nobody)")
         sys.exit(1)
-    principals = [p for s in grants for p in _principals(s)]
-    if delegator:
-        if delegator not in principals:
+    # AWS evaluates a statement as a unit, so the principal and the externalId condition have to ride
+    # in the SAME statement. Flattened across statements, the delegator under a wrong external id plus
+    # another principal under the right one grades valid while Wiz's assume-role is still denied.
+    # Scope: Allow statements only — a Deny that narrows them is not modelled.
+    trusting = [s for s in grants if _trusts_delegator(s, delegator)]
+    if not trusting:
+        principals = [p for s in grants for p in _principals(s)]
+        if delegator:
             print(f"role {role}: does not trust this tenant's Wiz delegator {delegator}; trusts {principals}")
-            sys.exit(1)
-    elif not any(_DELEGATOR_RE.search(p) for p in principals):
-        print(f"role {role}: trusts no Wiz AssumeRoleDelegator; trusts {principals}")
+        else:
+            print(f"role {role}: trusts no Wiz AssumeRoleDelegator; trusts {principals}")
         sys.exit(1)
-    ext = [v for s in grants for v in _external_ids(s)]
+    ext = [v for s in trusting for v in _external_ids(s)]
     if not ext:
-        print(f"role {role}: no StringEquals sts:ExternalId condition; Wiz's assume-role is rejected")
+        print(f"role {role}: no StringEquals sts:ExternalId condition on the statement trusting "
+              f"{delegator or 'the Wiz delegator'}; Wiz's assume-role is rejected")
         sys.exit(1)
     if tid and tid not in ext:
         print(f"role {role}: sts:ExternalId {ext} != tenant id {tid}")
@@ -2034,6 +2070,20 @@ def _lease_keys():
             if (k.get("description") or "").startswith(_LEASE_KEY_PREFIX)]
 
 
+def _lease_desc(args):
+    """The description every key this lab mints carries, ahead of its per-key tag."""
+    return f"{_LEASE_KEY_PREFIX}{(_flag(args, '--lab') or '').lower()}-"
+
+
+def _owned_keys(lab_desc):
+    """This lab's keys, matched on the WHOLE description — one rule, shared by ensure and delete, or the
+    two disagree about what they own. A bare prefix test also matches a longer lab name:
+    `dev-te-dev-aws-` prefixes `dev-te-dev-aws-extra-<tag>`, which revokes another lab's live key
+    mid-play and, on the delete path, revokes it INSTEAD of this lab's while reporting success."""
+    own = re.compile(re.escape(lab_desc) + r"[0-9a-f]{8}\Z")  # the tag _mint_authkey generates
+    return [k for k in _lease_keys() if own.match(k.get("description") or "")]
+
+
 def _revoke(key_id):
     """Best-effort. A key is consumed at join, so revoking after a node is up does not drop it — it
     only closes the window the secret is usable. An ephemeral key self-expires, so a miss is not fatal."""
@@ -2119,10 +2169,9 @@ def _mint_authkey(args, lab_desc, ttl):
     join on it, preauthorized so no console click gates the join. NOT revoked at the end of `ensure`:
     the grader joins minutes later during setup, so it must stay valid until it expires with the
     lease."""
-    for k in _lease_keys():
-        if k["description"].startswith(lab_desc):
-            _revoke(k["id"])
-    desc = f"{lab_desc}{secrets.token_hex(4)}"
+    for k in _owned_keys(lab_desc):
+        _revoke(k["id"])
+    desc = f"{lab_desc}{secrets.token_hex(4)}"  # 8 hex chars — _owned_keys matches on exactly that
     res = _ts("POST", f"/tailnet/{_TS_TAILNET}/keys", {
         "capabilities": {"devices": {"create": {"reusable": True, "ephemeral": True, "preauthorized": True}}},
         "expirySeconds": ttl,
@@ -2139,7 +2188,7 @@ def cmd_lease_ensure(args):
     sshd on the pubkey — so a partial push rolls back rather than burning a play."""
     ts_name, pub_name = _secret_names(args)
     ttl = int(_flag(args, "--timelimit-seconds") or 0) + 3600
-    lab_desc = f"{_LEASE_KEY_PREFIX}{(_flag(args, '--lab') or '').lower()}-"
+    lab_desc = _lease_desc(args)
     priv, pub = _mint_keypair(args)
     key_id, key, desc = _mint_authkey(args, lab_desc, ttl)
     try:
@@ -2188,18 +2237,17 @@ def cmd_lease_delete(args):
     Running`). The ephemeral flag, not the revoke, is what reaps the grader's node."""
     ts_name, pub_name = _secret_names(args)
     key_id = _flag(args, "--key-id")
-    if not key_id:
-        lab_desc = f"{_LEASE_KEY_PREFIX}{(_flag(args, '--lab') or '').lower()}-"
-        for k in _lease_keys():
-            if k["description"].startswith(lab_desc):
-                key_id = k["id"]
-    _revoke(key_id)
+    # Every key this lab owns, not the last one a prefix happened to match: teardown that leaves one
+    # live key behind leaves a usable way onto the tailnet.
+    key_ids = [key_id] if key_id else [k["id"] for k in _owned_keys(_lease_desc(args))]
+    for k in key_ids:
+        _revoke(k)
     dropped = [n for n in (ts_name, pub_name) if _drop_secret(n)]
     d = _keypair_dir(args)
     priv = d / "id_ed25519"
     for f in (priv, priv.with_suffix(".pub"), d / "authkey"):
         f.unlink(missing_ok=True)
-    print(f"revoked {key_id or '(no key)'}; dropped {', '.join(dropped) or '(no secrets)'}")
+    print(f"revoked {', '.join(key_ids) or '(no key)'}; dropped {', '.join(dropped) or '(no secrets)'}")
     sys.exit(0)
 
 
@@ -2209,7 +2257,12 @@ def _flag(args, name):
     i = args.index(name)
     if i + 1 >= len(args):
         die(2, f"missing value for flag {name}")
-    return args[i + 1]
+    val = args[i + 1]
+    # The next flag is never the value: `--session --commit` otherwise yields a session id of
+    # "--commit" AND drops the commit switch, turning a destructive run into a silent dry run.
+    if val.startswith("--"):
+        die(2, f"missing value for flag {name} (next argument is {val})")
+    return val
 
 
 VERBS = {
