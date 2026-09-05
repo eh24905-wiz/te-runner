@@ -2,10 +2,13 @@
 # Stdlib-only harness (no external deps, matching wizlab). Locks the load-bearing invariants so
 # refactors are safe without re-playing a lab: the 0/1/2/3 exit-code contract, IAM-trust parsing
 # breadth, flag edges, and the main() dispatch guard. Run: python wizlab/test_wizlab.py
+import base64
 import contextlib
 import io
 import json
 import pathlib
+import shutil
+import tempfile
 import types
 import typing
 import unittest
@@ -1127,6 +1130,164 @@ class PolicyGrading(unittest.TestCase):
 
     def test_missing_name_is_invocation_error_2(self):
         self.assertEqual(self._exit(wz.cmd_policy_inspect, [], self._api(existing=True)), 2)
+
+
+class LeaseDevAccess(unittest.TestCase):
+    """The dev path's contract: a transport/auth gap is 3 (INCONCLUSIVE), a not-yet-joined grader is
+    1 (a wait), no key material is ever logged or published, and delete revokes before it drops the
+    reference. Both halves move together — a tailnet key without a pubkey yields a node with no
+    shell, and a pubkey without a key yields nothing at all."""
+
+    def _exit(self, fn, args):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as cm:
+            fn(args)
+        return cm.exception.code
+
+    def test_secret_names_are_per_lab_and_drop_the_te_prefix(self):
+        self.assertEqual(wz._secret_names(["--lab", "te-wiz-code-201"]),
+                         ("TS_AUTHKEY_WIZ_CODE_201", "TE_DEV_SSH_PUBKEY_WIZ_CODE_201"))
+        self.assertEqual(wz._secret_names(["--lab", "te-dev-aws"]),
+                         ("TS_AUTHKEY_DEV_AWS", "TE_DEV_SSH_PUBKEY_DEV_AWS"))
+
+    def test_missing_lab_is_invocation_error_2(self):
+        self.assertEqual(self._exit(wz.cmd_lease_delete, []), 2)
+
+    def test_missing_operator_token_is_environment_3(self):
+        with mock.patch.dict(wz.os.environ, {"TAILSCALE_API_KEY": "", "INSTRUQT_API": ""}, clear=False):
+            self.assertEqual(self._exit(wz.cmd_lease_verify, ["--no-self"]), 3)
+
+    def test_inspect_not_yet_joined_is_1_not_3(self):
+        with mock.patch.object(wz, "_fresh_nodes", return_value=[]):
+            self.assertEqual(self._exit(wz.cmd_lease_inspect, ["--lab", "te-dev-aws", "--session", "s1"]), 1)
+
+    def test_inspect_emits_grader_ip_and_the_key_that_opens_it(self):
+        out = io.StringIO()
+        with mock.patch.object(wz, "_fresh_nodes", return_value=[(5.0, "100.64.0.7", "grader-aws-s1")]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_lease_inspect(["--lab", "te-dev-aws", "--session", "s1"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("GRADER_IP=100.64.0.7", out.getvalue())
+        self.assertIn("LEASE_SSH_KEY=", out.getvalue())  # an IP with no key is not access
+
+    def test_stale_node_is_not_reachable(self):
+        # lastSeen freshness is the ONLY liveness signal: an ephemeral node lingers ~30 min after its
+        # play, so an age-blind lookup hands the validator a dead grader.
+        old = (wz.datetime.datetime.now(wz.datetime.UTC)
+               - wz.datetime.timedelta(seconds=wz._NODE_FRESH_S + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        devices = {"devices": [{"hostname": "grader-aws-s1", "addresses": ["100.64.0.7"], "lastSeen": old}]}
+        with mock.patch.object(wz, "_ts", return_value=devices):
+            self.assertEqual(wz._fresh_nodes("s1"), [])
+
+    @staticmethod
+    def _ts_stub(keys, revoked, key="tskey-auth-SUPERSECRET"):
+        def ts(method, path, body=None):
+            if method == "GET":
+                return {"keys": keys}
+            if method == "DELETE":
+                revoked.append(path.rsplit("/", 1)[1])
+                return {}
+            return {"id": "kNEW", "key": key}
+        return ts
+
+    def _ensure(self, ts, iq, args, keypair=("/tmp/k/id_ed25519", "ssh-ed25519 AAAAPUB test")):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(wz, "_ts", ts), mock.patch.object(wz, "_iq", iq), \
+             mock.patch.object(wz, "_mint_keypair", return_value=(wz.pathlib.Path(keypair[0]), keypair[1])), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_lease_ensure(args)
+        return cm.exception.code, out.getvalue() + err.getvalue()
+
+    def test_ensure_publishes_both_halves_and_logs_no_key_material(self):
+        keys = [{"id": "kOLD", "description": "dev-te-dev-aws-aaaa"},
+                {"id": "kOTHER", "description": "dev-te-wiz-code-201-bbbb"}]
+        revoked, sent = [], []
+        code, logged = self._ensure(self._ts_stub(keys, revoked), lambda q, v: sent.append(v) or {},
+                                   ["--lab", "te-dev-aws", "--timelimit-seconds", "3600"])
+        self.assertEqual(code, 0)
+        self.assertEqual(revoked, ["kOLD"])  # this lab's prior key only — never another lab's
+        pushed = {s["n"]: base64.b64decode(s["s"]).decode() for s in sent}
+        self.assertEqual(pushed, {"TS_AUTHKEY_DEV_AWS": "tskey-auth-SUPERSECRET",
+                                  "TE_DEV_SSH_PUBKEY_DEV_AWS": "ssh-ed25519 AAAAPUB test"})
+        self.assertNotIn("SUPERSECRET", logged)
+
+    def test_ensure_never_publishes_the_private_half(self):
+        # The private key is the one thing that must stay on the operator box: in the team store it is
+        # readable by anything that can render a secret into a sandbox.
+        sent = []
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
+             mock.patch.object(wz, "_ts", self._ts_stub([], [])), \
+             mock.patch.object(wz, "_iq", lambda q, v, **k: sent.append(v) or {}), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+             contextlib.suppress(SystemExit):
+            wz.cmd_lease_ensure(["--lab", "te-dev-aws"])
+        for s in sent:
+            self.assertNotIn("PRIVATE KEY", base64.b64decode(s["s"]).decode())
+
+    def test_ensure_rolls_back_the_whole_set_when_a_push_fails(self):
+        # A live key nothing references is the worst outcome: the play that would have consumed it
+        # does not exist, so it is a standing credential with no owner. A half-pushed pair burns a play.
+        revoked, dropped = [], []
+
+        def iq(q, v, **k):
+            if "deleteTeamSecret" in q:
+                dropped.append(v["n"])
+                return {}
+            raise SystemExit(3)
+
+        self._ensure(self._ts_stub([], revoked, key="tskey-auth-X"), iq, ["--lab", "te-dev-aws"])
+        self.assertEqual(revoked, ["kNEW"])
+        self.assertEqual(sorted(dropped), ["TE_DEV_SSH_PUBKEY_DEV_AWS", "TS_AUTHKEY_DEV_AWS"])
+
+    def test_delete_revokes_before_dropping_either_secret(self):
+        order = []
+
+        def ts(method, path, body=None):
+            if method == "DELETE":
+                order.append("revoke")
+            return {"keys": [{"id": "kNEW", "description": "dev-te-dev-aws-cccc"}]}
+
+        with mock.patch.object(wz, "_ts", ts), \
+             mock.patch.object(wz, "_iq", lambda q, v, **k: order.append(v["n"]) or {}):
+            self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+        self.assertEqual(order, ["revoke", "TS_AUTHKEY_DEV_AWS", "TE_DEV_SSH_PUBKEY_DEV_AWS"])
+
+    def test_delete_removes_the_local_private_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            priv = pathlib.Path(d) / "te-dev-aws" / "id_ed25519"
+            priv.parent.mkdir(parents=True)
+            priv.write_text("PRIVATE")
+            priv.with_suffix(".pub").write_text("PUB")
+            with mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
+                 mock.patch.object(wz, "_ts", return_value={"keys": []}), \
+                 mock.patch.object(wz, "_iq", lambda q, v, **k: {}):
+                self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+            self.assertFalse(priv.exists())
+            self.assertFalse(priv.with_suffix(".pub").exists())
+
+    def test_delete_is_idempotent_when_both_sides_are_already_gone(self):
+        def boom(*a, **k):
+            raise SystemExit(3)
+
+        with mock.patch.object(wz, "_ts", return_value={"keys": []}), mock.patch.object(wz, "_iq", boom):
+            self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+
+    @unittest.skipUnless(shutil.which("ssh-keygen"), "openssh-client absent")
+    def test_minted_keypair_is_a_real_ed25519_pair_the_private_half_locked_down(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False):
+            priv, pub = wz._mint_keypair(["--lab", "te-dev-aws"])
+            self.assertTrue(pub.startswith("ssh-ed25519 "))
+            self.assertEqual(priv.stat().st_mode & 0o777, 0o600)
+            first = pub
+            # Fresh per play: a second ensure must not reuse the key the last play's grader trusted.
+            self.assertNotEqual(wz._mint_keypair(["--lab", "te-dev-aws"])[1], first)
+
+    def test_scrub_masks_any_key_shaped_string(self):
+        self.assertNotIn("abc123", wz._scrub("up --authkey=tskey-auth-abc123 failed"))
 
 
 if __name__ == "__main__":

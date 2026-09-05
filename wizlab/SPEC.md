@@ -19,7 +19,8 @@ Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. L
 
 ## Nouns
 `session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, for connectorless
-Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceaccount` and `code-scan`:
+Runtime-Sensor labs `sensor` and `detection`, for Wiz Code labs `serviceaccount` and `code-scan`, and
+authoring-side `lease`:
 - `outpost ensure|delete|inspect` — a Wiz Outpost (Automated deploy in the customer account). `ensure`
   createsOutpost named on the session stem, given `--role-arn` (the orchestrator TF module output Wiz
   assumes); `inspect --require exists|initialized|connected` asserts the `OutpostStatus` enum and
@@ -55,6 +56,28 @@ Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceacco
   `deleteCliDeployment`. The deployment's SA is named `<stem>-cli-deployment-<uuid>`, so the reaper's
   `ServiceAccount` `lab-<id>*` sweep also catches it. The `sensor` path stays on
   `createServiceAccount(type:SENSOR)`, unchanged.
+- `lease verify|ensure|inspect|delete --lab N` — the operator's dev-access path to a grader over the
+  tailnet. Authoring-side: reads `TAILSCALE_API_KEY` + `INSTRUQT_API` from the operator, never from a
+  lab, so in a grader it is inert. `verify` asserts both tokens, Instruqt reachability, and this
+  host's own tailnet membership (`tailscale status` → `BackendState`, the only local answer) — the
+  precheck that stops an unreachable grader from grading as a broken lab. `ensure` provisions **both**
+  halves of dev access, fresh per play: one ephemeral, reusable, preauthorized tailnet key
+  (`expirySeconds` = the lab's `timelimit` + 3600) under `TS_AUTHKEY_<LAB>`, and an ed25519 keypair
+  whose public half goes under `TE_DEV_SSH_PUBKEY_<LAB>`, private half left in
+  `~/.cache/wizlab/lease/<lab>/`. Both values **base64** (a raw one errors `illegal base64 data`);
+  both names per-lab, because 2.0's `startLab` takes no `runtimeParameters` to bind a per-run name
+  (`te-labkit-v2/authoring/instruqt-2.0.md`). This lab's prior key is revoked first — that bounds live
+  keys to one per lab and kills a crashed run's orphan, the only orphan nameable without guessing
+  which play a key belongs to — and a failed upsert rolls the whole set back, since a live key with
+  no reference is worse than no key. Key auth is not optional and the tailnet is not the perimeter:
+  grader and learner containers share `resource.network.lab` and stock sshd binds `0.0.0.0`
+  (`PermitRootLogin prohibit-password`), so the pubkey is the only thing keeping a learner terminal
+  off the container holding every operator secret. `inspect --require reachable` resolves the
+  session's node by `lastSeen` freshness — the devices API exposes no `online` field and an ephemeral
+  node lingers ~30 min past its play — and emits `GRADER_IP` + `LEASE_SSH_KEY`. `delete` revokes by
+  key id, THEN drops both secrets and the private key: a crash that order strands a dead string, the
+  reverse strands a live key. Between plays the team store holds no dev credential at all, so a lab
+  shipped with the dev block live references names that do not exist.
 - `policy ensure|inspect|delete --name N` — the BLOCK CI/CD IaC scan policy a code-scan gate needs.
   `ensure` is idempotent by name; absent, it creates a `type:IAC` policy with `enforcementMethod
   BLOCK` on `deploymentLifecycle CLI`, scoped (`iacParams.cloudConfigurationRules`) to the builtin
@@ -72,7 +95,9 @@ Runtime-Sensor labs `sensor` and `detection`, and for Wiz Code labs `serviceacco
 ## What may be added
 A change qualifies only if ALL hold:
 1. **General** — reused across labs, not bespoke to one scenario.
-2. **API-level** — a Wiz or CSP read/assert/mutation (`api()` / `_aws`).
+2. **API-level** — a Wiz or CSP read/assert/mutation (`api()` / `_aws`), or a Tailscale/Instruqt one
+   the lab runtime itself depends on (`lease`). Not a third cloud: the bar is an API no lab may hold
+   credentials for.
 3. **Fits the grammar** — a noun + one of the verbs above, at that verb's meaning.
 
 ## What may NOT
