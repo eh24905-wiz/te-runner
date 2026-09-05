@@ -1,10 +1,10 @@
 # Design review — open findings
 
-Findings distinguish reproduced local behavior from architectural recommendations. No live tenant mutation, image build, or deployed-image check backs any of them. F2, F5, F6, F9 and F10 are closed — `wizlab/test_wizlab.py` asserts the corrected behavior, so nothing here restates them; the numbering gap is deliberate. Reassess the rest against the working tree before implementing.
+Findings distinguish reproduced local behavior from architectural recommendations. No live tenant mutation, image build, or deployed-image check backs any of them. F1, F2, F5, F6, F9 and F10 are closed — `wizlab/test_wizlab.py` asserts the corrected behavior, so nothing here restates them; the numbering gap is deliberate. Reassess the rest against the working tree before implementing.
 
 ## Verifying the open findings
 
-`python3 research/reproduce_design_findings.py` → exit 0, 6 observations. Each asserts today's defect, so it goes red on a fix and retires into `wizlab/test_wizlab.py` as a desired-behavior regression. Suites: `python3 wizlab/test_wizlab.py` (161), `python3 reaper/test_reap_orphans.py` (5), `python3 test_entrypoint.py` (1). Gates: `ruff check`, `xenon --max-absolute C --max-average B wizlab/wizlab`; average complexity B. Interpreters: CI 3.11, image 3.12. Passing mocked tests establishes no external API behavior.
+`python3 research/reproduce_design_findings.py` → exit 0, 5 observations. Each asserts today's defect, so it goes red on a fix and retires into `wizlab/test_wizlab.py` as a desired-behavior regression. Suites: `python3 wizlab/test_wizlab.py` (168), `python3 reaper/test_reap_orphans.py` (5), `python3 test_entrypoint.py` (1). Gates: `ruff check`, `xenon --max-absolute C --max-average B wizlab/wizlab`; average complexity B. Interpreters: CI 3.11, image 3.12. Passing mocked tests establishes no external API behavior.
 
 ## Patterns to preserve
 
@@ -15,10 +15,6 @@ Findings distinguish reproduced local behavior from architectural recommendation
 | Session identity and exact matching | `_lab_stem`, `_kc_user_id`, `_reap_find`, `_owned_keys` scope operations and refuse duplicates. |
 | Measured facts with verification guidance | `measurements.yaml` distinguishes observations from guarantees and records how to recheck them. |
 | Small reusable helpers | `_NODE`, `_cloud`, `_kc_session`, `_cli` consolidate real repetition without hiding provider differences. |
-
-## F1 — High: transport retries non-idempotent mutations
-
-`api` suppresses GraphQL-level mutation retries, but `_post` retries HTTP 5xx, 429, and transport exceptions regardless of operation. Probe F1 records three mutation submissions after HTTP 503, then exit 3. If the server applied a request before its response failed, resubmission could duplicate resources. `TransientGraphqlErrors.test_a_mutation_is_never_retried` mocks `_post`, so it cannot catch this. Pass an explicit retry policy into transport; default unprotected mutations to one attempt, then reconcile uncertain outcomes using resource identity. Acceptance: reads retain bounded retries; mutation 503, timeout, and response-decoding failure cause one submission. HTTP retry semantics: https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2
 
 ## F3 — Medium: Outpost timeout delegates to an absent handler
 
@@ -38,15 +34,15 @@ Owner: unassigned. `_reap_one` returns an alert with `blocked=False` when a name
 
 ## D1 — Refactor along responsibilities, preserving deployment simplicity
 
-The runtime has 34 command handlers. Size alone is not the problem: HTTP clients, parsing, assertions, cleanup policy, output publication, and operator lease lifecycle change for different reasons. Extract a small importable package behind the same executable: CLI boundary, provider clients, resource operations, pure assertions, cleanup orchestration, and operator lease support. Keep Terraform outside it and preserve stdlib-only runtime dependencies. Do not introduce a provider/plugin framework merely to reduce line count. Acceptance: same command/output/exit contracts, installable image layout, and independently testable helpers; `main` owns process exits rather than deep transport helpers terminating orchestration. Do this after F1, F7 and D3 settle the contracts it would freeze.
+The runtime has 34 command handlers. Size alone is not the problem: HTTP clients, parsing, assertions, cleanup policy, output publication, and operator lease lifecycle change for different reasons. Extract a small importable package behind the same executable: CLI boundary, provider clients, resource operations, pure assertions, cleanup orchestration, and operator lease support. Keep Terraform outside it and preserve stdlib-only runtime dependencies. Do not introduce a provider/plugin framework merely to reduce line count. Acceptance: same command/output/exit contracts, installable image layout, and independently testable helpers; `main` owns process exits rather than deep transport helpers terminating orchestration. Do this after F7 and D3 settle the contracts it would freeze.
 
 ## D2 — Consolidate shared operational policy
 
-`api`, `_gql`, `_kc_call`, `_ts`, `_iq`, and reaper `_instruqt` duplicate transport concerns with different failure semantics. Share timeout budgets, safe retry decisions, secret redaction, and typed transport errors while keeping provider response parsing explicit. A command-scoped Wiz client can reuse authentication instead of `token_and_dc` running for every API call; refresh only on a defined expiry/auth path. Centralize complete enumeration and exact/unique selection rather than repeating `next`, sorting, and partial-page assumptions. `_cli` needs bounded subprocess execution. Acceptance: failure classification, retry counts, and token reuse are tested through transport boundaries, including GraphQL partial-data responses. F1 defines the retry semantics this would share.
+`api`, `_gql`, `_kc_call`, `_ts`, `_iq`, and reaper `_instruqt` duplicate transport concerns with different failure semantics. Share timeout budgets, safe retry decisions, secret redaction, and typed transport errors while keeping provider response parsing explicit. A command-scoped Wiz client can reuse authentication instead of `token_and_dc` running for every API call; refresh only on a defined expiry/auth path. Centralize complete enumeration and exact/unique selection rather than repeating `next`, sorting, and partial-page assumptions. `_cli` needs bounded subprocess execution. Acceptance: failure classification, retry counts, and token reuse are tested through transport boundaries, including GraphQL partial-data responses. `_submissions` is the retry rule to share; a consolidated client must not reintroduce a resend a caller did not authorize.
 
 ## D3 — Define successful ensure and inspect precisely
 
-`_ensure_sa` succeeds without credentials when a sensor account exists; `cmd_serviceaccount_ensure` instead deletes and recreates a CLI deployment. `cmd_policy_ensure` and `cmd_outpost_ensure` accept existing names without reconciling configuration. D3 probes confirm empty sensor output and ignored policy threshold changes. These may be intentional contracts, but “idempotent converge” alone does not explain them. Specify postconditions per resource, ownership, secret recovery/rotation, and interrupted-run behavior. For shared policies, report drift before mutating other labs' fixture. Also define whether `lease inspect --require reachable` promises node freshness or usable SSH: it currently accepts freshness even without a local private key.
+`_ensure_sa` succeeds without credentials when a sensor account exists; `cmd_serviceaccount_ensure` instead deletes and recreates a CLI deployment. `cmd_policy_ensure` and `cmd_outpost_ensure` accept existing names without reconciling configuration. D3 probes confirm empty sensor output and ignored policy threshold changes. These may be intentional contracts, but “idempotent converge” alone does not explain them. Specify postconditions per resource, ownership, secret recovery/rotation, and interrupted-run behavior — these are also what reconciles an unknown mutation outcome, since `_submissions` now refuses the resend. For shared policies, report drift before mutating other labs' fixture. Also define whether `lease inspect --require reachable` promises node freshness or usable SSH: it currently accepts freshness even without a local private key.
 
 ## D4 — Test behavior across boundaries
 
@@ -60,10 +56,9 @@ The suite reaches 25 of 34 `cmd_*` bodies when traced with `sys.settrace`; this 
 
 | Order | Action and completion criterion |
 |---|---|
-| 1 | Correct F1 mutation retries; convert probe F1 into a production regression test. |
-| 2 | Assign and settle the F7 coverage enum; it blocks F3 and F8. |
-| 3 | Implement F3 and F8 against that enum, then F4 pagination on destructive lookups. |
-| 4 | Specify D3 postconditions; add D4 destructive/credential coverage. |
-| 5 | Gate the release (D5), then extract shared boundaries (D1, D2). |
+| 1 | Assign and settle the F7 coverage enum; it blocks F3 and F8. |
+| 2 | Implement F3 and F8 against that enum, then F4 pagination on destructive lookups. |
+| 3 | Specify D3 postconditions; add D4 destructive/credential coverage. |
+| 4 | Gate the release (D5), then extract shared boundaries (D1, D2). |
 
 Open question: `fr/reaper-safety-and-role-refactor` is superseded by PR #1, which narrowed alert blocking to separate `alerted` and `blocked` outcomes. Do not merge the branch wholesale; F7 decides whether any of its broader blocking policy returns.

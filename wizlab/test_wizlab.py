@@ -440,6 +440,71 @@ class TransientGraphqlErrors(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
 
 
+class MutationSubmissionBudget(unittest.TestCase):
+    """A mutation is SENT once. Wiz applies it before answering, so a 503, a timeout or an undecodable
+    body leaves the outcome unknown, and a resend creates the second connector. Reads keep the retry.
+    These drive the real transport — mocking `_post` away is what let the retry hide underneath it."""
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(wz.time, "sleep"))
+        self.enterContext(mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")))
+
+    def _sends(self, fn, *args, side_effect=None, body=None):
+        """Returns (exit_code, submissions, message)."""
+        if side_effect is None:
+            cm = mock.MagicMock()
+            cm.__enter__.return_value.read.return_value = body
+            op = mock.MagicMock(return_value=cm)
+        else:
+            op = mock.MagicMock(side_effect=side_effect)
+        err = io.StringIO()
+        with mock.patch.object(wz.urllib.request, "urlopen", op), \
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm_exit:
+            fn(*args)
+        return cm_exit.exception.code, op.call_count, err.getvalue()
+
+    @staticmethod
+    def _http(code):
+        return urllib.error.HTTPError("https://x/", code, "boom", None, io.BytesIO(b"unavailable"))
+
+    MUTATION = "mutation M { createConnector { id } }"
+
+    def test_the_rule_is_a_property_of_the_document(self):
+        self.assertEqual(wz._submissions("query Q { x }"), 3)
+        self.assertEqual(wz._submissions("  { x }"), 3)  # anonymous query
+        self.assertEqual(wz._submissions(self.MUTATION), 1)
+        self.assertEqual(wz._submissions("subscription S { x }"), 1)  # unrecognised counts as unsafe
+
+    def test_a_mutation_is_submitted_once_after_http_503(self):
+        code, sends, msg = self._sends(wz.api, self.MUTATION, {}, side_effect=self._http(503))
+        self.assertEqual((code, sends), (3, 1))
+        self.assertIn("not resubmitted", msg)
+
+    def test_a_mutation_is_submitted_once_after_a_timeout(self):
+        code, sends, _ = self._sends(wz.api, self.MUTATION, {}, side_effect=TimeoutError("timed out"))
+        self.assertEqual((code, sends), (3, 1))
+
+    def test_a_mutation_is_submitted_once_when_the_response_will_not_decode(self):
+        code, sends, _ = self._sends(wz.api, self.MUTATION, {}, body=b"<html>502 Bad Gateway</html>")
+        self.assertEqual((code, sends), (3, 1))
+
+    def test_a_read_still_resends_after_503(self):
+        code, sends, _ = self._sends(wz.api, "query Q { connectors { id } }", {},
+                                     side_effect=self._http(503))
+        self.assertEqual((code, sends), (3, 3))
+
+    def test_a_reap_delete_is_submitted_once(self):
+        delete = 'mutation { deleteReport(input: { id: "r1" }) { _stub } }'
+        code, sends, _ = self._sends(wz._gql, "tok", "dc", delete, side_effect=self._http(503))
+        self.assertEqual((code, sends), (3, 1))
+
+    def test_a_team_secret_mutation_is_submitted_once(self):
+        upsert = "mutation($t: String!, $n: String!) { upsertTeamSecret(teamSlug: $t, name: $n) { name } }"
+        with mock.patch.dict(wz.os.environ, {"INSTRUQT_API": "tok"}, clear=False):
+            code, sends, _ = self._sends(wz._iq, upsert, {}, side_effect=self._http(503))
+        self.assertEqual((code, sends), (3, 1))
+
+
 class ConnectorLookupLayers(unittest.TestCase):
     """The account LINK lags create by 1-2 min, so the fallbacks decide what a check reports during
     the window a learner is most likely to click Check."""

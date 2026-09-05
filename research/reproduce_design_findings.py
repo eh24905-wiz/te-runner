@@ -12,7 +12,6 @@ import importlib.util
 import io
 import pathlib
 import unittest
-import urllib.error
 from importlib.machinery import SourceFileLoader
 from unittest import mock
 
@@ -44,15 +43,6 @@ class ReviewObservations(unittest.TestCase):
         with self.assertRaises(SystemExit) as result:
             fn(*args)
         return result.exception.code
-
-    def test_f1_http_503_retries_a_mutation_three_times(self):
-        error = urllib.error.HTTPError(
-            "https://test.invalid", 503, "unavailable", None, io.BytesIO(b"failure"))
-        self.addCleanup(error.close)
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz.urllib.request, "urlopen", side_effect=error) as http:
-            self.assertEqual(self.exit_code(wz.api, "mutation M { createConnector { id } }", {}), 3)
-        self.assertEqual(http.call_count, 3)
 
     def test_f3_outpost_timeout_succeeds_without_a_sweep_handler(self):
         node = {"id": "outpost-1", "status": "UNINSTALLING"}

@@ -208,8 +208,11 @@ def _claims(tok):
 
 
 def _post(url, data, headers, attempts=3):
-    # Retry transient failures (transport + 5xx/429) with backoff so a momentary Wiz blip doesn't
-    # exit 3 and abort a fail-loud setup. 4xx (auth/bad request) is not transient — fail fast.
+    # `attempts` is a SUBMISSION budget the caller owns, not a transport nicety: every failure counted
+    # here (transport, 5xx/429, an undecodable body) leaves the outcome UNKNOWN, so resubmitting is only
+    # safe when the request is. Retrying transient failures with backoff keeps a momentary Wiz blip from
+    # exiting 3 mid-setup. 4xx (auth/bad request) is not transient — fail fast. The default suits the
+    # token mints, which allocate no resource; GraphQL callers pass _submissions(query).
     payload = data.encode() if isinstance(data, str) else json.dumps(data).encode()
     last = ""
     for i in range(attempts):
@@ -226,6 +229,9 @@ def _post(url, data, headers, attempts=3):
             last = f"transport failure to {url}: {type(e).__name__}: {e}"
         if i < attempts - 1:
             time.sleep(2**i)  # 1s, 2s
+    if attempts == 1:
+        die(3, f"{last}; not resubmitted — the server may have applied it, so reconcile by name "
+               f"(re-run the same ensure) rather than assuming nothing happened")
     die(3, f"after {attempts} attempts: {last}")
 
 
@@ -256,6 +262,16 @@ def token_and_dc():
 # check wrapper remaps 3->1, and the learner is told "no connector targets this subscription" seconds
 # after creating one (observed once during azure-connector-101 validation).
 _TRANSIENT_GQL = ("internal server error", "temporarily unavailable", "service unavailable", "timeout")
+_READ_SUBMISSIONS = 3
+
+
+def _submissions(query):
+    """How many times this GraphQL document may be SENT, which is a property of the document, not of
+    the failure that interrupted it. Wiz applies a mutation before it answers, so a 503, a timeout or a
+    body that will not decode leaves "did it happen?" unanswerable — and a resend creates the second
+    connector. Reads carry no such risk and keep the bounded retry. Anything not recognisably a read
+    counts as a mutation. Idempotency: https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2"""
+    return _READ_SUBMISSIONS if query.lstrip().startswith(("query", "{")) else 1
 
 
 def api(query, variables, attempts=3):
@@ -265,15 +281,16 @@ def api(query, variables, attempts=3):
             f"https://api.{dc}.app.wiz.io/graphql",
             {"query": query, "variables": variables},
             {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+            attempts=_submissions(query),
         )
         errors = res.get("errors") or []
         data = res.get("data")
         if not errors or any((data or {}).get(k) is not None for k in (data or {})):
             return data or {}, tid
         msg = "; ".join(e.get("message", "?") for e in errors)
-        # Reads only. A mutation that 500s may still have applied, so retrying could create a second
-        # connector — fail loud there and let the operator look.
-        is_read = query.lstrip().startswith("query")
+        # One rule for both layers: whatever may not be resubmitted over HTTP may not be replayed here
+        # either, so a transient GraphQL fault is retried for reads and fatal for everything else.
+        is_read = _submissions(query) > 1
         if not (is_read and any(t in msg.lower() for t in _TRANSIENT_GQL)) or i == attempts - 1:
             die(3, msg)
         time.sleep(2**i)  # 1s, 2s
@@ -1792,7 +1809,8 @@ def _reap_handler(x):
 def _gql(tok, dc, query):
     # Non-fatal twin of api(): returns (data, errors) so one unresolvable type alerts, not aborts.
     res = _post(f"https://api.{dc}.app.wiz.io/graphql", {"query": query},
-                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
+                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                attempts=_submissions(query))
     return res.get("data") or {}, res.get("errors") or []
 
 
@@ -1993,7 +2011,8 @@ def _iq(query, variables, tolerate=None):
     a clean teardown. Returns None so the caller reports the absence instead of dying on it."""
     tok = os.getenv("INSTRUQT_API") or die(3, "INSTRUQT_API not in environment")
     res = _post(IQ_API, {"query": query, "variables": variables},
-                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
+                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                attempts=_submissions(query))
     errs = res.get("errors")
     if errs:
         if tolerate and all(tolerate in json.dumps(e) for e in errs):
