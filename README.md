@@ -13,5 +13,7 @@ labs pin (Instruqt pulls anonymously). A tag on `origin` (wiz-training) builds a
 environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
 session in a terminal `validating_error`); consume them raw in CI.
 
+Design review: [findings, reproductions, and recommendations](research/design-review.md).
+
 Next action: measure the post-role connector `healthy` enum on a live lease
 (TODO in `wizlab/wizlab`).
