@@ -69,7 +69,11 @@ authoring-side `lease`:
   (`te-labkit-v2/authoring/instruqt-2.0.md`). This lab's prior key is revoked first — that bounds live
   keys to one per lab and kills a crashed run's orphan, the only orphan nameable without guessing
   which play a key belongs to — and a failed upsert rolls the whole set back, since a live key with
-  no reference is worse than no key. Key auth is not optional and the tailnet is not the perimeter:
+  no reference is worse than no key. It then joins **this host** on that same key (what `reusable` is
+  for) via `sudo -n tailscale up --auth-key=file:…` — a path, never argv, since `/proc/<pid>/cmdline`
+  is world-readable and `tailscale up` echoes the flag into its own errors. A host already `Running`
+  is left alone; a `sudo` that needs a password is a warning naming the command, not a failure, since
+  the lease itself is already real. Key auth is not optional and the tailnet is not the perimeter:
   grader and learner containers share `resource.network.lab` and stock sshd binds `0.0.0.0`
   (`PermitRootLogin prohibit-password`), so the pubkey is the only thing keeping a learner terminal
   off the container holding every operator secret. `inspect --require reachable` resolves the

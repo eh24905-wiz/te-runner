@@ -2055,9 +2055,8 @@ def _fresh_nodes(match):
     return sorted(out)
 
 
-def _self_on_tailnet():
-    """This host, not any host: a minted key the operator cannot follow the grader over reaches
-    nothing. `tailscale status` is the only local answer — the devices API cannot say which node is us."""
+def _backend_state():
+    """`tailscale status` is the only local answer — the devices API cannot say which node is us."""
     try:
         st = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True,
                             timeout=10, check=False)
@@ -2065,9 +2064,41 @@ def _self_on_tailnet():
         die(3, f"cannot run `tailscale status`: {type(e).__name__}: {e}")
     if st.returncode != 0:
         die(3, f"tailscale status exit {st.returncode}: {_scrub(st.stderr).strip()[:200]}")
-    state = (json.loads(st.stdout or "{}").get("BackendState") or "").lower()
+    return (json.loads(st.stdout or "{}").get("BackendState") or "").lower()
+
+
+def _self_on_tailnet():
+    """This host, not any host: a minted key the operator cannot follow the grader over reaches
+    nothing."""
+    state = _backend_state()
     if state != "running":
-        die(3, f"this host's tailscale is {state or 'unknown'}, not running; `tailscale up` first")
+        die(3, f"this host's tailscale is {state or 'unknown'}, not running; `lease ensure` joins it")
+
+
+def _self_join(args, key):
+    """Join THIS host on the same key the grader gets — what `reusable` is for. The key arrives as a
+    file path, never argv: `/proc/<pid>/cmdline` is world-readable and `tailscale up` echoes the flag
+    into its own error output. A host already Running is left alone, since re-upping churns a durable
+    node identity for nothing. Failure is a warning, not an exit: the lease is already real, and
+    `verify` is what refuses to grade over a tunnel that is not there."""
+    if _backend_state() == "running":
+        return "already on the tailnet"
+    d = _keypair_dir(args)
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    kf = d / "authkey"
+    kf.write_text(key)
+    kf.chmod(0o600)
+    try:
+        r = subprocess.run(["sudo", "-n", "tailscale", "up", f"--auth-key=file:{kf}"],
+                           capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"NOT joined ({type(e).__name__}); run: sudo tailscale up --auth-key=file:{kf}"
+    if r.returncode != 0:
+        return (f"NOT joined ({_scrub(r.stderr).strip()[:100]}); "
+                f"run: sudo tailscale up --auth-key=file:{kf}")
+    kf.unlink(missing_ok=True)
+    return "joined this host to the tailnet"
 
 
 def cmd_lease_verify(args):
@@ -2120,8 +2151,10 @@ def cmd_lease_ensure(args):
         _drop_secret(ts_name)
         _drop_secret(pub_name)
         raise
+    joined = _self_join(args, key)
     print(f"LEASE_KEY_ID={key_id}\nLEASE_SECRET={ts_name}\nLEASE_SSH_KEY={priv}")
-    print(f"rotated {ts_name} + {pub_name}; start the play now (expires in {ttl}s)", file=sys.stderr)
+    print(f"rotated {ts_name} + {pub_name}; {joined}; start the play now (expires in {ttl}s)",
+          file=sys.stderr)
     sys.exit(0)
 
 
@@ -2159,8 +2192,9 @@ def cmd_lease_delete(args):
                 key_id = k["id"]
     _revoke(key_id)
     dropped = [n for n in (ts_name, pub_name) if _drop_secret(n)]
-    priv = _keypair_dir(args) / "id_ed25519"
-    for f in (priv, priv.with_suffix(".pub")):
+    d = _keypair_dir(args)
+    priv = d / "id_ed25519"
+    for f in (priv, priv.with_suffix(".pub"), d / "authkey"):
         f.unlink(missing_ok=True)
     print(f"revoked {key_id or '(no key)'}; dropped {', '.join(dropped) or '(no secrets)'}")
     sys.exit(0)

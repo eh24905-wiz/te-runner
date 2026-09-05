@@ -1191,10 +1191,12 @@ class LeaseDevAccess(unittest.TestCase):
             return {"id": "kNEW", "key": key}
         return ts
 
-    def _ensure(self, ts, iq, args, keypair=("/tmp/k/id_ed25519", "ssh-ed25519 AAAAPUB test")):
+    def _ensure(self, ts, iq, args, keypair=("/tmp/k/id_ed25519", "ssh-ed25519 AAAAPUB test"),
+                joined="joined"):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(wz, "_ts", ts), mock.patch.object(wz, "_iq", iq), \
              mock.patch.object(wz, "_mint_keypair", return_value=(wz.pathlib.Path(keypair[0]), keypair[1])), \
+             mock.patch.object(wz, "_self_join", return_value=joined), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
              self.assertRaises(SystemExit) as cm:
             wz.cmd_lease_ensure(args)
@@ -1215,11 +1217,14 @@ class LeaseDevAccess(unittest.TestCase):
 
     def test_ensure_never_publishes_the_private_half(self):
         # The private key is the one thing that must stay on the operator box: in the team store it is
-        # readable by anything that can render a secret into a sandbox.
+        # readable by anything that can render a secret into a sandbox. `_mint_keypair` is real here —
+        # a stub cannot prove what the real one writes — but `_self_join` must stay patched: unpatched,
+        # this test shells out to a real `tailscale up` and blocks on the control plane.
         sent = []
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
              mock.patch.object(wz, "_ts", self._ts_stub([], [])), \
+             mock.patch.object(wz, "_self_join", return_value="joined"), \
              mock.patch.object(wz, "_iq", lambda q, v, **k: sent.append(v) or {}), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              contextlib.suppress(SystemExit):
@@ -1274,6 +1279,48 @@ class LeaseDevAccess(unittest.TestCase):
 
         with mock.patch.object(wz, "_ts", return_value={"keys": []}), mock.patch.object(wz, "_iq", boom):
             self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+
+    def _join(self, state, proc, key="tskey-auth-SUPERSECRET"):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
+             mock.patch.object(wz, "_backend_state", return_value=state), \
+             mock.patch.object(wz.subprocess, "run", return_value=proc) as run:
+            msg = wz._self_join(["--lab", "te-dev-aws"], key)
+            argv = run.call_args[0][0] if run.call_args else []
+            leftover = sorted(p.name for p in (pathlib.Path(d) / "te-dev-aws").glob("*"))
+        return msg, argv, leftover
+
+    def test_self_join_passes_the_key_by_path_never_in_argv(self):
+        # /proc/<pid>/cmdline is world-readable, so a key in argv is readable by any local user for
+        # as long as the process lives.
+        msg, argv, leftover = self._join("needslogin", _proc(0))
+        self.assertEqual(msg, "joined this host to the tailnet")
+        self.assertIn("--auth-key=file:", " ".join(argv))
+        self.assertNotIn("SUPERSECRET", " ".join(argv))
+        self.assertEqual(leftover, [])  # consumed key file is removed on success
+
+    def test_self_join_leaves_a_running_host_alone(self):
+        # Re-upping with a per-play ephemeral key would churn a durable node identity for nothing.
+        msg, argv, _ = self._join("running", _proc(0))
+        self.assertEqual(msg, "already on the tailnet")
+        self.assertEqual(argv, [])
+
+    def test_self_join_failure_is_a_warning_naming_the_command(self):
+        # The lease is already real by this point; only local membership is missing, and `verify` is
+        # what refuses to grade over a tunnel that is not there.
+        msg, _, leftover = self._join("needslogin", _proc(1, stderr="sudo: a password is required"))
+        self.assertIn("NOT joined", msg)
+        self.assertIn("sudo tailscale up --auth-key=file:", msg)
+        self.assertNotIn("SUPERSECRET", msg)
+        self.assertEqual(leftover, ["authkey"])  # left for the operator to run the command with
+
+    def test_ensure_exits_0_even_when_the_local_join_fails(self):
+        sent = []
+        code, logged = self._ensure(self._ts_stub([], []), lambda q, v, **k: sent.append(v) or {},
+                                   ["--lab", "te-dev-aws"], joined="NOT joined (sudo)")
+        self.assertEqual(code, 0)
+        self.assertIn("NOT joined", logged)
+        self.assertEqual(len(sent), 2)  # both secrets still pushed
 
     @unittest.skipUnless(shutil.which("ssh-keygen"), "openssh-client absent")
     def test_minted_keypair_is_a_real_ed25519_pair_the_private_half_locked_down(self):
