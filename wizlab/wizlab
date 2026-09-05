@@ -2182,7 +2182,10 @@ def cmd_lease_inspect(args):
 def cmd_lease_delete(args):
     """Revoke the key, THEN drop the secrets and the private half. A crash in that order strands a
     dead string the next ensure overwrites; the reverse strands a live key with nothing pointing at
-    it. Idempotent — a second run on an already-clean lab still exits 0."""
+    it. Idempotent — a second run on an already-clean lab still exits 0. Safe the moment a verdict
+    lands: revoking an auth key does not log out a node it already authorized, so this host stays
+    `Running` (reproducer: `wizlab lease delete --lab L; tailscale status --json` → `BackendState:
+    Running`). The ephemeral flag, not the revoke, is what reaps the grader's node."""
     ts_name, pub_name = _secret_names(args)
     key_id = _flag(args, "--key-id")
     if not key_id:
