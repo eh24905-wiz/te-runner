@@ -81,7 +81,9 @@ def _reap_session(tenant, sid, commit):
     # when the footprint survives. Only a run inside WINDOW_H retries on its own — past that the sid
     # has aged out of labPlayReports and an operator must pass it via REAP_SESSIONS.
     if _wizlab(tenant, "user", "reap", "--session", sid, "--commit") != 0:
-        print(f"reap_orphans: retaining lab-{sid}@ because Wiz cleanup failed", file=sys.stderr)
+        # Exit 3 means failed OR deferred (a multi-pass teardown mid-flight); the preceding wizlab
+        # output names which. Either way the handle stays until a pass proves the footprint gone.
+        print(f"reap_orphans: retaining lab-{sid}@ because Wiz cleanup is incomplete", file=sys.stderr)
         return False
     return _wizlab(tenant, "user", "delete", "--session", sid) == 0
 
@@ -110,7 +112,7 @@ def main():
     completed = total - len(failed)
     print(f"# {completed}/{total} session(s) {'reaped' if commit else 'ready to reap (dry-run)'}", file=sys.stderr)
     if failed:
-        _die(f'{len(failed)} session(s) failed cleanup; see preceding wizlab errors, then retry with '
+        _die(f'{len(failed)} session(s) left cleanup incomplete; see preceding wizlab output, then retry with '
              f'REAP_SESSIONS="{",".join(failed)}"')
 
 

@@ -17,6 +17,15 @@ wrappers (one `wizlab` call + an exit-code remap). Change it only within this co
 
 Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1.
 
+### What `user reap` exit 0 promises
+One outcome per resource: `removed`, `absent`, `deferred`, `unknown`, `failed`. Exit 3 is `failed` or
+`deferred` — the signal for the reaper to keep `lab-<sid>@`, its only handle back to leftovers, and
+retry the sid. Exit 0 promises that every guaranteed-type resource (`_SWEEP_TYPES`) named for the
+session, and every audit-attributed create carrying a handler and a name, is removed or absent. It does
+NOT promise the session created nothing else; that residue is counted as `unknown`. Blanket blocking on
+`unknown` is rejected — handler coverage is partial by construction, so it would fail every reap and
+retain every user. Operator decision, 2026-09-05.
+
 ## Nouns
 `session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, for connectorless
 Runtime-Sensor labs `sensor` and `detection`, for Wiz Code labs `serviceaccount` and `code-scan`, and
@@ -26,7 +35,8 @@ authoring-side `lease`:
   assumes); `inspect --require exists|initialized|connected` asserts the `OutpostStatus` enum and
   `--require scanned` counts workload scans performed BY this Outpost (`resourceScanMetricsTrend`,
   `--lookback-days` default 2); `delete` reaps by name as uninstall → poll to UNINSTALLED → delete
-  (`--timeout`, default 600s), exit 0 on a stuck record. Scoping key: the Outpost name == the session
+  (`--timeout`, default 600s), exit 0 on a stuck record — `user reap` owns the same lifecycle as a
+  guaranteed type and reports `deferred` rather than waiting. Scoping key: the Outpost name == the session
   stem (`OutpostFilters` has no account/region field, same as the sensor plane). Three statuses that
   read as success are not: **INITIALIZED proves only that the object is registered**, **CONNECTED does
   not imply it scanned anything** (4 of 7 live ones had scanned nothing), and a direct delete fails.

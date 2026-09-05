@@ -254,32 +254,38 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         with mock.patch.object(wz, "api", side_effect=self._api(find, bytype)):
             self.assertEqual([n["id"] for n in wz.find_connector("111111111111")], ["a"])
 
+    HANDLER: typing.ClassVar = {"list": "reports", "filter": "search", "delete": "deleteReport",
+                                "soft": False, "deleter": None}
+
     def test_reap_one_refuses_ambiguous_match(self):
-        # Shared-tenant safety: >1 name match must skip+alert, never delete — even with --commit.
-        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+        # Shared-tenant safety: >1 name match must skip, never delete — even with --commit.
+        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
              mock.patch.object(wz, "_reap_find", return_value=(None, 2, None)):
-            did, alert, blocked = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
-        self.assertFalse(did)
-        self.assertIn("matched 2", alert)
-        self.assertTrue(blocked)  # the resource is still there
+            outcome, review = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
+        self.assertEqual(outcome, wz.FAILED)  # the resource is still there
+        self.assertIn("matched 2", review)
 
-    def test_reap_one_treats_an_already_gone_resource_as_a_no_op(self):
+    def test_reap_one_treats_an_already_gone_resource_as_absent(self):
         # The reap window overlaps by design, so a second pass over a reaped session finds the audit
-        # Create with no resource behind it. That must not alert, and must not block the user delete.
-        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+        # Create with no resource behind it. That must not need review, and must not keep the user.
+        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
              mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
-            did, alert, blocked = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
-        self.assertEqual((did, alert, blocked), (False, None, False))
+            self.assertEqual(wz._reap_one("tok", "dc", "CreateReport", "lab-s1-r", True), (wz.ABSENT, None))
 
-    def test_reap_one_does_not_block_on_an_unhandled_type(self):
-        # No handler for the type: unactionable, so alert a human but never fail the run — the generic
-        # plural+search handler misses most create types and this would otherwise fire every reap.
-        with mock.patch.object(wz, "_reap_handler", return_value={}), \
+    def test_an_unhandled_type_is_unknown_and_does_not_block(self):
+        # Handler coverage is partial by construction: the generic plural+search handler misses most
+        # create types, so blocking a miss would fail every reap and retain every user.
+        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
              mock.patch.object(wz, "_reap_find", return_value=(None, None, "no such field")):
-            did, alert, blocked = wz._reap_one("tok", "dc", "CreateWidget", "lab-s1-w", True)
-        self.assertFalse(did)
-        self.assertIn("no handler", alert)
-        self.assertFalse(blocked)
+            outcome, review = wz._reap_one("tok", "dc", "CreateWidget", "lab-s1-w", True)
+        self.assertEqual(outcome, wz.UNKNOWN)
+        self.assertIn("no handler", review)
+        self.assertNotIn(wz.UNKNOWN, wz._REAP_BLOCKING)
+
+    def test_an_audit_entry_with_no_name_is_unknown(self):
+        outcome, review = wz._reap_one("tok", "dc", "CreateWidget", None, True)
+        self.assertEqual(outcome, wz.UNKNOWN)
+        self.assertIn("no name in input", review)
 
     def test_reap_enumeration_surfaces_graphql_errors(self):
         with mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
@@ -287,42 +293,98 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertIn("denied", alert)
 
+    def _reap(self, outcome_or_actions, sweep=None):
+        """cmd_reap over one audit outcome, with the sweep stubbed out. Returns the exit code."""
+        one = (outcome_or_actions, "review") if isinstance(outcome_or_actions, str) else None
+        actions = [("CreateWidget", "lab-s1-w")] if one else []
+        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "_reap_enumerate", return_value=(actions, None)), \
+             mock.patch.object(wz, "_reap_one", return_value=one), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=sweep or wz.Counter()), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_reap(["--session", "s1", "--commit"])
+        return cm.exception.code
+
     def test_committed_reap_exits_3_when_enumeration_is_incomplete(self):
         with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
              mock.patch.object(wz, "_reap_enumerate", return_value=([], "denied")), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 0, 0)), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=wz.Counter()), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              self.assertRaises(SystemExit) as cm:
             wz.cmd_reap(["--session", "s1", "--commit"])
         self.assertEqual(cm.exception.code, 3)
 
     def test_committed_reap_exits_3_when_a_sweep_lookup_fails(self):
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "_reap_enumerate", return_value=([], None)), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 1, 1)), \
-             self.assertRaises(SystemExit) as cm:
-            wz.cmd_reap(["--session", "s1", "--commit"])
-        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(self._reap(None, sweep=wz.Counter({wz.FAILED: 1})), 3)
 
-    def test_committed_reap_exits_0_when_alerts_are_unactionable(self):
-        # An alert a human should read is not the same as cleanup that did not happen: exiting 3 here
-        # would make the reaper retain every lab-<sid>@ user it was built to delete.
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "_reap_enumerate", return_value=([("CreateWidget", "lab-s1-w")], None)), \
-             mock.patch.object(wz, "_reap_one", return_value=(False, "ALERT no handler", False)), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=(0, 0, 0)), \
-             self.assertRaises(SystemExit) as cm:
-            wz.cmd_reap(["--session", "s1", "--commit"])
-        self.assertEqual(cm.exception.code, 0)
+    def test_committed_reap_exits_0_when_coverage_is_unknown(self):
+        # Residue we cannot act on is not cleanup that failed: exiting 3 here would make the reaper
+        # retain every lab-<sid>@ user it was built to delete.
+        self.assertEqual(self._reap(wz.UNKNOWN), 0)
+        self.assertEqual(self._reap(wz.ABSENT), 0)
+        self.assertEqual(self._reap(wz.REMOVED), 0)
 
-    def test_reap_one_alerts_when_delete_does_not_remove_resource(self):
+    def test_a_deferred_resource_keeps_the_user_and_the_retry(self):
+        # Exit 3 is the only signal the reaper acts on, and "come back to this" is exactly what a
+        # multi-pass teardown needs — one extra daily cycle, then the record is gone.
+        self.assertEqual(self._reap(wz.DEFERRED), 3)
+        self.assertEqual(self._reap(wz.FAILED), 3)
+
+    def test_reap_one_reports_failed_when_delete_does_not_remove_resource(self):
         found = [("id1", 1, None), ("id1", 1, None)]
-        with mock.patch.object(wz, "_reap_handler", return_value={"delete": "deleteReport", "soft": False}), \
+        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
              mock.patch.object(wz, "_reap_find", side_effect=found), \
              mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
-            did, alert, blocked = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
-        self.assertFalse(did)
-        self.assertIn("deletion did not remove", alert)
-        self.assertTrue(blocked)
+            outcome, review = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
+        self.assertEqual(outcome, wz.FAILED)
+        self.assertIn("denied", review)
+
+    def _outpost_reap(self, status, delete_err=None, status_err=None):
+        """Drives the real _reap_outpost. Returns (outcome, detail, mutations issued)."""
+        sent = []
+
+        def gql(tok, dc, query, variables=None):
+            if query is wz.OUTPOST_Q:
+                if status_err:
+                    return {}, [{"message": status_err}]
+                return {"outpost": ({"id": "o1", "status": status} if status else None)}, []
+            sent.append("delete" if query is wz.DELETE_OUTPOST else "uninstall")
+            return {}, ([{"message": delete_err}] if delete_err else [])
+
+        with mock.patch.object(wz, "_gql", gql):
+            outcome, detail = wz._reap_outpost("tok", "dc", "o1", "lab-s1")
+        return outcome, detail, sent
+
+    def test_a_live_outpost_is_uninstalled_then_deferred_never_deleted(self):
+        # deleteOutpost fails on a live record, so the sweep must not try it; the reaper also must not
+        # sit in a poll loop inside a cron container.
+        outcome, _detail, sent = self._outpost_reap("CONNECTED")
+        self.assertEqual((outcome, sent), (wz.DEFERRED, ["uninstall"]))
+
+    def test_an_uninstalling_outpost_is_deferred_without_a_second_uninstall(self):
+        outcome, _detail, sent = self._outpost_reap("UNINSTALLING")
+        self.assertEqual((outcome, sent), (wz.DEFERRED, []))
+
+    def test_an_uninstalled_outpost_is_deleted(self):
+        for status in wz._OUTPOST_DELETABLE:
+            outcome, _detail, sent = self._outpost_reap(status)
+            self.assertEqual((outcome, sent), (wz.REMOVED, ["delete"]), status)
+
+    def test_an_absent_outpost_is_absent_not_failed(self):
+        self.assertEqual(self._outpost_reap(None)[0], wz.ABSENT)
+
+    def test_an_outpost_delete_that_errors_is_failed(self):
+        self.assertEqual(self._outpost_reap("UNINSTALLED", delete_err="internal error")[0], wz.FAILED)
+
+    def test_an_unreadable_outpost_status_is_failed_not_deferred(self):
+        # A guaranteed type whose state we cannot read has not been proven clean.
+        self.assertEqual(self._outpost_reap("CONNECTED", status_err="denied")[0], wz.FAILED)
+
+    def test_the_sweep_routes_outpost_through_its_own_deleter(self):
+        self.assertIn("Outpost", wz._SWEEP_TYPES)
+        self.assertIs(wz._reap_handler("Outpost")["deleter"], wz._reap_outpost)
+        self.assertIsNone(wz._reap_handler("Report")["deleter"])
 
     def test_kc_user_id_refuses_multiple_exact(self):
         dup = json.dumps([{"id": "1", "username": "lab-s1@titra-labs.ai"},

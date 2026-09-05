@@ -44,21 +44,12 @@ class ReviewObservations(unittest.TestCase):
             fn(*args)
         return result.exception.code
 
-    def test_f3_outpost_timeout_succeeds_without_a_sweep_handler(self):
-        node = {"id": "outpost-1", "status": "UNINSTALLING"}
-        with mock.patch.object(wz, "_resolve_outpost", return_value=node), \
-             mock.patch.object(wz, "_await_uninstalled", return_value="UNINSTALLING"), \
-             mock.patch.object(wz, "api") as api:
-            self.assertEqual(self.exit_code(wz.cmd_outpost_delete, ["--name", "lab-s1", "--timeout", "1"]), 0)
-        api.assert_not_called()
-        self.assertNotIn("Outpost", wz._SWEEP_TYPES)
-        self.assertNotIn("Outpost", wz._REAP_OVERRIDES)
-
     def test_f4_resource_sweep_stops_at_one_full_page(self):
         nodes = [{"id": str(i), "name": f"lab-s1-{i}"} for i in range(100)]
         data = {"reports": {"nodes": nodes}}
         with mock.patch.object(wz, "_gql", return_value=(data, [])) as gql:
-            self.assertEqual(wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", False), (100, 0, 0))
+            tally = wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", False)
+        self.assertEqual(tally, wz.Counter({wz.REMOVED: 100}))
         self.assertEqual(gql.call_count, 1)
         self.assertNotIn("pageInfo", gql.call_args.args[2])
 
