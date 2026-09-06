@@ -2121,8 +2121,21 @@ def _drop_secret(name):
 
 
 def _lease_keys():
-    return [k for k in (_ts("GET", f"/tailnet/{_TS_TAILNET}/keys").get("keys") or [])
-            if (k.get("description") or "").startswith(_LEASE_KEY_PREFIX)]
+    """`/keys` lists the tailnet's API ACCESS TOKENS alongside device auth keys, distinguishable only by
+    `capabilities.devices.create` — absent on a token. Revoking the one `TAILSCALE_API_KEY` holds locks
+    every lease verb out of the API and cannot be undone from here, so a key is swept only when it both
+    carries the lease description AND proves it can create devices. The capability check is skipped when
+    the list payload omits `capabilities` entirely (it is not always summarized), because the
+    description prefix already excludes an operator token."""
+    out = []
+    for k in _ts("GET", f"/tailnet/{_TS_TAILNET}/keys").get("keys") or []:
+        if not (k.get("description") or "").startswith(_LEASE_KEY_PREFIX):
+            continue
+        caps = k.get("capabilities")
+        if caps is not None and not (caps.get("devices") or {}).get("create"):
+            continue
+        out.append(k)
+    return out
 
 
 def _lease_desc(args):

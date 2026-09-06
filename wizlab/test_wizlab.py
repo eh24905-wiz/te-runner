@@ -1563,6 +1563,23 @@ class LeaseDevAccess(unittest.TestCase):
             # Fresh per play: a second ensure must not reuse the key the last play's grader trusted.
             self.assertNotEqual(wz._mint_keypair(["--lab", "te-dev-aws"])[1], first)
 
+    def test_an_api_access_token_is_never_a_sweepable_lease_key(self):
+        # `/keys` returns API access tokens next to device auth keys; only `capabilities.devices.create`
+        # separates them. Revoking the one TAILSCALE_API_KEY holds locks every lease verb out of the API
+        # and cannot be undone from the CLI, so the sweep must not be able to select one.
+        token = {"id": "kTOKEN", "description": "dev-te-dev-aws-tok", "capabilities": {}}
+        authkey = {"id": "kAUTH", "description": "dev-te-dev-aws-aaaa",
+                   "capabilities": {"devices": {"create": {"reusable": True}}}}
+        with mock.patch.object(wz, "_ts", lambda m, p, b=None: {"keys": [token, authkey]}):
+            self.assertEqual([k["id"] for k in wz._lease_keys()], ["kAUTH"])
+
+    def test_a_list_payload_without_capabilities_still_sweeps(self):
+        # Capabilities are not always summarized in the list response; dropping such keys would silently
+        # strand every prior lease key as an unrevokable orphan.
+        with mock.patch.object(wz, "_ts",
+                               lambda m, p, b=None: {"keys": [{"id": "kA", "description": "dev-te-dev-aws-a"}]}):
+            self.assertEqual([k["id"] for k in wz._lease_keys()], ["kA"])
+
     def test_scrub_masks_any_key_shaped_string(self):
         self.assertNotIn("abc123", wz._scrub("up --authkey=tskey-auth-abc123 failed"))
 
