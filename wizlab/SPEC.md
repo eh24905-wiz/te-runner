@@ -68,7 +68,9 @@ authoring-side `lease`:
   `createServiceAccount(type:SENSOR)`, unchanged.
 - `lease verify|ensure|inspect|delete --lab N` — the operator's dev-access path to a grader over the
   tailnet. Authoring-side: reads `TAILSCALE_API_KEY` + `INSTRUQT_API` from the operator, never from a
-  lab, so in a grader it is inert. `verify` asserts both tokens, Instruqt reachability, and this
+  lab, so in a grader it is inert. `verify` SPENDS both tokens — a
+  present-but-revoked one passes every local check and fails at mint, and this is the only place that
+  costs nothing — plus this
   host's own tailnet membership (`tailscale status` → `BackendState`, the only local answer) — the
   precheck that stops an unreachable grader from grading as a broken lab. `ensure` provisions **both**
   halves of dev access, fresh per play: one ephemeral, reusable, preauthorized tailnet key

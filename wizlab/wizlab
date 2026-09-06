@@ -2225,6 +2225,9 @@ def cmd_lease_verify(args):
     for var in ("TAILSCALE_API_KEY", "INSTRUQT_API"):
         if not os.getenv(var):
             die(3, f"{var} not in environment; the dev path needs it (it lives on the operator, not a grader)")
+    # Both tokens are spent, not just read: a present-but-revoked one passes every local check and then
+    # fails at mint, which is a burnt play. This is the only place that failure is cheap.
+    _ts("GET", f"/tailnet/{_TS_TAILNET}/keys")
     _iq("query($t: String!) { teamSecrets(teamSlug: $t) { name } }", {"t": IQ_TEAM})
     if "--no-self" not in args:
         _self_on_tailnet()

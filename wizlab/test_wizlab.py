@@ -1563,6 +1563,29 @@ class LeaseDevAccess(unittest.TestCase):
             # Fresh per play: a second ensure must not reuse the key the last play's grader trusted.
             self.assertNotEqual(wz._mint_keypair(["--lab", "te-dev-aws"])[1], first)
 
+    def test_verify_spends_the_tailscale_token_not_just_reads_the_env(self):
+        # A revoked-but-present token passes every local check and then fails at mint, burning a play.
+        calls = []
+        with mock.patch.dict(wz.os.environ, {"TAILSCALE_API_KEY": "x", "INSTRUQT_API": "y"}), \
+             mock.patch.object(wz, "_ts", lambda m, p, b=None: calls.append(("ts", p)) or {"keys": []}), \
+             mock.patch.object(wz, "_iq", lambda q, v, **k: calls.append(("iq", None)) or {}), \
+             mock.patch.object(wz, "_self_on_tailnet", lambda: None), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            wz.cmd_lease_verify([])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("ts", [c[0] for c in calls])   # the Tailscale API was actually reached
+        self.assertIn("iq", [c[0] for c in calls])
+
+    def test_verify_is_3_when_the_tailscale_token_is_revoked(self):
+        def dead_ts(m, p, b=None):
+            wz.die(3, "tailscale: 401")
+        with mock.patch.dict(wz.os.environ, {"TAILSCALE_API_KEY": "revoked", "INSTRUQT_API": "y"}), \
+             mock.patch.object(wz, "_ts", dead_ts), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_lease_verify([])
+        self.assertEqual(cm.exception.code, 3)
+
     def test_an_api_access_token_is_never_a_sweepable_lease_key(self):
         # `/keys` returns API access tokens next to device auth keys; only `capabilities.devices.create`
         # separates them. Revoking the one TAILSCALE_API_KEY holds locks every lease verb out of the API
