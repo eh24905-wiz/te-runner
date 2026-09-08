@@ -6,6 +6,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import pathlib
 import shutil
 import tempfile
@@ -17,6 +18,14 @@ from importlib.machinery import SourceFileLoader
 from unittest import mock
 
 wz = SourceFileLoader("wizlab_cli", str(pathlib.Path(__file__).resolve().parent / "wizlab")).load_module()
+
+# `_keypair_dir` falls back to ~/.cache/wizlab/lease/<lab>, and the lease tests name a REAL lab
+# (te-dev-aws), so a suite run on an operator's box deleted the private key of a live play and still
+# exited OK — the play stays up, unreachable, and no new pubkey can reach a container that read the
+# secret at sandbox build. Redirect for the whole process, not per test: three tests escaped a
+# per-test tempdir unnoticed, and the next one added would too.
+_LEASE_SANDBOX = tempfile.TemporaryDirectory()
+os.environ["WIZLAB_LEASE_DIR"] = _LEASE_SANDBOX.name
 
 
 def _proc(returncode=0, stdout="", stderr=""):

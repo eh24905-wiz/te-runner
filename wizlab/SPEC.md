@@ -38,8 +38,10 @@ state, so a validator reads FAIL and not INCONCLUSIVE. Exit **3** when the ident
 cannot be graded against a floor it cannot name. The floor is checked before any token is spent.
 Versions compare as int tuples, because string order puts `v0.1.9` above `v0.1.36`.
 
-The identity is read from the process env, falling back to PID 1 — sshd scrubs its sessions'
-environment, so a validator driving over the tailnet would otherwise fail every floor as 3.
+The identity is read from the process env, falling back to PID 1. The fallback is convenience, not
+a fix: sshd scrubs its sessions' environment of `WIZ_*` too, so a shell that cannot name the
+runner cannot authenticate either — importing PID 1's env is required over ssh regardless
+(`README.md` §Three env contexts).
 
 Binds only at v0.1.37+: earlier images carry no identity and silently ignore the flag (unparsed flags
 are not rejected), so the repin is what activates the gate. Operator decision, 2026-09-07: this is env

@@ -20,6 +20,23 @@ it is (`wizlab session verify` prints it), and a lab can assert its verb floor
 with `session verify --min-runner vX.Y.Z` (`wizlab/SPEC.md`). Both are empty on
 images before v0.1.37, which is why that floor gate binds only at v0.1.37+.
 
+## Three env contexts on a grader
+`entrypoint.sh` creates them, and they carry different environments — a `wizlab`
+call that works in one exits 3 in another:
+
+| Context | Carries `WIZ_*`, lease creds, `TE_RUNNER_*` | Reach it by |
+|---|---|---|
+| platform check/solve/exec executor | yes — a container exec gets image `ENV` + the `environment` block | the platform only |
+| `tmux attach -t dev` | yes — started by the entrypoint, inherits its env | dev tracks |
+| plain `ssh root@<grader>` | **no** — sshd builds a clean env per session | dev tracks |
+
+So over ssh, import PID 1's env before any `wizlab` call, or every one of them
+fails on auth:
+
+```sh
+while IFS= read -r -d '' kv; do export "$kv"; done < /proc/1/environ
+```
+
 `wizlab` exit codes: 0 satisfied · 1 not satisfied · 2 invocation · 3
 environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
 session in a terminal `validating_error`); consume them raw in CI.
