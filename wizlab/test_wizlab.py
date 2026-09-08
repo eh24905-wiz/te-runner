@@ -1023,9 +1023,6 @@ class WorkflowGrading(unittest.TestCase):
             self._exit(wz.cmd_workflowrun_inspect, ["--name", "lab-x", "--require", "branch"],
                        self._api(self.LIVE)), 2)
 
-    def test_delete_absent_is_exit_0(self):
-        self.assertEqual(self._exit(wz.cmd_workflow_delete, ["--name", "lab-x"], self._api([])), 0)
-
     def test_ensure_needs_a_readable_definition(self):
         self.assertEqual(self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x"], self._api(self.LIVE)), 2)
         self.assertEqual(
@@ -1035,6 +1032,58 @@ class WorkflowGrading(unittest.TestCase):
     def test_run_ensure_rejects_unknown_initial_step(self):
         argv = ["--name", "lab-x", "--initial-step", "Nope", "--data", "/nope.json"]
         self.assertEqual(self._exit(wz.cmd_workflowrun_ensure, argv, self._api(self.LIVE)), 2)
+
+    def _api_validate(self, issues, wf_nodes=None):
+        nodes = self.LIVE if wf_nodes is None else wf_nodes
+
+        def side(query, variables):
+            if "validateAutomationWorkflow" in query:
+                return {"validateAutomationWorkflow": {"issues": issues}}, "tid"
+            if "automationWorkflows(" in query:
+                return {"automationWorkflows": {"nodes": nodes}}, "tid"
+            if "createAutomationWorkflow" in query:
+                return {"createAutomationWorkflow": {"workflow": {"id": "w1", "name": "lab-x-night-watch",
+                                                                  "enabled": True}}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _definition_file(self):
+        d = tempfile.mkdtemp()
+        path = pathlib.Path(d) / "wf.json"
+        path.write_text(json.dumps({"steps": [], "triggers": []}))
+        self.addCleanup(shutil.rmtree, d)
+        return str(path)
+
+    def test_ensure_refuses_to_submit_an_invalid_definition(self):
+        # An invalid definition is the caller's bug, not the environment's: exit 2, and the create is
+        # never sent — the API's own refusal names neither the step nor the field.
+        argv = ["--name", "lab-x", "--definition", self._definition_file()]
+        issues = [{"target": {"stepId": "route"}, "message": "field 'name' does not exist in expression"}]
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate(issues)), 2)
+
+    def test_dry_run_reports_issues_without_mutating(self):
+        argv = ["--name", "lab-x", "--definition", self._definition_file(), "--dry-run"]
+        issues = [{"target": {"triggerId": "eventThreats"}, "message": "outbound edge references non-existent step"}]
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate(issues)), 1)
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate([])), 0)
+
+    def test_issue_line_survives_a_workflow_level_target(self):
+        # The workflow member of the target union carries only `_stub`, so nothing names a step.
+        self.assertEqual(wz._issue_line({"target": {"_stub": None}, "message": "m"}), "workflow: m")
+        self.assertEqual(wz._issue_line({"message": "m"}), "workflow: m")
+
+    def test_ensure_never_publishes(self):
+        # publishAutomationWorkflowVersion answers "Workflow versions are currently not supported", and
+        # a create carrying enabled:true is already live — so a publish hop can only fail.
+        seen = []
+
+        def side(query, variables):
+            seen.append(query)
+            return self._api_validate([], wf_nodes=[])(query, variables)
+        argv = ["--name", "lab-x", "--definition", self._definition_file()]
+        with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit):
+            wz.cmd_workflow_ensure(argv)
+        self.assertFalse([q for q in seen if "publishAutomationWorkflowVersion" in q])
 
 
 class OutpostGrading(unittest.TestCase):

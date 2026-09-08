@@ -201,6 +201,22 @@ planes:
       wizlab detection inspect --rule-name "Process memory dump via common utilities"    # GENERATED_THREAT
       wizlab detection inspect --rule-name "Process memory data file was accessed" --match-only
 
+  workflow:
+    # Automation Workflow lab (te-wiz-workflows-201). Graded planes are `automationWorkflows` (by name
+    # prefix) and `automationWorkflowRuns` (by workflowId, then the SWITCH_CASE step's outboundEdge).
+    # n=1, one live play. `published` is `enabled`: activeVersion/draftVersion/versions read null/0 on
+    # every workflow in the tenant, so no version field can carry a grade.
+    test_run:
+      fire_to_completed_s: [0.046, 0.082] # runAutomationWorkflowTest EVENT -> status COMPLETED
+      solver_budget_s: 60                 # `workflow-run ensure --timeout` default; ~700x the observed max
+      # Server-side startedAt->completedAt on a synthetic customData payload. Three orders of magnitude
+      # under a cloud plane: there is no discovery latency here, only workflow execution. A task timeout
+      # in minutes is measuring nothing.
+    definition:
+      create_s: 2.0   # createAutomationWorkflow
+      validate_s: 2.0 # validateAutomationWorkflow -- the CEL/edge pre-flight, no mutation
+      # publishAutomationWorkflowVersion is unimplemented ("Workflow versions are currently not
+      # supported") and unnecessary: a create carrying enabled:true is already live.
 # ---------------------------------------------------------------------------------------------------
 # Per entity kind. `external_id` is the column that decides whether an equality test can work at all:
 # it is NOT uniform, and a check that assumes one shape misses silently rather than erroring.

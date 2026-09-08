@@ -93,31 +93,43 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   gone leaves the SA `unknown`, not `failed`: blocking would retain the session's user with no later
   pass able to clear it. The `sensor` path stays on `createServiceAccount(type:SENSOR)`, deletable
   directly.
-- `workflow inspect|ensure|delete` and `workflow-run inspect|ensure` — an Automation Workflow, for labs
-  whose artifact is the workflow itself. `inspect --require exists|published`: **`published` is
-  `enabled`, and that is the only signal there is** — `activeVersion`, `draftVersion` and `versions`
-  read null/0 on every workflow of a live tenant, so a version-based assertion fails every learner
-  while looking correct. It matters because Create leaves a workflow saved-but-inactive, so `exists`
-  alone passes someone who never published. Name resolution is **prefix** on the session stem (`search`
-  is a case-insensitive substring match), because a guide tells a learner to type
-  `lab-<sid>-<scenario>` and the suffix is not the lesson; `--exact-name` pins it, and an `enabled` hit
-  outranks a disabled leftover on the same stem. `ensure --definition <file.json>` converges to that
-  definition then publishes — absent → `createAutomationWorkflow`, present →
-  `updateAutomationWorkflowDraft` with `patchStrict{steps,triggers}`, since a published version is
-  immutable and only a draft is editable. `name` and `--project-id` are injected over the file so every
-  lab lands on the reap stem. **The definition JSON lives in the lab**: which steps and which switch
-  cases a scenario wants is a config-shape assertion, barred from `--require` below, so it is data
-  passed in, not a flag per shape. `workflow-run inspect --require completed|branch --branch N` grades a
-  run's own signal — `AutomationWorkflowRunStepResult.outboundEdge` on a `SWITCH_CASE` is the matched
-  case's `branchName`, so this asserts the routing *decision*, not the definition. Two hops
-  (name → id → runs) because `AutomationWorkflowRunFilters` carries only `workflowId`, no name or search
-  key; `TEST` runs only unless `--run-type` widens it, since an `AUTOMATIC` run from a real event would
-  grade a learner on someone else's Threat. `workflow-run ensure --data <file.json> --initial-step
-  <step name>` fires a test run with a synthetic trigger payload and waits for `COMPLETED`;
-  `customData.initialSteps` is non-optional and step ids are minted per create, so the step is named and
-  resolved here. Reap needs no verb — `AutomationWorkflow` is already a `_SWEEP_TYPES` member and the
-  generic prefix sweep reaches it. Never `TRIGGER_BLUE_AGENT` in a lab flow: manual Blue Agent runs are
-  5/day/tenant and a cohort exhausts them on learner two.
+- `workflow inspect|ensure` and `workflow-run inspect|ensure` — an Automation Workflow, for labs whose
+  artifact is the workflow itself. `inspect --require exists|published`: **`published` is `enabled`, and
+  that is the only signal there is** — `activeVersion`, `draftVersion` and `versions` read null/0 on
+  every workflow of a live tenant, so a version-based assertion fails every learner while looking
+  correct. It matters because Create leaves a workflow saved-but-inactive, so `exists` alone passes
+  someone who never published. Name resolution is **prefix** on the session stem (`search` is a
+  case-insensitive substring match), because a guide tells a learner to type `lab-<sid>-<scenario>` and
+  the suffix is not the lesson; `--exact-name` pins it, and an `enabled` hit outranks a disabled
+  leftover on the same stem.
+
+  `ensure --definition <file.json>` **validates, then creates or patches, and never publishes.**
+  `publishAutomationWorkflowVersion` answers `Workflow versions are currently not supported`, and it is
+  unnecessary regardless: a create carrying `enabled: true` is already live. The validate hop is not
+  politeness — a definition with `enabled: true` and any issue is refused as `an enabled workflow cannot
+  have validation errors`, naming neither the step nor the expression, while
+  `validateAutomationWorkflow(input:{workflow:…}){issues{message target}}` names both, costs no mutation
+  and runs on any tenant. So `--dry-run` validates and stops, which is **the only gate that exists for
+  CEL**: nothing local parses it, so every expression a lab ships — in its definition and in the text it
+  hands a learner — is checked here before a play. Issues exit 2 (the caller's bug, not the
+  environment's) and nothing is submitted. `name` and `--project-id` are injected over the file so every
+  lab lands on the reap stem. **The definition JSON lives in the lab**, since which steps and cases a
+  scenario wants is a config-shape assertion barred from `--require` below.
+
+  `workflow-run inspect --require completed|branch --branch N` grades a run's own signal —
+  `AutomationWorkflowRunStepResult.outboundEdge` on a `SWITCH_CASE` is the matched case's `branchName`,
+  so this asserts the routing *decision*, not the definition. Two hops (name → id → runs) because
+  `AutomationWorkflowRunFilters` carries no name or search key; `TEST` runs only unless `--run-type`
+  widens it, since an `AUTOMATIC` run from a real event would grade a learner on someone else's Threat.
+  `workflow-run ensure --data <file.json> --initial-step <step name>` fires a test run with a synthetic
+  trigger payload and waits on **that run's id**, never "a completed run of this workflow" — the
+  workflow's earlier runs already satisfy the latter, so a second call reports success while its own run
+  is still in flight. `customData.initialSteps` is non-optional and step ids are minted per create, so
+  the step is named and resolved at call time.
+
+  No `delete` verb: `AutomationWorkflow` is already a `_SWEEP_TYPES` member, so the generic prefix sweep
+  reaches it and a second path would be two places holding one fact. Never `TRIGGER_BLUE_AGENT` in a lab
+  flow: manual Blue Agent runs are 5/day/tenant and a cohort exhausts them on learner two.
 - `lease verify|ensure|inspect|delete --lab N` — the operator's dev-access path to a grader over the
   tailnet. Authoring-side: reads `TAILSCALE_API_KEY` + `INSTRUQT_API` from the operator, never from a
   lab, so in a grader it is inert. `verify` SPENDS both tokens — a
