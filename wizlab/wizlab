@@ -1352,18 +1352,15 @@ def _run_filter(args, wf_ids):
 
 
 def cmd_workflowrun_inspect(args):
-    """Assert the session has a COMPLETED run (--require completed) or that one of those runs left a
-    SWITCH_CASE by a named edge (--require branch --branch <branchName>). outboundEdge on a SWITCH_CASE
-    is the matched case's branchName, so this grades the routing decision itself rather than the
-    definition's shape. Two hops because AutomationWorkflowRunFilters has no name or search key — and the
-    first hop takes EVERY workflow on the stem, because a learner who attempts twice leaves two and
-    grading whichever the API returned first grades an arbitrary attempt."""
-    require = _flag(args, "--require") or "completed"
-    if require not in ("completed", "branch"):
-        die(2, f"--require must be completed|branch, got {require}")
-    branch = _flag(args, "--branch") if require == "branch" else None
-    if require == "branch" and not branch:
-        die(2, "--require branch needs --branch <branchName>")
+    """Assert the session has a COMPLETED run (--require completed), that one of those runs left a step
+    by a named edge (--require branch --branch <branchName>), or that one of them carried a failed step
+    whose error edge was followed (--require error-path). outboundEdge is the run's own signal: a
+    SWITCH_CASE case name, a CONDITION's true/false, an unbranched step's main — so this grades the
+    routing decision itself rather than the definition's shape. Two hops because
+    AutomationWorkflowRunFilters has no name or search key — and the first hop takes EVERY workflow on the
+    stem, because a learner who attempts twice leaves two and grading whichever the API returned first
+    grades an arbitrary attempt."""
+    require, branch = _run_require(args)
     stem = _workflow_stem(args)
     nodes = _resolve_workflows(stem, exact="--exact-name" in args)
     if not nodes:
@@ -1374,16 +1371,35 @@ def cmd_workflowrun_inspect(args):
     if not runs:
         print(f"no completed run across {len(nodes)} workflow(s) named {stem}*")
         sys.exit(1)
-    switch_edges = [s.get("outboundEdge") for r in runs for s in (r.get("steps") or [])
-                    if (s.get("step") or {}).get("type") == "SWITCH_CASE"]
+    steps = [s for r in runs for s in (r.get("steps") or [])]
     print(f"{stem}*: {len(nodes)} workflow(s), {len(runs)} completed run(s), "
-          f"switch edges taken: {switch_edges or 'none'}")
+          f"edges taken: {[s.get('outboundEdge') for s in steps] or 'none'}")
+    sys.exit(0 if _run_satisfies(require, branch, steps) else 1)
+
+
+def _run_require(args):
+    require = _flag(args, "--require") or "completed"
+    if require not in ("completed", "branch", "error-path"):
+        die(2, f"--require must be completed|branch|error-path, got {require}")
+    branch = _flag(args, "--branch") if require == "branch" else None
+    if require == "branch" and not branch:
+        die(2, "--require branch needs --branch <branchName>")
+    return require, branch
+
+
+def _run_satisfies(require, branch, steps):
     if require == "completed":
-        sys.exit(0)
-    sys.exit(0 if branch in switch_edges else 1)
+        return True
+    if require == "branch":
+        return any(s.get("outboundEdge") == branch for s in steps)
+    # Every failed step reads outboundEdge "error", edge or no edge; what proves the edge was FOLLOWED is
+    # that the step failed inside a run that still COMPLETED (the run filter admits COMPLETED only).
+    return any(s.get("status") == "FAILED" and s.get("outboundEdge") == "error" for s in steps)
 
 
-_RUN_DEAD = ("FAILED", "CANCELLED", "SKIPPED")
+# AutomationWorkflowRunStatus spells CANCELED; a misspelling here is not a wrong exit code but a
+# cancelled run that burns the whole --timeout before it dies.
+_RUN_DEAD = ("FAILED", "CANCELED", "SKIPPED")
 
 
 def _wait_for_run(run_id, timeout, interval):

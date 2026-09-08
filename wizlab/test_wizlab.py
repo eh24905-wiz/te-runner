@@ -1004,11 +1004,42 @@ class WorkflowGrading(unittest.TestCase):
         self.assertEqual(
             self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("default")])), 1)
 
-    def test_run_branch_ignores_non_switch_steps(self):
-        # Unbranched steps carry "main"; only a SWITCH_CASE edge is a routing decision.
-        argv = ["--name", "lab-x", "--require", "branch", "--branch", "main"]
+    def test_run_branch_grades_every_step_type(self):
+        # A CONDITION leaves by true/false and an unbranched step by main; a verb that read only
+        # SWITCH_CASE edges printed "none" on a run that demonstrably took the false edge.
+        argv = ["--name", "lab-x", "--require", "branch", "--branch", "false"]
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("false", "CONDITION")])), 0)
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("true", "CONDITION")])), 1)
+
+    def _failed_step_run(self, edge="error", status="FAILED"):
+        return {"id": "r2", "status": "COMPLETED",
+                "steps": [{"status": status, "outboundEdge": edge, "step": {"name": "Look up team", "type": "ECHO"}},
+                          {"status": "COMPLETED", "outboundEdge": "main", "step": {"name": "Alert", "type": "ECHO"}}]}
+
+    def test_run_error_path_needs_a_failed_step_inside_a_completed_run(self):
+        # Every failed step reads outboundEdge "error", edge or no edge; the run filter admits COMPLETED
+        # runs only, so FAILED-step-in-COMPLETED-run is what proves the edge was followed.
+        argv = ["--name", "lab-x", "--require", "error-path"]
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._failed_step_run()])), 0)
         self.assertEqual(
             self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("main", "ECHO")])), 1)
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv,
+                       self._api(self.LIVE, [self._failed_step_run(status="COMPLETED")])), 1)
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [])), 1)
+
+    def test_run_wait_dies_on_the_enum_spelling_of_canceled(self):
+        # CANCELLED would never match, so a cancelled run would poll to the deadline instead of exiting 3
+        # on the first read.
+        side = self._api(self.LIVE, [{"id": "r1", "status": "CANCELED", "steps": []}])
+        with mock.patch.object(wz, "api", side_effect=side), mock.patch.object(wz.time, "sleep") as slept, \
+                self.assertRaises(SystemExit) as cm:
+            wz._wait_for_run("r1", timeout=60, interval=2)
+        self.assertEqual(cm.exception.code, 3)
+        slept.assert_not_called()
 
     def test_run_completed_and_none(self):
         argv = ["--name", "lab-x", "--require", "completed"]

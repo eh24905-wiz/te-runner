@@ -121,9 +121,13 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   lab lands on the reap stem. **The definition JSON lives in the lab**, since which steps and cases a
   scenario wants is a config-shape assertion barred from `--require` below.
 
-  `workflow-run inspect --require completed|branch --branch N` grades a run's own signal —
-  `AutomationWorkflowRunStepResult.outboundEdge` on a `SWITCH_CASE` is the matched case's `branchName`,
-  so this asserts the routing *decision*, not the definition. Two hops (name → id → runs) because
+  `workflow-run inspect --require completed|branch --branch N|error-path` grades a run's own signal —
+  `AutomationWorkflowRunStepResult.outboundEdge`: a `SWITCH_CASE` case's `branchName` or its
+  `defaultBranchName`, a `CONDITION`'s `true`/`false`, an unbranched step's `main` — so this asserts the
+  routing *decision*, not the definition. `error-path` is the `outpost-bound` carve-out: every failed step
+  reads `outboundEdge` `error` whether or not it defines an edge, so the edge name proves nothing; what
+  proves the edge was followed is a step at `status FAILED` inside a run that still `COMPLETED`, and no
+  lifecycle state separates that from a run the failure killed. Two hops (name → id → runs) because
   `AutomationWorkflowRunFilters` carries no name or search key, and the first hop takes **every** workflow
   on the stem: a learner who attempts twice leaves two, so grading whichever the API returned first grades
   an arbitrary attempt. `TEST` runs only unless `--run-type` widens it, since an `AUTOMATIC` run from a

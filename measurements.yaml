@@ -202,10 +202,29 @@ planes:
       wizlab detection inspect --rule-name "Process memory data file was accessed" --match-only
 
   workflow:
-    # Automation Workflow lab (te-wiz-workflows-201). Graded planes are `automationWorkflows` (by name
-    # prefix) and `automationWorkflowRuns` (by workflowId, then the SWITCH_CASE step's outboundEdge).
-    # n=1, one live play. `published` is `enabled`: activeVersion/draftVersion/versions read null/0 on
-    # every workflow in the tenant, so no version field can carry a grade.
+    # Automation Workflow labs. Graded planes are `automationWorkflows` (by name prefix) and
+    # `automationWorkflowRuns` (by workflowId, then a step result's outboundEdge). Timings n=1, one live
+    # play. `published` is `enabled`: activeVersion/draftVersion/versions read null/0 on every workflow
+    # in the tenant, so no version field can carry a grade.
+    validation:
+      # validateAutomationWorkflow checks field NAMES against the trigger payload schema and nothing
+      # about null or key safety, so a clean publish does not predict a clean run.
+      rejects_unknown_field: true          # "field 'x' does not exist in expression" -> ensure --dry-run exit 1
+      rejects_unguarded_traversal: false   # tags.owner on a map, a.b.c on a nullable parent: both exit 0
+      rejects_null_coalesce: true          # `??` -> "syntax error: unexpected token '?'"; use .get(k, d) / .orValue()
+      verify: |
+        wizlab workflow ensure --name probe --definition <def.json> --dry-run   # exit 0 clean / 1 issues
+    run_failure:
+      cel_class: map key access            # {{trigger.riskIssue.resource.tags.<key>}} with the key absent
+      error_type: EXECUTION_ERROR
+      error_message: "program evaluation: no such key: <key>"
+      null_chain_observed_failing: false   # 53 workflows with unguarded >=3-hop chains, 600 FAILED runs, none attributable
+      error_edge_branch_name: error        # fixed string on every errorEdge; never author-named
+      failed_step_outbound_edge: error     # read on EVERY failed step, edge defined or not
+      error_path_followed: "run COMPLETED and a step at status FAILED"   # 0/400 without an edge, 358/400 with one
+      throw_error: "run FAILED; step result status FAILED, error.message == throwError.message"
+      verify: |
+        automationWorkflowRuns(filterBy:{status:{equals:[FAILED]}}) { nodes { steps { status outboundEdge error { type message } step { type } } } }
     test_run:
       fire_to_completed_s: [0.046, 0.082] # runAutomationWorkflowTest EVENT -> status COMPLETED
       solver_budget_s: 60                 # `workflow-run ensure --timeout` default; ~700x the observed max
