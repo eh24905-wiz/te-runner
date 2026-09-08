@@ -203,9 +203,22 @@ def die(code, msg):
 
 def _runner_id():
     """This image's own identity — `(tag, rev)`, baked at build from the git tag and sha it was built
-    from. Read from the env per call, not once at import, so a test can set it. Empty on any image
-    built before v0.1.37 and on a run from a git checkout: absence is the answer, never a default."""
-    return os.getenv("TE_RUNNER_TAG", ""), os.getenv("TE_RUNNER_REV", "")
+    from. Read per call, not once at import, so a test can set it. Empty on an image built before
+    v0.1.37 and on a run from a git checkout: absence is the answer, never a default.
+
+    Falls back to PID 1, which is the only context in the container that always carries the image's
+    own ENV: sshd hands its sessions a scrubbed environment (measured — a validator driving over the
+    tailnet sees no TE_RUNNER_*), so without this a floor assertion would exit 3 anywhere but the
+    platform's own executor."""
+    tag, rev = os.getenv("TE_RUNNER_TAG", ""), os.getenv("TE_RUNNER_REV", "")
+    if tag:
+        return tag, rev
+    try:
+        env = pathlib.Path("/proc/1/environ").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return "", ""
+    kv = dict(p.split("=", 1) for p in env.split("\0") if "=" in p)
+    return kv.get("TE_RUNNER_TAG", ""), kv.get("TE_RUNNER_REV", "")
 
 
 def _version(s):

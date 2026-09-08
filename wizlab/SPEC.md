@@ -38,6 +38,9 @@ state, so a validator reads FAIL and not INCONCLUSIVE. Exit **3** when the ident
 cannot be graded against a floor it cannot name. The floor is checked before any token is spent.
 Versions compare as int tuples, because string order puts `v0.1.9` above `v0.1.36`.
 
+The identity is read from the process env, falling back to PID 1 — sshd scrubs its sessions'
+environment, so a validator driving over the tailnet would otherwise fail every floor as 3.
+
 Binds only at v0.1.37+: earlier images carry no identity and silently ignore the flag (unparsed flags
 are not rejected), so the repin is what activates the gate. Operator decision, 2026-09-07: this is env
 health under `verify`, not a new noun — a floor is not an API fact and would fail the API-level bar

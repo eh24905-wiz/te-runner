@@ -1660,6 +1660,26 @@ class RunnerFloor(unittest.TestCase):
         # Check 1's line is the only record of what a play actually ran.
         self.assertIn("runner=v0.1.37@deadbee", out)
 
+    def test_identity_falls_back_to_pid_1_when_the_shell_env_was_scrubbed(self):
+        # sshd's sessions carry none of the image's ENV, so a validator over the tailnet would fail
+        # every floor as exit 3 without this.
+        environ = b"PATH=/usr/bin\x00TE_RUNNER_TAG=v0.1.38\x00TE_RUNNER_REV=abc1234\x00"
+        with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "", "TE_RUNNER_REV": ""}, clear=False), \
+             mock.patch.object(wz.pathlib.Path, "read_bytes", lambda self: environ):
+            self.assertEqual(wz._runner_id(), ("v0.1.38", "abc1234"))
+
+    def test_the_shell_env_wins_over_pid_1(self):
+        with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "v0.1.40", "TE_RUNNER_REV": "dd"}), \
+             mock.patch.object(wz.pathlib.Path, "read_bytes",
+                               lambda self: b"TE_RUNNER_TAG=v0.1.1\x00"):
+            self.assertEqual(wz._runner_id(), ("v0.1.40", "dd"))
+
+    def test_no_pid_1_to_read_is_an_absent_identity_not_a_crash(self):
+        with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "", "TE_RUNNER_REV": ""}, clear=False), \
+             mock.patch.object(wz.pathlib.Path, "read_bytes",
+                               lambda self: (_ for _ in ()).throw(OSError("no /proc"))):
+            self.assertEqual(wz._runner_id(), ("", ""))
+
     def test_an_unidentified_runner_still_verifies_without_the_flag(self):
         code, out, _err = self._verify([], {"TE_RUNNER_TAG": "", "TE_RUNNER_REV": ""})
         self.assertEqual(code, 0)
