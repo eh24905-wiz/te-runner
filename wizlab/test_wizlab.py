@@ -941,6 +941,102 @@ class SensorDetectionGrading(unittest.TestCase):
             self._exit(wz.cmd_detection_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 2)
 
 
+class WorkflowGrading(unittest.TestCase):
+    """Locks two things a live tenant proved and a reader would otherwise get wrong: `enabled` is the
+    only publish signal (activeVersion/draftVersion/versions read null/0 on every workflow), and the
+    graded branch comes from a run's outboundEdge on a SWITCH_CASE step, not from the definition."""
+
+    LIVE: typing.ClassVar = [{"id": "w1", "name": "lab-x-night-watch", "enabled": True,
+                              "project": {"name": "p"},
+                              "steps": [{"id": "s1", "name": "Route", "type": "SWITCH_CASE"}]}]
+
+    def _api(self, wf_nodes, run_nodes=()):
+        def side(query, variables):
+            if "automationWorkflowRuns(" in query:
+                return {"automationWorkflowRuns": {"nodes": list(run_nodes)}}, "tid"
+            if "automationWorkflows(" in query:
+                return {"automationWorkflows": {"nodes": wf_nodes}}, "tid"
+            return {}, "tid"
+        return side
+
+    def _run(self, edge, stype="SWITCH_CASE"):
+        return {"id": "r1", "status": "COMPLETED",
+                "steps": [{"status": "COMPLETED", "outboundEdge": edge,
+                           "step": {"name": "Route", "type": stype}}]}
+
+    def _exit(self, fn, argv, side):
+        with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit) as cm:
+            fn(argv)
+        return cm.exception.code
+
+    def test_inspect_exists_and_absent(self):
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api(self.LIVE)), 0)
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api([])), 1)
+
+    def test_published_is_enabled_only(self):
+        argv = ["--name", "lab-x", "--require", "published"]
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._api(self.LIVE)), 0)
+        saved = [dict(self.LIVE[0], enabled=False)]
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._api(saved)), 1)
+
+    def test_inspect_bad_require_exit_2(self):
+        self.assertEqual(
+            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--require", "branched"],
+                       self._api(self.LIVE)), 2)
+
+    def test_stem_matches_by_prefix_but_exact_name_pins(self):
+        # The guide tells a learner to type lab-<sid>-night-watch, so the stem must match a suffixed
+        # name. --exact-name is for a caller that knows the whole thing.
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api(self.LIVE)), 0)
+        self.assertEqual(
+            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--exact-name"], self._api(self.LIVE)), 1)
+
+    def test_enabled_outranks_disabled_leftover_on_same_stem(self):
+        nodes = [dict(self.LIVE[0], id="old", enabled=False), self.LIVE[0]]
+        self.assertEqual(
+            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--require", "published"],
+                       self._api(nodes)), 0)
+
+    def test_run_branch_grades_the_edge_taken(self):
+        argv = ["--name", "lab-x", "--require", "branch", "--branch", "Malicious"]
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("Malicious")])), 0)
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("default")])), 1)
+
+    def test_run_branch_ignores_non_switch_steps(self):
+        # Unbranched steps carry "main"; only a SWITCH_CASE edge is a routing decision.
+        argv = ["--name", "lab-x", "--require", "branch", "--branch", "main"]
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("main", "ECHO")])), 1)
+
+    def test_run_completed_and_none(self):
+        argv = ["--name", "lab-x", "--require", "completed"]
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("x")])), 0)
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [])), 1)
+
+    def test_run_absent_workflow_exit_1(self):
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, ["--name", "lab-x"], self._api([])), 1)
+
+    def test_run_branch_without_branch_flag_exit_2(self):
+        self.assertEqual(
+            self._exit(wz.cmd_workflowrun_inspect, ["--name", "lab-x", "--require", "branch"],
+                       self._api(self.LIVE)), 2)
+
+    def test_delete_absent_is_exit_0(self):
+        self.assertEqual(self._exit(wz.cmd_workflow_delete, ["--name", "lab-x"], self._api([])), 0)
+
+    def test_ensure_needs_a_readable_definition(self):
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x"], self._api(self.LIVE)), 2)
+        self.assertEqual(
+            self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x", "--definition", "/nope.json"],
+                       self._api(self.LIVE)), 2)
+
+    def test_run_ensure_rejects_unknown_initial_step(self):
+        argv = ["--name", "lab-x", "--initial-step", "Nope", "--data", "/nope.json"]
+        self.assertEqual(self._exit(wz.cmd_workflowrun_ensure, argv, self._api(self.LIVE)), 2)
+
+
 class OutpostGrading(unittest.TestCase):
     """Locks the OutpostStatus grading table and the uninstall->wait->delete order. A refactor that
     reorders the reap would silently leave an Outpost record behind, which no lab check would

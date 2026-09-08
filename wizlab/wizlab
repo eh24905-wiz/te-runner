@@ -1176,6 +1176,200 @@ def cmd_policy_delete(args):
     sys.exit(0)
 
 
+# --- Workflows (Automation > Workflows). A learner's artifact is a workflow DEFINITION, so the graded
+# signal is either its lifecycle state (`published`) or a run's own `outboundEdge` — never a config
+# field. Which steps and which switch cases a scenario wants lives in that lab's definition JSON,
+# passed to `ensure`, because a `--require` per shape is a verb per assertion (SPEC.md §What may NOT). ---
+WORKFLOWS_Q = """query Workflows($f: AutomationWorkflowFilters) {
+  automationWorkflows(first: 50, filterBy: $f) {
+    nodes { id name enabled project { name } steps { id name type } }
+  }
+}"""
+
+WORKFLOW_RUNS_Q = """query WorkflowRuns($f: AutomationWorkflowRunFilters) {
+  automationWorkflowRuns(first: 20, filterBy: $f) {
+    nodes { id status startedAt steps { status outboundEdge step { name type } } }
+  }
+}"""
+
+CREATE_WORKFLOW = """mutation CreateWorkflow($input: CreateAutomationWorkflowInput!) {
+  createAutomationWorkflow(input: $input) { workflow { id name enabled } }
+}"""
+
+UPDATE_WORKFLOW_DRAFT = """mutation UpdateWorkflowDraft($input: UpdateAutomationWorkflowDraftInput!) {
+  updateAutomationWorkflowDraft(input: $input) { workflow { id name } }
+}"""
+
+PUBLISH_WORKFLOW = """mutation PublishWorkflow($input: PublishAutomationWorkflowVersionInput!) {
+  publishAutomationWorkflowVersion(input: $input) { workflow { id name enabled } }
+}"""
+
+RUN_WORKFLOW_TEST = """mutation RunWorkflowTest($input: RunAutomationWorkflowTestInput!) {
+  runAutomationWorkflowTest(input: $input) { workflowRun { id status } }
+}"""
+
+
+def _workflow_stem(args):
+    return _flag(args, "--name") or _lab_stem(_session_id(args))
+
+
+def _resolve_workflow(name, exact=False):
+    """The session's workflow. `search` is a case-insensitive substring match, so the stem also matches
+    a suffixed name the guide told the learner to type (lab-<sid>-night-watch) — which is wanted: the
+    suffix is not the lesson and the reap sweep keys on the same prefix. --exact-name pins it."""
+    data, _ = api(WORKFLOWS_Q, {"f": {"search": name}})
+    nodes = (data.get("automationWorkflows") or {}).get("nodes") or []
+    hits = [n for n in nodes if (n.get("name") == name if exact else (n.get("name") or "").startswith(name))]
+    # An enabled one outranks a disabled leftover from an earlier attempt on the same stem.
+    return sorted(hits, key=lambda n: not n.get("enabled"))[0] if hits else None
+
+
+def cmd_workflow_inspect(args):
+    """Assert the session's workflow exists (--require exists) or is live (--require published =
+    `enabled`). Create leaves a workflow saved but inactive, so existence alone passes a learner who
+    never clicked Publish. `enabled` is the ONLY signal for that: `activeVersion`, `draftVersion` and
+    `versions` read null/0 on every workflow of a live tenant, so a version-based assertion fails
+    everyone. `steps` distinguishes a bare trigger from a built flow if a lab needs it."""
+    name = _workflow_stem(args)
+    require = _flag(args, "--require") or "exists"
+    if require not in ("exists", "published"):
+        die(2, f"--require must be exists|published, got {require}")
+    node = _resolve_workflow(name, exact="--exact-name" in args)
+    if not node:
+        print(f"no workflow named {name}*")
+        sys.exit(1)
+    print(f"workflow {node['name']} ({node['id']}): enabled={node['enabled']} "
+          f"project={(node.get('project') or {}).get('name')} steps={len(node.get('steps') or [])}")
+    if require == "exists":
+        sys.exit(0)
+    sys.exit(0 if node["enabled"] else 1)
+
+
+def _read_json_flag(args, flag):
+    path = _flag(args, flag) or die(2, f"needs {flag} <path to json>")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except OSError as e:
+        die(2, f"cannot read {flag} {path}: {e}")
+    except ValueError as e:
+        die(2, f"{flag} {path} is not valid JSON: {e}")
+
+
+def cmd_workflow_ensure(args):
+    """Converge the session's workflow to the definition in --definition <file.json>, then publish it.
+    The file carries steps/triggers (the scenario); name and projectId are injected here so every lab
+    lands on the session stem the reap sweep keys on. Absent -> create; present -> patch the draft,
+    because a published version is immutable and only a draft can be edited."""
+    name = _workflow_stem(args)
+    definition = _read_json_flag(args, "--definition")
+    definition["name"] = name
+    project = _flag(args, "--project-id")
+    if project:
+        definition["projectId"] = project
+    definition.setdefault("enabled", True)
+    definition.setdefault("tags", [])
+    node = _resolve_workflow(name, exact="--exact-name" in args)
+    if node:
+        wf_id = node["id"]
+        patch = {k: definition[k] for k in ("steps", "triggers") if k in definition}
+        api(UPDATE_WORKFLOW_DRAFT, {"input": {"workflow": wf_id, "patchStrict": patch}})
+        print(f"patched draft of workflow {name} ({wf_id})")
+    else:
+        data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
+        wf = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}
+        if not wf:
+            die(3, "createAutomationWorkflow returned no workflow")
+        wf_id = wf["id"]
+        print(f"created workflow {wf['name']} ({wf_id})")
+    data, _ = api(PUBLISH_WORKFLOW, {"input": {"workflow": wf_id}})
+    wf = (data.get("publishAutomationWorkflowVersion") or {}).get("workflow") or {}
+    print(f"published workflow {wf.get('name', name)} ({wf_id}) enabled={wf.get('enabled')}")
+    sys.exit(0 if wf.get("enabled") else 3)
+
+
+def cmd_workflow_delete(args):
+    """Delete the session's workflow by --id or by the session stem. CRUD symmetry: the reaper reaches
+    the same object through its generic AutomationWorkflow prefix sweep, so a lab never needs this."""
+    wf_id = _flag(args, "--id")
+    if not wf_id:
+        node = _resolve_workflow(_workflow_stem(args), exact="--exact-name" in args)
+        if not node:
+            print("no workflow on this session's stem; nothing to delete")
+            sys.exit(0)
+        wf_id = node["id"]
+    api('mutation { deleteAutomationWorkflow(input: { id: "' + wf_id + '" }) { _stub } }', {})
+    print(f"deleted workflow {wf_id}")
+    sys.exit(0)
+
+
+def _run_filter(args, wf_id):
+    # TEST by default: a lab fires test runs, and an AUTOMATIC run from a real event would grade a
+    # learner on someone else's Threat. --run-type widens it.
+    return {"workflowId": {"equals": [wf_id]},
+            "type": {"equals": [_flag(args, "--run-type") or "TEST"]},
+            "status": {"equals": ["COMPLETED"]}}
+
+
+def cmd_workflowrun_inspect(args):
+    """Assert the session's workflow has a COMPLETED run (--require completed) or that one of those runs
+    left a SWITCH_CASE by a named edge (--require branch --branch <branchName>). outboundEdge on a
+    SWITCH_CASE is the matched case's branchName, so this grades the routing decision itself rather than
+    the definition's shape. Two hops because AutomationWorkflowRunFilters has no name or search key."""
+    require = _flag(args, "--require") or "completed"
+    if require not in ("completed", "branch"):
+        die(2, f"--require must be completed|branch, got {require}")
+    branch = _flag(args, "--branch") if require == "branch" else None
+    if require == "branch" and not branch:
+        die(2, "--require branch needs --branch <branchName>")
+    node = _resolve_workflow(_workflow_stem(args), exact="--exact-name" in args)
+    if not node:
+        print(f"no workflow named {_workflow_stem(args)}*; cannot scope runs")
+        sys.exit(1)
+    data, _ = api(WORKFLOW_RUNS_Q, {"f": _run_filter(args, node["id"])})
+    runs = (data.get("automationWorkflowRuns") or {}).get("nodes") or []
+    if not runs:
+        print(f"no completed run for workflow {node['name']} ({node['id']})")
+        sys.exit(1)
+    edges = [(s.get("outboundEdge"), (s.get("step") or {}).get("type")) for r in runs for s in (r.get("steps") or [])]
+    switch_edges = [e for e, t in edges if t == "SWITCH_CASE"]
+    print(f"workflow {node['name']}: {len(runs)} completed run(s), switch edges taken: "
+          f"{switch_edges or 'none'}")
+    if require == "completed":
+        sys.exit(0)
+    sys.exit(0 if branch in switch_edges else 1)
+
+
+def cmd_workflowrun_ensure(args):
+    """Fire a test run of the session's workflow with the synthetic trigger payload in --data
+    <file.json>, then wait for it to reach COMPLETED. customData.initialSteps is non-optional, so
+    --initial-step names the step the payload enters at and is resolved to its id here — a lab knows its
+    own step names, and step ids are minted per create."""
+    node = _resolve_workflow(_workflow_stem(args), exact="--exact-name" in args)
+    if not node:
+        die(3, f"no workflow named {_workflow_stem(args)}*; nothing to test-run")
+    step_name = _flag(args, "--initial-step") or die(2, "needs --initial-step <step name>")
+    step = next((s for s in (node.get("steps") or []) if s.get("name") == step_name), None)
+    if not step:
+        die(2, f"workflow {node['name']} has no step named {step_name!r}; "
+               f"has {[s.get('name') for s in (node.get('steps') or [])]}")
+    payload = _read_json_flag(args, "--data")
+    api(RUN_WORKFLOW_TEST, {"input": {
+        "workflowId": node["id"], "triggerType": _flag(args, "--trigger-type") or "EVENT",
+        "customData": {"initialSteps": [step["id"]], "data": payload}}})
+    print(f"test run fired on {node['name']} ({node['id']}) entering at {step_name!r}")
+    timeout = int(_flag(args, "--timeout") or "180")
+    deadline = time.time() + timeout
+    while True:
+        data, _ = api(WORKFLOW_RUNS_Q, {"f": _run_filter(args, node["id"])})
+        if ((data.get("automationWorkflowRuns") or {}).get("nodes") or []):
+            print("test run reached COMPLETED")
+            sys.exit(0)
+        if time.time() >= deadline:
+            die(3, f"no COMPLETED test run within {timeout}s — measure this plane")
+        time.sleep(10)
+
+
 def _outpost_name(args):
     # The Outpost's Wiz name, pinned to the session stem so the reaper's `search` finds it and
     # concurrent leases never collide. --name overrides for a manual/dev run.
@@ -2450,6 +2644,11 @@ VERBS = {
     ("policy", "inspect"): cmd_policy_inspect,
     ("policy", "delete"): cmd_policy_delete,
     ("detection", "inspect"): cmd_detection_inspect,
+    ("workflow", "inspect"): cmd_workflow_inspect,
+    ("workflow", "ensure"): cmd_workflow_ensure,
+    ("workflow", "delete"): cmd_workflow_delete,
+    ("workflow-run", "inspect"): cmd_workflowrun_inspect,
+    ("workflow-run", "ensure"): cmd_workflowrun_ensure,
     ("outpost", "inspect"): cmd_outpost_inspect,
     ("outpost", "ensure"): cmd_outpost_ensure,
     ("outpost", "delete"): cmd_outpost_delete,
