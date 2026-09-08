@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 TEAM = os.getenv("INSTRUQT_TEAM", "wiz")
 # Rolling window, so a session stopped near the cron hour is seen by two consecutive runs. That is
 # safe only because an already-reaped resource is a no-op, not a failure.
-WINDOW_H = int(os.getenv("REAP_WINDOW_HOURS", "25"))
+WINDOW_H = int(os.getenv("REAP_WINDOW_HOURS", "168"))
 # tenant key (the WIZ_TENANT value wizlab keys creds on) -> the lab's Instruqt tag. Extend as tenants onboard.
 TENANTS = {"TBCMP": "tid:tbcmp"}
 PAGE_SIZE = 500
