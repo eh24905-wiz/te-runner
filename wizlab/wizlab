@@ -926,8 +926,10 @@ def cmd_detection_inspect(args):
 # --- Wiz CLI credential for `wizcli auth`, minted via a CLI DEPLOYMENT (not createServiceAccount:
 # type:CLI accounts are internal and that mutation rejects them). createCliDeployment returns the
 # client secret ONCE, so `ensure` converges to one fresh deployment (delete-then-mint, like the
-# sensor). The SA it creates is named "<deployment-name>-deployment-<uuid>", so the reaper's
-# ServiceAccount lab-<id>* prefix sweep still catches it; `delete` removes the deployment itself. ---
+# sensor). The SA it creates is named "<deployment-name>-deployment-<uuid>", which the reaper's
+# ServiceAccount lab-<id>* prefix sweep finds but cannot delete directly — deleteServiceAccount rejects
+# an internal account, so the sweep routes it back through deleteCliDeployment (_reap_service_account).
+# `delete` removes the deployment itself. ---
 CLI_DEPLOYMENTS_Q = """query CliDeployments($f: DeploymentFilters) {
   deployments(first: 50, filterBy: $f) { nodes { id name type } }
 }"""
@@ -995,8 +997,8 @@ def cmd_serviceaccount_inspect(args):
 
 
 def cmd_serviceaccount_delete(args):
-    """Delete the session's Wiz CLI deployment, by --id or (default) the session-stem name. The
-    reaper's ServiceAccount prefix sweep also catches the SA the deployment created."""
+    """Delete the session's Wiz CLI deployment, by --id or (default) the session-stem name. Deleting the
+    deployment is also the only path to the SA it created — see _reap_service_account."""
     dep_id = _flag(args, "--id")
     if not dep_id:
         name = _cli_dep_name(args)
@@ -1852,7 +1854,7 @@ _REAP_BLOCKING = (FAILED, DEFERRED)
 _REAP_NEEDS_REVIEW = (FAILED, DEFERRED, UNKNOWN)
 
 
-def _reap_outpost(tok, dc, oid, name):
+def _reap_outpost(tok, dc, _h, oid, name):
     """Outpost delete is a lifecycle, not a mutation: deleteOutpost fails on a live record and on one
     still UNINSTALLING, so the order is uninstall -> UNINSTALLED -> delete. The reaper never waits that
     out inside a cron container, so a record mid-uninstall is DEFERRED — blocking keeps the user, and
@@ -1873,8 +1875,41 @@ def _reap_outpost(tok, dc, oid, name):
     return DEFERRED, f"{status.lower()}; delete deferred to the next pass"
 
 
+# A CLI deployment's service account carries the deployment's name plus this suffix, and that name is
+# the only handle back to the owner: the API exposes no reverse lookup from a service account to its
+# deployment.
+_CLI_SA_SUFFIX = re.compile(r"^(?P<dep>.+)-deployment-[0-9a-fA-F-]{36}$")
+
+
+def _reap_service_account(tok, dc, h, rid, name):
+    """`deleteServiceAccount` rejects a CLI deployment's account — "Internal service account cannot be
+    deleted" — so it is reachable only through `deleteCliDeployment` on the owning deployment. Left on
+    the uniform path it is a permanent FAILED, which blocks and retains the session's user forever.
+    Sensor and other accounts come from `createServiceAccount` and take the uniform delete."""
+    m = _CLI_SA_SUFFIX.match(name)
+    if not m:
+        return _reap_delete_uniform(tok, dc, h, rid, name)
+    dep = m.group("dep")
+    data, errs = _gql(tok, dc, CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": dep}})
+    if errs:
+        return FAILED, f"deployment lookup failed ({errs[0].get('message', '?')})"
+    nodes = ((data.get("deployments") or {}).get("nodes") or [])
+    owner = next((n for n in nodes if n.get("name") == dep), None)
+    if not owner:
+        # Nothing left that can delete this record, so blocking would retain the user forever with no
+        # pass able to clear it. UNKNOWN reports the residue without holding the handle.
+        return UNKNOWN, f"orphaned CLI service account; owning deployment {dep!r} is absent"
+    _d, derr = _gql(tok, dc, 'mutation { deleteCliDeployment(input: { id: "' + owner["id"] + '" }) { id } }')
+    if derr:
+        return FAILED, derr[0].get("message", "?")
+    if _reap_find(tok, dc, h, name)[1] == 0:
+        return REMOVED, None
+    return FAILED, "still present after deleting its CLI deployment"
+
+
 _REAP_OVERRIDES = {
-    "ServiceAccount": {"list": "serviceAccounts", "filter": "name", "soft": True},
+    "ServiceAccount": {"list": "serviceAccounts", "filter": "name", "soft": True,
+                       "deleter": _reap_service_account},
     "Outpost": {"deleter": _reap_outpost},
 }
 
@@ -1959,16 +1994,21 @@ def _reap_find(tok, dc, h, name):
     return (exact[0]["id"] if len(exact) == 1 else None), len(exact), None
 
 
-def _reap_delete(tok, dc, h, rid, name):
-    """One resource, one outcome. A type whose delete is a lifecycle rather than a single mutation
-    supplies its own deleter; everything else is the uniform delete<X>(input:{id}), verified by
-    re-lookup because the mutation can report success without removing the record."""
-    if h["deleter"]:
-        return h["deleter"](tok, dc, rid, name)
+def _reap_delete_uniform(tok, dc, h, rid, name):
+    # Verified by re-lookup because the mutation can report success without removing the record.
     _d, derr = _gql(tok, dc, "mutation { " + h["delete"] + '(input: { id: "' + rid + '" }) { _stub } }')
     if _reap_find(tok, dc, h, name)[1] == 0:
         return REMOVED, None
     return FAILED, derr[0].get("message", "?") if derr else "still present after delete"
+
+
+def _reap_delete(tok, dc, h, rid, name):
+    """One resource, one outcome. A type whose delete is a lifecycle rather than a single mutation, or
+    whose record is only reachable through an owner, supplies its own deleter and may fall back to the
+    uniform path per resource; everything else is the uniform delete<X>(input:{id})."""
+    if h["deleter"]:
+        return h["deleter"](tok, dc, h, rid, name)
+    return _reap_delete_uniform(tok, dc, h, rid, name)
 
 
 def _reap_one(tok, dc, action, name, commit):

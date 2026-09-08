@@ -296,6 +296,44 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         self.assertEqual(outcome, wz.UNKNOWN)
         self.assertIn("no name in input", review)
 
+    SA_HANDLER: typing.ClassVar = {"list": "serviceAccounts", "filter": "name", "soft": True,
+                                   "delete": "deleteServiceAccount", "deleter": None}
+
+    def test_a_cli_deployments_service_account_is_reaped_through_its_deployment(self):
+        # deleteServiceAccount rejects an internal type:CLI account ("Internal service account cannot
+        # be deleted"), so the uniform path is a permanent FAILED that retains the session's user.
+        name = "lab-s1-cli-deployment-26dc83b5-503a-4725-a087-0764b1ef671d"
+        sent = []
+
+        def _gql(_tok, _dc, query, variables=None):
+            sent.append(query)
+            if "deployments" in query:
+                return {"deployments": {"nodes": [{"id": "dep1", "name": "lab-s1-cli"}]}}, None
+            return {}, None
+
+        with mock.patch.object(wz, "_gql", side_effect=_gql), \
+             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+            outcome, detail = wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", name)
+        self.assertEqual((outcome, detail), (wz.REMOVED, None))
+        self.assertTrue(any("deleteCliDeployment" in q for q in sent))
+        self.assertFalse(any("deleteServiceAccount" in q for q in sent))
+
+    def test_a_non_cli_service_account_still_takes_the_uniform_delete(self):
+        # The sensor account comes from createServiceAccount and is deletable directly.
+        with mock.patch.object(wz, "_reap_delete_uniform", return_value=(wz.REMOVED, None)) as uni:
+            wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", "lab-s1-sensor")
+        uni.assert_called_once()
+
+    def test_a_cli_service_account_whose_deployment_is_gone_does_not_block(self):
+        # Nothing left can delete the record, so blocking would retain the user with no pass able to
+        # clear it.
+        name = "lab-s1-cli-deployment-26dc83b5-503a-4725-a087-0764b1ef671d"
+        with mock.patch.object(wz, "_gql", return_value=({"deployments": {"nodes": []}}, None)):
+            outcome, detail = wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", name)
+        self.assertEqual(outcome, wz.UNKNOWN)
+        self.assertIn("lab-s1-cli", detail)
+        self.assertNotIn(wz.UNKNOWN, wz._REAP_BLOCKING)
+
     def test_reap_enumeration_surfaces_graphql_errors(self):
         with mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
             actions, alert = wz._reap_enumerate("tok", "dc", "lab-s1@example.com", 60)
@@ -362,7 +400,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             return {}, ([{"message": delete_err}] if delete_err else [])
 
         with mock.patch.object(wz, "_gql", gql):
-            outcome, detail = wz._reap_outpost("tok", "dc", "o1", "lab-s1")
+            outcome, detail = wz._reap_outpost("tok", "dc", None, "o1", "lab-s1")
         return outcome, detail, sent
 
     def test_a_live_outpost_is_uninstalled_then_deferred_never_deleted(self):

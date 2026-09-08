@@ -1,7 +1,9 @@
 name: reap-orphans
 # Out-of-band reaper: daily, finds stopped tagged lab sessions and reaps their Wiz footprint + Keycloak
-# user (via the baked-in reaper + wizlab). DRY-RUN by default — set repo variable REAP_COMMIT=true to
-# actually delete (do that only after reviewing a few dry-run logs).
+# user (via the baked-in reaper + wizlab).
+# The `commit` input below defaults true for MANUAL dispatch only — a scheduled run supplies no inputs,
+# so the cron deletes nothing unless repo variable REAP_COMMIT=true. With it unset the schedule is a
+# dry run that reports a backlog and leaves it, and every run is green either way.
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -18,7 +20,7 @@ on:
 jobs:
   reap:
     runs-on: ubuntu-latest
-    container: ghcr.io/eh24905-wiz/te-runner:v0.1.32 # the reaper-bearing tag; bump when the reaper changes
+    container: ghcr.io/eh24905-wiz/te-runner:v0.1.39 # the reaper-bearing tag; bump when the reaper changes
     steps:
       - name: reap orphans
         env:
