@@ -85,9 +85,14 @@ authoring-side `lease`:
   (delete-then-mint, since the secret is shown once), emitting `WIZ_CLIENT_ID` (the deployment SA's
   `clientId`) + `WIZ_CLIENT_SECRET` (the payload's `clientSecret`) to stdout + `$EXEC_OUTPUT`.
   `inspect --require exists` and `delete` (by `--id` or name) go through `deployments(type:WIZ_CLI)` /
-  `deleteCliDeployment`. The deployment's SA is named `<stem>-cli-deployment-<uuid>`, so the reaper's
-  `ServiceAccount` `lab-<id>*` sweep also catches it. The `sensor` path stays on
-  `createServiceAccount(type:SENSOR)`, unchanged.
+  `deleteCliDeployment`. The deployment's SA is named `<stem>-cli-deployment-<uuid>`, which the
+  reaper's `ServiceAccount` `lab-<id>*` sweep finds and **cannot delete directly**:
+  `deleteServiceAccount` answers `Internal service account cannot be deleted`, so the sweep routes the
+  record back through `deleteCliDeployment` on the deployment whose name is that SA name minus
+  `-deployment-<uuid>` — the only handle back, since no reverse lookup exists. A deployment already
+  gone leaves the SA `unknown`, not `failed`: blocking would retain the session's user with no later
+  pass able to clear it. The `sensor` path stays on `createServiceAccount(type:SENSOR)`, deletable
+  directly.
 - `lease verify|ensure|inspect|delete --lab N` — the operator's dev-access path to a grader over the
   tailnet. Authoring-side: reads `TAILSCALE_API_KEY` + `INSTRUQT_API` from the operator, never from a
   lab, so in a grader it is inert. `verify` SPENDS both tokens — a
