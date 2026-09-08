@@ -15,8 +15,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # A force-moved git tag would otherwise overwrite a published image in place: every lab pinned to
+      # that tag changes under it, with no diff in any repo to show it. Refuse, and bump instead.
+      - name: refuse to overwrite a published tag
+        run: |
+          if docker manifest inspect "ghcr.io/${{ github.repository }}:${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "::error::ghcr.io/${{ github.repository }}:${{ github.ref_name }} is already published — bump the version instead of moving the tag"
+            exit 1
+          fi
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          # Bakes the identity a grader reports back (`wizlab session verify`) and the floor gate reads.
+          # Without these the image cannot name itself.
+          build-args: |
+            TE_RUNNER_TAG=${{ github.ref_name }}
+            TE_RUNNER_REV=${{ github.sha }}

@@ -1607,5 +1607,64 @@ class LeaseDevAccess(unittest.TestCase):
         self.assertNotIn("abc123", wz._scrub("up --authkey=tskey-auth-abc123 failed"))
 
 
+class RunnerFloor(unittest.TestCase):
+    """`session verify --min-runner` turns a lab's floor comment into something that fails."""
+
+    def _verify(self, args, env):
+        with mock.patch.dict(wz.os.environ, env, clear=False), \
+             mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "api", return_value=({"connectors": {"totalCount": 0}}, "tid")), \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             contextlib.redirect_stderr(io.StringIO()) as err, \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(args)
+        return cm.exception.code, out.getvalue(), err.getvalue()
+
+    def test_version_compares_as_ints_not_lexicographically(self):
+        # The whole point: "v0.1.9" > "v0.1.36" as strings, so a floor of v0.1.29 would pass on v0.1.9.
+        self.assertLess(wz._version("v0.1.9"), wz._version("v0.1.36"))
+        self.assertEqual(wz._version("v0.1.36"), (0, 1, 36))
+        self.assertIsNone(wz._version("latest"))
+
+    def test_a_pin_at_or_above_the_floor_passes(self):
+        for tag in ("v0.1.29", "v0.1.37"):
+            code, _out, _err = self._verify(["--min-runner", "v0.1.29"], {"TE_RUNNER_TAG": tag})
+            self.assertEqual(code, 0, tag)
+
+    def test_a_pin_below_the_floor_is_an_invocation_error_not_a_learner_failure(self):
+        # 2, so a validator reads FAIL (the lab's own pin is wrong) rather than INCONCLUSIVE.
+        code, _out, err = self._verify(["--min-runner", "v0.1.33"], {"TE_RUNNER_TAG": "v0.1.29"})
+        self.assertEqual(code, 2)
+        self.assertIn("below this lab's floor", err)
+
+    def test_the_floor_is_checked_before_any_credential_is_spent(self):
+        with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "v0.1.29"}, clear=False), \
+             mock.patch.object(wz, "token_and_dc") as tok, \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            wz.cmd_session_verify(["--min-runner", "v0.1.33"])
+        self.assertEqual(cm.exception.code, 2)
+        tok.assert_not_called()
+
+    def test_a_runner_that_cannot_name_itself_is_environment_never_a_pass(self):
+        code, _out, err = self._verify(["--min-runner", "v0.1.29"], {"TE_RUNNER_TAG": ""})
+        self.assertEqual(code, 3)
+        self.assertIn("unknowable", err)
+
+    def test_a_floor_that_is_not_a_version_is_an_invocation_error(self):
+        code, _out, _err = self._verify(["--min-runner", "latest"], {"TE_RUNNER_TAG": "v0.1.37"})
+        self.assertEqual(code, 2)
+
+    def test_no_floor_flag_leaves_verify_unchanged(self):
+        code, out, _err = self._verify([], {"TE_RUNNER_TAG": "v0.1.37", "TE_RUNNER_REV": "deadbeefcafe"})
+        self.assertEqual(code, 0)
+        # Check 1's line is the only record of what a play actually ran.
+        self.assertIn("runner=v0.1.37@deadbee", out)
+
+    def test_an_unidentified_runner_still_verifies_without_the_flag(self):
+        code, out, _err = self._verify([], {"TE_RUNNER_TAG": "", "TE_RUNNER_REV": ""})
+        self.assertEqual(code, 0)
+        self.assertIn("runner=unknown", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

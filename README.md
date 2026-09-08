@@ -9,6 +9,17 @@ whose Actions publish the **public** `ghcr.io/eh24905-wiz/te-runner:<tag>` that
 labs pin (Instruqt pulls anonymously). A tag on `origin` (wiz-training) builds a
 **private** org package labs can't pull — `manifest unknown`/401. Never `latest`.
 
+Read tags with `git tag --sort=-v:refname` — the default sort is lexicographic
+and puts `v0.1.9` above `v0.1.36`. There are no GitHub release objects, so the
+newest tag IS "the latest released image", and `main` may run ahead of it: what
+labs pin is the tag, never `HEAD`.
+
+Each image names itself — `TE_RUNNER_TAG`/`TE_RUNNER_REV` in its env and OCI
+`image.version`/`image.revision` labels — so a running grader can be asked what
+it is (`wizlab session verify` prints it), and a lab can assert its verb floor
+with `session verify --min-runner vX.Y.Z` (`wizlab/SPEC.md`). Both are empty on
+images before v0.1.37, which is why that floor gate binds only at v0.1.37+.
+
 `wizlab` exit codes: 0 satisfied · 1 not satisfied · 2 invocation · 3
 environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
 session in a terminal `validating_error`); consume them raw in CI.

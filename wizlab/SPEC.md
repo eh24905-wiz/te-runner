@@ -26,6 +26,23 @@ NOT promise the session created nothing else; that residue is counted as `unknow
 `unknown` is rejected — handler coverage is partial by construction, so it would fail every reap and
 retain every user. Operator decision, 2026-09-05.
 
+### Runner identity, and the floor `session verify` enforces
+The image carries its own `TE_RUNNER_TAG` + `TE_RUNNER_REV`, baked from the git tag and sha CI built
+(`Dockerfile` ARG→ENV, plus OCI `image.version`/`image.revision` labels). A play pins HCL at import, so
+a tag string in a lab repo names what `main` held then, not what the container runs; these two are the
+only answer a running grader can give, and `session verify` prints them on check 1.
+
+`session verify --min-runner vX.Y.Z` asserts this image is at or above the lab's declared verb floor.
+Exit **2** below the floor — a pin disagreeing with its own floor is a broken declaration, never learner
+state, so a validator reads FAIL and not INCONCLUSIVE. Exit **3** when the identity is absent: a runner
+cannot be graded against a floor it cannot name. The floor is checked before any token is spent.
+Versions compare as int tuples, because string order puts `v0.1.9` above `v0.1.36`.
+
+Binds only at v0.1.37+: earlier images carry no identity and silently ignore the flag (unparsed flags
+are not rejected), so the repin is what activates the gate. Operator decision, 2026-09-07: this is env
+health under `verify`, not a new noun — a floor is not an API fact and would fail the API-level bar
+below as `runner inspect`.
+
 ## Nouns
 `session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, for connectorless
 Runtime-Sensor labs `sensor` and `detection`, for Wiz Code labs `serviceaccount` and `code-scan`, and
