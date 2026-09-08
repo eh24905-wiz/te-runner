@@ -1072,18 +1072,49 @@ class WorkflowGrading(unittest.TestCase):
         self.assertEqual(wz._issue_line({"target": {"_stub": None}, "message": "m"}), "workflow: m")
         self.assertEqual(wz._issue_line({"message": "m"}), "workflow: m")
 
-    def test_ensure_never_publishes(self):
-        # publishAutomationWorkflowVersion answers "Workflow versions are currently not supported", and
-        # a create carrying enabled:true is already live — so a publish hop can only fail.
+    def _ensure_queries(self, wf_nodes):
         seen = []
 
         def side(query, variables):
             seen.append(query)
-            return self._api_validate([], wf_nodes=[])(query, variables)
+            return self._api_validate([], wf_nodes=wf_nodes)(query, variables)
         argv = ["--name", "lab-x", "--definition", self._definition_file()]
         with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit):
             wz.cmd_workflow_ensure(argv)
-        self.assertFalse([q for q in seen if "publishAutomationWorkflowVersion" in q])
+        return seen
+
+    def test_ensure_sends_no_version_bearing_mutation(self):
+        # "Workflow versions are currently not supported" covers EVERY version-bearing path, not just
+        # publish: the first fix removed the publish call and left updateAutomationWorkflowDraft, so the
+        # same defect failed a second play. This asserts the class, not the one call.
+        for nodes in ([], self.LIVE):
+            seen = self._ensure_queries(nodes)
+            for banned in ("publishAutomationWorkflowVersion", "updateAutomationWorkflowDraft",
+                           "revertAutomationWorkflowToVersion", "automationWorkflowVersion("):
+                self.assertFalse([q for q in seen if banned in q], f"{banned} sent with nodes={bool(nodes)}")
+
+    def test_ensure_converges_an_existing_workflow_by_rebuilding_it(self):
+        # A patch cannot work here, so converge is delete-then-create. Without the delete, a second
+        # solve would create a duplicate on the same stem.
+        seen = self._ensure_queries(self.LIVE)
+        self.assertTrue([q for q in seen if "deleteAutomationWorkflow" in q])
+        self.assertTrue([q for q in seen if "createAutomationWorkflow" in q])
+
+    def test_run_inspect_spans_every_workflow_on_the_stem(self):
+        # Two attempts on one stem: the edge lives on the second, and grading only the first would fail a
+        # learner who got there.
+        two = [dict(self.LIVE[0], id="w1", name="lab-x-night-watch"),
+               dict(self.LIVE[0], id="w2", name="lab-x-night-watch-2")]
+        captured = {}
+
+        def side(query, variables):
+            if "automationWorkflowRuns(" in query:
+                captured["ids"] = variables["f"]["workflowId"]["equals"]
+                return {"automationWorkflowRuns": {"nodes": [self._run("Malicious")]}}, "tid"
+            return {"automationWorkflows": {"nodes": two}}, "tid"
+        argv = ["--name", "lab-x", "--require", "branch", "--branch", "Malicious"]
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, side), 0)
+        self.assertEqual(sorted(captured["ids"]), ["w1", "w2"])
 
 
 class OutpostGrading(unittest.TestCase):

@@ -103,9 +103,14 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   the suffix is not the lesson; `--exact-name` pins it, and an `enabled` hit outranks a disabled
   leftover on the same stem.
 
-  `ensure --definition <file.json>` **validates, then creates or patches, and never publishes.**
-  `publishAutomationWorkflowVersion` answers `Workflow versions are currently not supported`, and it is
-  unnecessary regardless: a create carrying `enabled: true` is already live. The validate hop is not
+  `ensure --definition <file.json>` **validates, then rebuilds, and touches no version-bearing
+  mutation.** `Workflow versions are currently not supported` is refused for `publishAutomationWorkflowVersion`
+  **and** `updateAutomationWorkflowDraft` — it covers the whole family, so removing only the publish call
+  leaves a converge that fails the moment the workflow exists, which is every second solve. Converge is
+  therefore `deleteAutomationWorkflow` + `createAutomationWorkflow`, the two this tenant honours, and a
+  create carrying `enabled: true` is already live so nothing needs publishing.
+  `updateAutomationWorkflow(input:{id, patchStrict})` also exists and may work; untested, and a patch that
+  silently no-ops is worse than a rebuild that cannot. The validate hop is not
   politeness — a definition with `enabled: true` and any issue is refused as `an enabled workflow cannot
   have validation errors`, naming neither the step nor the expression, while
   `validateAutomationWorkflow(input:{workflow:…}){issues{message target}}` names both, costs no mutation
@@ -119,8 +124,10 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   `workflow-run inspect --require completed|branch --branch N` grades a run's own signal —
   `AutomationWorkflowRunStepResult.outboundEdge` on a `SWITCH_CASE` is the matched case's `branchName`,
   so this asserts the routing *decision*, not the definition. Two hops (name → id → runs) because
-  `AutomationWorkflowRunFilters` carries no name or search key; `TEST` runs only unless `--run-type`
-  widens it, since an `AUTOMATIC` run from a real event would grade a learner on someone else's Threat.
+  `AutomationWorkflowRunFilters` carries no name or search key, and the first hop takes **every** workflow
+  on the stem: a learner who attempts twice leaves two, so grading whichever the API returned first grades
+  an arbitrary attempt. `TEST` runs only unless `--run-type` widens it, since an `AUTOMATIC` run from a
+  real event would grade a learner on someone else's Threat.
   `workflow-run ensure --data <file.json> --initial-step <step name>` fires a test run with a synthetic
   trigger payload and waits on **that run's id**, never "a completed run of this workflow" — the
   workflow's earlier runs already satisfy the latter, so a second call reports success while its own run

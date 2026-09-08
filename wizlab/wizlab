@@ -1196,8 +1196,8 @@ CREATE_WORKFLOW = """mutation CreateWorkflow($input: CreateAutomationWorkflowInp
   createAutomationWorkflow(input: $input) { workflow { id name enabled } }
 }"""
 
-UPDATE_WORKFLOW_DRAFT = """mutation UpdateWorkflowDraft($input: UpdateAutomationWorkflowDraftInput!) {
-  updateAutomationWorkflowDraft(input: $input) { workflow { id name } }
+DELETE_WORKFLOW = """mutation DeleteWorkflow($input: DeleteAutomationWorkflowInput!) {
+  deleteAutomationWorkflow(input: $input) { _stub }
 }"""
 
 # The pre-flight that turns an opaque create failure into the actual reasons. A definition with
@@ -1225,15 +1225,23 @@ def _workflow_stem(args):
     return _flag(args, "--name") or _lab_stem(_session_id(args))
 
 
-def _resolve_workflow(name, exact=False):
-    """The session's workflow. `search` is a case-insensitive substring match, so the stem also matches
-    a suffixed name the guide told the learner to type (lab-<sid>-night-watch) — which is wanted: the
-    suffix is not the lesson and the reap sweep keys on the same prefix. --exact-name pins it."""
+def _resolve_workflows(name, exact=False):
+    """EVERY workflow on the session's stem, enabled first then by name so the order is stable. `search`
+    is a case-insensitive substring match, so the stem also matches a suffixed name the guide told the
+    learner to type (lab-<sid>-night-watch) — which is wanted: the suffix is not the lesson and the reap
+    sweep keys on the same prefix. --exact-name pins it.
+
+    Plural because a learner who attempts twice leaves two, and "the first enabled one in API order"
+    grades an arbitrary attempt. Callers that assert state take any match; `ensure` deletes them all."""
     data, _ = api(WORKFLOWS_Q, {"f": {"search": name}})
     nodes = (data.get("automationWorkflows") or {}).get("nodes") or []
     hits = [n for n in nodes if (n.get("name") == name if exact else (n.get("name") or "").startswith(name))]
-    # An enabled one outranks a disabled leftover from an earlier attempt on the same stem.
-    return sorted(hits, key=lambda n: not n.get("enabled"))[0] if hits else None
+    return sorted(hits, key=lambda n: (not n.get("enabled"), n.get("name") or ""))
+
+
+def _resolve_workflow(name, exact=False):
+    hits = _resolve_workflows(name, exact=exact)
+    return hits[0] if hits else None
 
 
 def cmd_workflow_inspect(args):
@@ -1301,7 +1309,15 @@ def cmd_workflow_ensure(args):
     which names nothing, so the issues are printed and the exit is 2 (the definition is the caller's
     bug, not the environment's). There is NO publish step — `publishAutomationWorkflowVersion` answers
     "Workflow versions are currently not supported", and it is unnecessary anyway: a create carrying
-    `enabled: true` is already live. Absent -> create; present -> patch the draft.
+    `enabled: true` is already live.
+
+    Converge is **delete-then-create**, not a patch. `updateAutomationWorkflowDraft` answers the same
+    "Workflow versions are currently not supported" as publish — the refusal covers every version-bearing
+    path, not just the publish call — so a patch fails whenever the workflow already exists, which is
+    always on a second solve. `deleteAutomationWorkflow` + `createAutomationWorkflow` are the two
+    mutations this tenant does honour (the reap sweep uses the first), so they are what `ensure` is built
+    from. `updateAutomationWorkflow(input:{id, patchStrict})` also exists and may work; untested, and a
+    patch that silently no-ops is worse than a rebuild that cannot.
 
     `--dry-run` validates and stops. That costs no mutation and needs no lease, so every CEL expression
     a lab ships — in its definition and in the text it hands a learner — is checkable before a play
@@ -1316,53 +1332,52 @@ def cmd_workflow_ensure(args):
         sys.exit(1 if issues else 0)
     if issues:
         die(2, f"definition has {len(issues)} validation issue(s); not submitted")
-    node = _resolve_workflow(name, exact="--exact-name" in args)
-    if node:
-        patch = {k: definition[k] for k in ("steps", "triggers") if k in definition}
-        api(UPDATE_WORKFLOW_DRAFT, {"input": {"workflow": node["id"], "patchStrict": patch}})
-        print(f"patched workflow {name} ({node['id']})")
-    else:
-        data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
-        wf = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}
-        if not wf:
-            die(3, "createAutomationWorkflow returned no workflow")
-        print(f"created workflow {wf['name']} ({wf['id']}) enabled={wf.get('enabled')}")
-    live = _resolve_workflow(name, exact="--exact-name" in args)
-    sys.exit(0 if (live and live.get("enabled")) else 3)
+    for stale in _resolve_workflows(name, exact="--exact-name" in args):
+        api(DELETE_WORKFLOW, {"input": {"id": stale["id"]}})
+        print(f"deleted existing workflow {stale['name']} ({stale['id']})")
+    data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
+    wf = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}
+    if not wf:
+        die(3, "createAutomationWorkflow returned no workflow")
+    print(f"created workflow {wf['name']} ({wf['id']}) enabled={wf.get('enabled')}")
+    sys.exit(0 if wf.get("enabled") else 3)
 
 
-def _run_filter(args, wf_id):
+def _run_filter(args, wf_ids):
     # TEST by default: a lab fires test runs, and an AUTOMATIC run from a real event would grade a
     # learner on someone else's Threat. --run-type widens it.
-    return {"workflowId": {"equals": [wf_id]},
+    return {"workflowId": {"equals": wf_ids},
             "type": {"equals": [_flag(args, "--run-type") or "TEST"]},
             "status": {"equals": ["COMPLETED"]}}
 
 
 def cmd_workflowrun_inspect(args):
-    """Assert the session's workflow has a COMPLETED run (--require completed) or that one of those runs
-    left a SWITCH_CASE by a named edge (--require branch --branch <branchName>). outboundEdge on a
-    SWITCH_CASE is the matched case's branchName, so this grades the routing decision itself rather than
-    the definition's shape. Two hops because AutomationWorkflowRunFilters has no name or search key."""
+    """Assert the session has a COMPLETED run (--require completed) or that one of those runs left a
+    SWITCH_CASE by a named edge (--require branch --branch <branchName>). outboundEdge on a SWITCH_CASE
+    is the matched case's branchName, so this grades the routing decision itself rather than the
+    definition's shape. Two hops because AutomationWorkflowRunFilters has no name or search key — and the
+    first hop takes EVERY workflow on the stem, because a learner who attempts twice leaves two and
+    grading whichever the API returned first grades an arbitrary attempt."""
     require = _flag(args, "--require") or "completed"
     if require not in ("completed", "branch"):
         die(2, f"--require must be completed|branch, got {require}")
     branch = _flag(args, "--branch") if require == "branch" else None
     if require == "branch" and not branch:
         die(2, "--require branch needs --branch <branchName>")
-    node = _resolve_workflow(_workflow_stem(args), exact="--exact-name" in args)
-    if not node:
-        print(f"no workflow named {_workflow_stem(args)}*; cannot scope runs")
+    stem = _workflow_stem(args)
+    nodes = _resolve_workflows(stem, exact="--exact-name" in args)
+    if not nodes:
+        print(f"no workflow named {stem}*; cannot scope runs")
         sys.exit(1)
-    data, _ = api(WORKFLOW_RUNS_Q, {"f": _run_filter(args, node["id"])})
+    data, _ = api(WORKFLOW_RUNS_Q, {"f": _run_filter(args, [n["id"] for n in nodes])})
     runs = (data.get("automationWorkflowRuns") or {}).get("nodes") or []
     if not runs:
-        print(f"no completed run for workflow {node['name']} ({node['id']})")
+        print(f"no completed run across {len(nodes)} workflow(s) named {stem}*")
         sys.exit(1)
-    edges = [(s.get("outboundEdge"), (s.get("step") or {}).get("type")) for r in runs for s in (r.get("steps") or [])]
-    switch_edges = [e for e, t in edges if t == "SWITCH_CASE"]
-    print(f"workflow {node['name']}: {len(runs)} completed run(s), switch edges taken: "
-          f"{switch_edges or 'none'}")
+    switch_edges = [s.get("outboundEdge") for r in runs for s in (r.get("steps") or [])
+                    if (s.get("step") or {}).get("type") == "SWITCH_CASE"]
+    print(f"{stem}*: {len(nodes)} workflow(s), {len(runs)} completed run(s), "
+          f"switch edges taken: {switch_edges or 'none'}")
     if require == "completed":
         sys.exit(0)
     sys.exit(0 if branch in switch_edges else 1)
