@@ -42,7 +42,7 @@ The suite reaches 25 of 34 `cmd_*` bodies when traced with `sys.settrace`; this 
 
 ## D5 — Make releases validate the artifact they publish
 
-`build.yml` publishes tags without depending on `lint.yml` or an image smoke test. The Dockerfile floats its base and several downloaded CLIs, including wizcli; a source tag alone does not make rebuilds reproducible. Gate publication on checks for the same commit, test Python 3.12, smoke-test installed binaries and entrypoint, record dependency versions, and use verified artifacts/digests where practical. `reap.yml` defaults manual commit to true despite its dry-run comment, and the repository variable can override an unchecked input; make mode precedence explicit and test it. The scheduled reaper pins image `v0.1.32` — update the pin when accepted runtime fixes ship.
+`build.yml` publishes tags without depending on `lint.yml` or an image smoke test. The Dockerfile floats its base and several downloaded CLIs, including wizcli; a source tag alone does not make rebuilds reproducible. Gate publication on checks for the same commit, test Python 3.12, smoke-test installed binaries and entrypoint, record dependency versions, and use verified artifacts/digests where practical. `reap.yml` defaults manual commit to true despite its dry-run comment, and the repository variable can override an unchecked input; make mode precedence explicit and test it. The `reap.yml` image pin is bumped by hand; nothing fails when a reaper fix ships under a newer tag.
 
 ## Next actions
 
@@ -53,4 +53,4 @@ The suite reaches 25 of 34 `cmd_*` bodies when traced with `sys.settrace`; this 
 | 3 | Specify D3 postconditions; add D4 destructive/credential coverage. |
 | 4 | Gate the release (D5), then extract shared boundaries (D1, D2). |
 
-Open question: whether `actionParameters` carries the created object's id, not only its name. If it does, a direct id delete converts much of `unknown` into `removed` — the only change that shrinks uncovered residue rather than reclassifying it. Needs a live-tenant reproducer. `fr/reaper-safety-and-role-refactor` is superseded by PR #1; do not merge it.
+Open question: whether `actionParameters` carries the created object's id, not only its name. If it does, a direct id delete converts much of `unknown` into `removed` — the only change that shrinks uncovered residue rather than reclassifying it. Needs a live-tenant reproducer.
