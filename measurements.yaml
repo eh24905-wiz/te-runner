@@ -228,6 +228,10 @@ planes:
     test_run:
       fire_to_completed_s: [0.046, 0.082] # runAutomationWorkflowTest EVENT -> status COMPLETED
       solver_budget_s: 60                 # `workflow-run ensure --timeout` default; ~700x the observed max
+      # Wall clock on the grader for a check that fires one run then inspects, and for a solve that
+      # converges a definition then fires one or two runs. n=1, one play.
+      check_fire_and_inspect_wall_s: [2, 6]
+      solve_ensure_and_fire_wall_s: [8, 10]
       # Server-side startedAt->completedAt on a synthetic customData payload. Three orders of magnitude
       # under a cloud plane: there is no discovery latency here, only workflow execution. A task timeout
       # in minutes is measuring nothing.
