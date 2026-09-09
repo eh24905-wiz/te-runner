@@ -2,7 +2,7 @@
 
 The one Docker image TE 2.0 labs reference.
 Carries `wizlab` (`/usr/local/bin/wizlab`), the measured-facts catalog
-(`/opt/te/measurements.yaml`), AWS CLI v2, Terraform 1.9.8, python 3.12, jq.
+(`/opt/te/measurements.yaml`), AWS CLI v2, Terraform 1.16.2, python 3.12, jq.
 
 Build: CI only — push a `v*` tag to the **`personal`** remote (`eh24905-wiz`),
 whose Actions publish the **public** `ghcr.io/eh24905-wiz/te-runner:<tag>` that
