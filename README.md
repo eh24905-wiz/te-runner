@@ -1,12 +1,13 @@
 # te-runner
 
 The one Docker image TE 2.0 labs reference.
-Carries `wizlab` (`/usr/local/bin/wizlab`), the measured-facts catalog
-(`/opt/te/measurements.yaml`), AWS CLI v2, Terraform 1.16.2, python 3.12, jq.
+Carries `wizlab` (`/usr/local/bin/wizlab`), AWS CLI v2, Terraform 1.16.2, python 3.12, jq.
 
 Build: CI only — push a `v*` tag to the **`personal`** remote (`eh24905-wiz`),
 whose Actions publish the **public** `ghcr.io/eh24905-wiz/te-runner:<tag>` that
-labs pin (Instruqt pulls anonymously). A tag on `origin` (wiz-training) builds a
+labs pin (Instruqt pulls anonymously). The build lints the tagged sha, smoke-tests
+the image, and refuses a tag `reap.yml` does not pin, so bump that pin in the
+tagged commit. A tag on `origin` (wiz-training) builds a
 **private** org package labs can't pull — `manifest unknown`/401. Never `latest`.
 
 Read tags with `git tag --sort=-v:refname` — the default sort is lexicographic
@@ -41,7 +42,7 @@ while IFS= read -r -d '' kv; do export "$kv"; done < /proc/1/environ
 environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
 session in a terminal `validating_error`); consume them raw in CI.
 
-Design review: [findings, reproductions, and recommendations](research/design-review.md).
+Review backlog, ranked by return on effort: `research/review.md`.
 
 Next action: measure the post-role connector `healthy` enum on a live lease
 (TODO in `wizlab/wizlab`).

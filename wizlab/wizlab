@@ -22,6 +22,7 @@ import string
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, namedtuple
@@ -124,16 +125,20 @@ INSTANCES = """query Instances($f: CloudResourceFilters) {
 # installed sensor registers under the HOST name (a lab sets the host name to the session stem, so the
 # stem scopes both planes). Neither SensorFilters nor DetectionFilters carries a cloud-account/instance
 # field, so `search` by name is the only session key; detections then scope by the resolved sensorId. ---
-SA_FIND = """query FindSA($n: String!) {
-  serviceAccounts(first: 50, filterBy: { name: $n, deleted: false }) { nodes { id name } }
+SA_FIND = """query FindSA($n: String!, $after: String) {
+  serviceAccounts(first: 50, after: $after, filterBy: { name: $n, deleted: false }) {
+    nodes { id name } pageInfo { hasNextPage endCursor }
+  }
 }"""
 
 CREATE_SA = """mutation CreateSA($input: CreateServiceAccountInput!) {
   createServiceAccount(input: $input) { serviceAccount { id name clientId clientSecret } }
 }"""
 
-SENSORS_Q = """query Sensors($s: String!) {
-  sensors(first: 50, filterBy: { search: $s }) { nodes { id name status type } totalCount }
+SENSORS_Q = """query Sensors($s: String!, $after: String) {
+  sensors(first: 50, after: $after, filterBy: { search: $s }) {
+    nodes { id name status type } totalCount pageInfo { hasNextPage endCursor }
+  }
 }"""
 
 # Default DetectionType is GENERATED_THREAT: the MATCH_ONLY sibling is invisible without the explicit
@@ -149,10 +154,10 @@ DETECTIONS_Q = """query Dets($f: DetectionFilters) {
 # an account that is not ours still reaches INITIALIZED with errorCode null, so it is not evidence any
 # AWS resource exists. The serviceType filter is a LIST. useWizServiceAccount:true means createOutpost
 # returns a null serviceAccount. ---
-OUTPOSTS_Q = """query Outposts($s: String) {
-  outposts(first: 50, filterBy: { search: $s, serviceType: [AWS] }) {
+OUTPOSTS_Q = """query Outposts($s: String, $after: String) {
+  outposts(first: 50, after: $after, filterBy: { search: $s, serviceType: [AWS] }) {
     nodes { id name status inAccountOutpostType serviceType }
-    totalCount
+    totalCount pageInfo { hasNextPage endCursor }
   }
 }"""
 
@@ -322,6 +327,63 @@ def _submissions(query):
     connector. Reads carry no such risk and keep the bounded retry. Anything not recognisably a read
     counts as a mutation. Idempotency: https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2"""
     return _READ_SUBMISSIONS if query.lstrip().startswith(("query", "{")) else 1
+
+
+# Pages a lookup follows before it stops calling the remainder "absent". A list on the session stem or
+# an exact name past this is an anomaly to name, never a page to guess about.
+_PAGE_CAP = 30
+
+
+def _next_cursor(conn, seen):
+    """(cursor, None) for the page after `conn`; (None, None) when it was the last; (None, reason) when
+    the walk cannot be trusted: no cursor, a cursor already fetched (a server ignoring `after`), or
+    the cap. A short walk is never "absent" — callers refuse to conclude on it."""
+    pi = conn.get("pageInfo") or {}
+    if not pi.get("hasNextPage"):
+        return None, None
+    cur = pi.get("endCursor")
+    if not cur:
+        return None, "hasNextPage without an endCursor"
+    if cur in seen:
+        return None, "the server repeated a cursor"
+    if len(seen) + 1 >= _PAGE_CAP:
+        return None, f"more than {_PAGE_CAP} pages"
+    seen.add(cur)
+    return cur, None
+
+
+def _paged(send, query, variables, field):
+    """Every node of connection `field`, following pageInfo through `send(query, variables) -> (data,
+    errors)`. Returns (nodes, alert); the alert names why the walk stopped short."""
+    nodes, cursor, seen = [], None, set()
+    while True:
+        data, errs = send(query, {**variables, "after": cursor})
+        if errs:
+            return nodes, errs[0].get("message", "?")
+        conn = data.get(field) or {}
+        nodes += conn.get("nodes") or []
+        cursor, alert = _next_cursor(conn, seen)
+        if cursor is None:
+            return nodes, alert
+
+
+def _api_send(query, variables):
+    return api(query, variables)[0], []
+
+
+def _all_nodes(query, variables, field):
+    """Every node the document matches, or exit 3: a lookup that feeds a delete or an ==1 guard must see
+    the whole set, and a check that cannot see it must not report learner state."""
+    nodes, alert = _paged(_api_send, query, variables, field)
+    if alert:
+        die(3, f"{field}: {alert}; cannot prove what is absent")
+    return nodes
+
+
+def _delete_doc(mutation, select="_stub"):
+    # The id is a variable, never spliced: `--id` on `_delete_sa` / `cmd_serviceaccount_delete` is user
+    # input. The mutation name stays in the document text — callers and tests route on it.
+    return f"mutation DeleteById($id: ID!) {{ {mutation}(input: {{ id: $id }}) {{ {select} }} }}"
 
 
 def api(query, variables, attempts=3):
@@ -534,15 +596,16 @@ def cmd_wiz_type(args):
     sys.exit(0)
 
 
-def _audit_page(filter_body, cursor):
-    after = f', after: "{cursor}"' if cursor else ""
-    qy = (
-        "query { auditLogEntries(first: 100" + after + ", filterBy: { " + filter_body + " }) "
-        "{ nodes { action actionType status timestamp performer { id name } } "
-        "pageInfo { hasNextPage endCursor } } }"
-    )
-    data, _ = api(qy, {})
-    return data.get("auditLogEntries") or {}
+def _audit_entries(send, minutes, mutations_only=True):
+    """Every audit entry in the window, newest page first, via `send` (api or _gql). Returns (entries,
+    alert). The filter is a literal: `minutes` is an int and MUTATION an enum, neither user text."""
+    scope = "actionType: MUTATION, " if mutations_only else ""
+    qy = ("query Audit($after: String) { auditLogEntries(first: 100, after: $after, filterBy: { " + scope
+          + f"timestamp: {{ inLast: {{ amount: {int(minutes)}, unit: DurationFilterValueUnitMinutes }} }} }}) "
+          "{ nodes { action actionType status timestamp performer { id name } actionParameters } "
+          "pageInfo { hasNextPage endCursor } } }")
+    entries, alert = _paged(send, qy, {}, "auditLogEntries")
+    return entries, (f"audit enumeration {alert}" if alert else None)
 
 
 def cmd_audit_user(args):
@@ -554,22 +617,17 @@ def cmd_audit_user(args):
     needle = (match or email).lower()
     minutes = int(_flag(args, "--last-min") or "120")
     include_all = "--all" in args
-    scope = "" if include_all else "actionType: MUTATION, "
-    fb = scope + f"timestamp: {{ inLast: {{ amount: {minutes}, unit: DurationFilterValueUnitMinutes }} }}"
-    cursor, pages, hits = None, 0, 0
-    while pages < 25:
-        conn = _audit_page(fb, cursor)
-        for n in conn.get("nodes") or []:
-            p = n.get("performer") or {}
-            if needle in f"{p.get('id', '')} {p.get('name', '')}".lower():
-                hits += 1
-                print(f"{n['timestamp']}  {n['actionType']:10} {n.get('status', ''):8} {n['action']}")
-        pi = conn.get("pageInfo") or {}
-        if not pi.get("hasNextPage"):
-            break
-        cursor, pages = pi.get("endCursor"), pages + 1
+    entries, alert = _audit_entries(_api_send, minutes, mutations_only=not include_all)
+    hits = 0
+    for n in entries:
+        p = n.get("performer") or {}
+        if needle in f"{p.get('id', '')} {p.get('name', '')}".lower():
+            hits += 1
+            print(f"{n['timestamp']}  {n['actionType']:10} {n.get('status', ''):8} {n['action']}")
     kind = "ALL" if include_all else "MUTATION"
     print(f"# {hits} {kind} action(s) by {email or match} in last {minutes}m", file=sys.stderr)
+    if alert:
+        die(3, f"{alert}; the list above is incomplete")
     sys.exit(0)
 
 
@@ -816,15 +874,13 @@ def _sa_name(args):
 
 def _resolve_sensor(name):
     """The sensor whose name exactly matches, ACTIVE-first (search is substring, so filter to ==)."""
-    data, _ = api(SENSORS_Q, {"s": name})
-    nodes = [n for n in ((data.get("sensors") or {}).get("nodes") or []) if n.get("name") == name]
+    nodes = [n for n in _all_nodes(SENSORS_Q, {"s": name}, "sensors") if n.get("name") == name]
     return sorted(nodes, key=lambda n: n.get("status") != "ACTIVE")[0] if nodes else None
 
 
 def _find_sa(name):
     """The service account whose name matches exactly (the filter is substring, so filter to ==)."""
-    data, _ = api(SA_FIND, {"n": name})
-    return next((n for n in ((data.get("serviceAccounts") or {}).get("nodes") or []) if n.get("name") == name), None)
+    return next((n for n in _all_nodes(SA_FIND, {"n": name}, "serviceAccounts") if n.get("name") == name), None)
 
 
 def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
@@ -864,7 +920,7 @@ def _delete_sa(args, name):
             print(f"no service account named {name}; nothing to delete")
             sys.exit(0)
         sid = node["id"]
-    api('mutation { deleteServiceAccount(input: { id: "' + sid + '" }) { _stub } }', {})
+    api(_delete_doc("deleteServiceAccount"), {"id": sid})
     print(f"deleted service account {sid}")
     sys.exit(0)
 
@@ -923,15 +979,10 @@ def cmd_detection_inspect(args):
     sys.exit(0 if n > 0 else 1)
 
 
-# --- Wiz CLI credential for `wizcli auth`, minted via a CLI DEPLOYMENT (not createServiceAccount:
-# type:CLI accounts are internal and that mutation rejects them). createCliDeployment returns the
-# client secret ONCE, so `ensure` converges to one fresh deployment (delete-then-mint, like the
-# sensor). The SA it creates is named "<deployment-name>-deployment-<uuid>", which the reaper's
-# ServiceAccount lab-<id>* prefix sweep finds but cannot delete directly — deleteServiceAccount rejects
-# an internal account, so the sweep routes it back through deleteCliDeployment (_reap_service_account).
-# `delete` removes the deployment itself. ---
-CLI_DEPLOYMENTS_Q = """query CliDeployments($f: DeploymentFilters) {
-  deployments(first: 50, filterBy: $f) { nodes { id name type } }
+# --- Wiz CLI credential for `wizcli auth`, minted via a CLI DEPLOYMENT: createServiceAccount rejects
+# type:CLI. The secret is returned once, so `ensure` is delete-then-mint. Lifecycle: SPEC.md. ---
+CLI_DEPLOYMENTS_Q = """query CliDeployments($f: DeploymentFilters, $after: String) {
+  deployments(first: 50, after: $after, filterBy: $f) { nodes { id name type } pageInfo { hasNextPage endCursor } }
 }"""
 
 CREATE_CLI_DEPLOYMENT = """mutation CreateCliDeployment($input: CreateCliDeploymentInput!) {
@@ -948,12 +999,12 @@ def _cli_dep_name(args):
 
 def _find_cli_deployment(name):
     """The WIZ_CLI deployment whose name matches exactly (search is substring, so filter to ==)."""
-    data, _ = api(CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": name}})
-    return next((n for n in ((data.get("deployments") or {}).get("nodes") or []) if n.get("name") == name), None)
+    nodes = _all_nodes(CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": name}}, "deployments")
+    return next((n for n in nodes if n.get("name") == name), None)
 
 
 def _delete_cli_deployment(dep_id):
-    api('mutation { deleteCliDeployment(input: { id: "' + dep_id + '" }) { id } }', {})
+    api(_delete_doc("deleteCliDeployment", "id"), {"id": dep_id})
 
 
 def cmd_serviceaccount_ensure(args):
@@ -1072,8 +1123,8 @@ def cmd_codescan_inspect(args):
 # trips. A SHARED, PERSISTENT fixture (not session-scoped) so the reaper never deletes it. Scoped to
 # one builtin Dockerfile control so it never blocks unrelated scans, and default:false so only a scan
 # that names it is gated. ---
-CICD_POLICIES_Q = """query CicdPolicies($f: CICDScanPolicyFilters) {
-  cicdScanPolicies(first: 50, filterBy: $f) { nodes { id name } }
+CICD_POLICIES_Q = """query CicdPolicies($f: CICDScanPolicyFilters, $after: String) {
+  cicdScanPolicies(first: 50, after: $after, filterBy: $f) { nodes { id name } pageInfo { hasNextPage endCursor } }
 }"""
 
 CREATE_CICD_POLICY = """mutation CreateCicdPolicy($input: CreateCICDScanPolicyInput!) {
@@ -1093,8 +1144,8 @@ def _policy_name(args):
 
 def _find_policy(name):
     """The IaC CI/CD scan policy whose name matches exactly (names filter is a contains, so ==)."""
-    data, _ = api(CICD_POLICIES_Q, {"f": {"type": ["IAC"], "names": [name]}})
-    return next((n for n in ((data.get("cicdScanPolicies") or {}).get("nodes") or []) if n.get("name") == name), None)
+    nodes = _all_nodes(CICD_POLICIES_Q, {"f": {"type": ["IAC"], "names": [name]}}, "cicdScanPolicies")
+    return next((n for n in nodes if n.get("name") == name), None)
 
 
 def _resolve_dockerfile_control(search):
@@ -1171,7 +1222,7 @@ def cmd_policy_delete(args):
     if not node:
         print(f"no cicd scan policy named {name}; nothing to delete")
         sys.exit(0)
-    api('mutation { deleteCICDScanPolicy(input: { id: "' + node["id"] + '" }) { id } }', {})
+    api(_delete_doc("deleteCICDScanPolicy", "id"), {"id": node["id"]})
     print(f"deleted cicd scan policy {node['id']}")
     sys.exit(0)
 
@@ -1180,9 +1231,9 @@ def cmd_policy_delete(args):
 # signal is either its lifecycle state (`published`) or a run's own `outboundEdge` — never a config
 # field. Which steps and which switch cases a scenario wants lives in that lab's definition JSON,
 # passed to `ensure`, because a `--require` per shape is a verb per assertion (SPEC.md §What may NOT). ---
-WORKFLOWS_Q = """query Workflows($f: AutomationWorkflowFilters) {
-  automationWorkflows(first: 50, filterBy: $f) {
-    nodes { id name enabled project { name } steps { id name type } }
+WORKFLOWS_Q = """query Workflows($f: AutomationWorkflowFilters, $after: String) {
+  automationWorkflows(first: 50, after: $after, filterBy: $f) {
+    nodes { id name enabled project { name } steps { id name type } } pageInfo { hasNextPage endCursor }
   }
 }"""
 
@@ -1239,8 +1290,7 @@ def _resolve_workflows(name, exact=False):
 
     Plural because a learner who attempts twice leaves two, and "the first enabled one in API order"
     grades an arbitrary attempt. Callers that assert state take any match; `ensure` deletes them all."""
-    data, _ = api(WORKFLOWS_Q, {"f": {"search": name}})
-    nodes = (data.get("automationWorkflows") or {}).get("nodes") or []
+    nodes = _all_nodes(WORKFLOWS_Q, {"f": {"search": name}}, "automationWorkflows")
     hits = [n for n in nodes if (n.get("name") == name if exact else (n.get("name") or "").startswith(name))]
     return sorted(hits, key=lambda n: (not n.get("enabled"), n.get("name") or ""))
 
@@ -1297,7 +1347,7 @@ def _workflow_definition(args):
 
 def _validate_definition(definition):
     data, _ = api(VALIDATE_WORKFLOW, {"workflow": definition})
-    return definition, ((data.get("validateAutomationWorkflow") or {}).get("issues") or [])
+    return (data.get("validateAutomationWorkflow") or {}).get("issues") or []
 
 
 def _issue_line(issue):
@@ -1310,26 +1360,14 @@ def _issue_line(issue):
 
 
 def cmd_workflow_ensure(args):
-    """Converge the session's workflow to --definition <file.json>. Validates first: a definition with
-    `enabled: true` and any issue is refused as "an enabled workflow cannot have validation errors",
-    which names nothing, so the issues are printed and the exit is 2 (the definition is the caller's
-    bug, not the environment's). There is NO publish step — `publishAutomationWorkflowVersion` answers
-    "Workflow versions are currently not supported", and it is unnecessary anyway: a create carrying
-    `enabled: true` is already live.
-
-    Converge is **patch-in-place** when the workflow exists, create when it does not. The patch keeps
-    the workflow id, and a test run belongs to that id, so runs an earlier activity graded survive a later
-    activity's solve. `updateAutomationWorkflow(input:{id, patchStrict})` is the mutation the console's
-    Save sends; the "Workflow versions are currently not supported" refusal is confined to
-    `updateAutomationWorkflowDraft` and `publishAutomationWorkflowVersion`. A second exact-name match is
-    a learner's duplicate attempt and is deleted, so a check that takes "any match" grades one workflow.
-
-    `--dry-run` validates and stops. That costs no mutation and needs no lease, so every CEL expression
-    a lab ships — in its definition and in the text it hands a learner — is checkable before a play
-    exists. It is the only gate there is: nothing local parses CEL."""
+    """Validate, then patch in place, create only when absent (contract: SPEC.md, workflow section).
+    Validation issues exit 2: the definition is the caller's bug, not the environment's. The patch keeps
+    the workflow id, so test runs an earlier activity graded survive a later activity's solve. No
+    version-bearing mutation is sent: every one is refused live. `--dry-run` validates and stops, which
+    is the only CEL gate there is — nothing local parses CEL."""
     definition = _workflow_definition(args)
     name = definition["name"]
-    _, issues = _validate_definition(definition)
+    issues = _validate_definition(definition)
     for i in issues:
         print(_issue_line(i))
     if "--dry-run" in args:
@@ -1343,13 +1381,14 @@ def cmd_workflow_ensure(args):
         print(f"deleted duplicate workflow {stale['name']} ({stale['id']})")
     if live:
         patch = {k: v for k, v in definition.items() if k != "projectId"}
+        mutation, verb = "updateAutomationWorkflow", "updated"
         data, _ = api(UPDATE_WORKFLOW, {"input": {"id": live[0]["id"], "patchStrict": patch}})
-        wf, verb = (data.get("updateAutomationWorkflow") or {}).get("workflow") or {}, "updated"
     else:
+        mutation, verb = "createAutomationWorkflow", "created"
         data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
-        wf, verb = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}, "created"
+    wf = (data.get(mutation) or {}).get("workflow") or {}
     if not wf:
-        die(3, f"{verb[:-1]}AutomationWorkflow returned no workflow")
+        die(3, f"{mutation} returned no workflow")
     print(f"{verb} workflow {wf['name']} ({wf['id']}) enabled={wf.get('enabled')}")
     sys.exit(0 if wf.get("enabled") else 3)
 
@@ -1417,7 +1456,7 @@ def _wait_for_run(run_id, timeout, interval):
     """Poll THIS run by id, never "a completed run of this workflow": the workflow's own earlier runs
     already satisfy the latter, so a second call would report success while its own run was in flight.
     Budget from measurements.yaml planes.workflow.test_run, which observes 46-82ms."""
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     while True:
         data, _ = api(WORKFLOW_RUNS_Q, {"f": {"id": {"equals": [run_id]}}})
         nodes = (data.get("automationWorkflowRuns") or {}).get("nodes") or []
@@ -1426,7 +1465,7 @@ def _wait_for_run(run_id, timeout, interval):
             return status
         if status in _RUN_DEAD:
             die(3, f"test run {run_id} ended {status}, not COMPLETED")
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             die(3, f"test run {run_id} still {status or 'unseen'} after {timeout}s")
         time.sleep(interval)
 
@@ -1472,8 +1511,7 @@ def _outpost_name(args):
 def _resolve_outpost(name):
     """The AWS Outpost whose name exactly matches (search is substring, so filter to ==),
     CONNECTED-first so a healthy one outranks a stale UNINSTALLED record on a recycled name."""
-    data, _ = api(OUTPOSTS_Q, {"s": name})
-    nodes = [n for n in ((data.get("outposts") or {}).get("nodes") or []) if n.get("name") == name]
+    nodes = [n for n in _all_nodes(OUTPOSTS_Q, {"s": name}, "outposts") if n.get("name") == name]
     return sorted(nodes, key=lambda n: n.get("status") != "CONNECTED")[0] if nodes else None
 
 
@@ -1604,8 +1642,8 @@ def _outpost_by_id(oid):
 
 def _await_uninstalled(oid, timeout):
     """Poll until the uninstall reaches a deletable terminal state; returns the last status seen."""
-    deadline, status = time.time() + timeout, "UNINSTALLING"
-    while time.time() < deadline:
+    deadline, status = time.monotonic() + timeout, "UNINSTALLING"
+    while time.monotonic() < deadline:
         time.sleep(20)
         status = (_outpost_by_id(oid) or {}).get("status") or "GONE"
         if status in _OUTPOST_DELETABLE or status == "GONE":
@@ -1630,7 +1668,7 @@ def _decode_trust_policy(doc):
         for cand in (text, urllib.parse.unquote_plus(text), urllib.parse.unquote(text)):
             try:
                 p = json.loads(cand)
-            except Exception:
+            except ValueError:
                 continue
             if isinstance(p, dict):
                 return p
@@ -1689,11 +1727,19 @@ def _wiz_delegator():
     return params["aws"].get("roleArn") or "", tid
 
 
+# A hung CSP CLI otherwise outlives the platform's own check timeout and the learner sees a timeout,
+# not the environment error it is.
+_CLI_TIMEOUT_S = 120
+
+
 def _cli(binary, *a):
     try:
-        return subprocess.run([binary, *a], capture_output=True, text=True, check=False)
+        return subprocess.run([binary, *a], capture_output=True, text=True, check=False,
+                              timeout=_CLI_TIMEOUT_S)
     except FileNotFoundError:
         die(3, f"{binary!r} not found in PATH")  # env error (3), not the main() catch-all's 2
+    except subprocess.TimeoutExpired:
+        die(3, f"{binary!r} produced no result within {_CLI_TIMEOUT_S}s")
 
 
 def _aws(*a): return _cli("aws", *a)
@@ -2063,6 +2109,8 @@ def cmd_user_ensure(args):
         if status != 201:
             die(3, f"create user HTTP {status}: {body[:300]!r}")
         uid = _kc_user_id(endpoint, realm, token, email)
+        if uid is None:
+            die(3, f"created {email} but Keycloak does not return it on re-lookup")
         action = "created"
     else:
         status, body = _kc_call(
@@ -2169,10 +2217,8 @@ _CLI_SA_SUFFIX = re.compile(r"^(?P<dep>.+)-deployment-[0-9a-fA-F-]{36}$")
 
 
 def _reap_service_account(tok, dc, h, rid, name):
-    """`deleteServiceAccount` rejects a CLI deployment's account — "Internal service account cannot be
-    deleted" — so it is reachable only through `deleteCliDeployment` on the owning deployment. Left on
-    the uniform path it is a permanent FAILED, which blocks and retains the session's user forever.
-    Sensor and other accounts come from `createServiceAccount` and take the uniform delete."""
+    """`deleteServiceAccount` rejects a CLI deployment's account, so the owning deployment is the only
+    handle; on the uniform path it is a permanent FAILED that retains the session's user forever."""
     m = _CLI_SA_SUFFIX.match(name)
     if not m:
         return _reap_delete_uniform(tok, dc, h, rid, name)
@@ -2186,7 +2232,7 @@ def _reap_service_account(tok, dc, h, rid, name):
         # Nothing left that can delete this record, so blocking would retain the user forever with no
         # pass able to clear it. UNKNOWN reports the residue without holding the handle.
         return UNKNOWN, f"orphaned CLI service account; owning deployment {dep!r} is absent"
-    _d, derr = _gql(tok, dc, 'mutation { deleteCliDeployment(input: { id: "' + owner["id"] + '" }) { id } }')
+    _d, derr = _gql(tok, dc, _delete_doc("deleteCliDeployment", "id"), {"id": owner["id"]})
     if derr:
         return FAILED, derr[0].get("message", "?")
     if _reap_find(tok, dc, h, name)[1] == 0:
@@ -2242,48 +2288,40 @@ def _input_name(d):
 
 
 def _reap_enumerate(tok, dc, email, minutes):
-    fb = f"actionType: MUTATION, timestamp: {{ inLast: {{ amount: {minutes}, unit: DurationFilterValueUnitMinutes }} }}"
-    out, cursor, pages = [], None, 0
-    while pages < 30:
-        after = f', after: "{cursor}"' if cursor else ""
-        qy = ("query { auditLogEntries(first: 100" + after + ", filterBy: { " + fb + " }) "
-              "{ nodes { action status performer { name } actionParameters } pageInfo { hasNextPage endCursor } } }")
-        data, errs = _gql(tok, dc, qy)
-        if errs:
-            return out, f"audit enumeration failed: {errs[0].get('message', '?')}"
-        conn = data.get("auditLogEntries") or {}
-        for n in conn.get("nodes") or []:
-            if (n.get("performer") or {}).get("name") != email or n.get("status") != "SUCCESS":
-                continue
-            if n["action"].startswith("Create"):
-                out.append((n["action"], _input_name((n.get("actionParameters") or {}).get("input") or {})))
-        pi = conn.get("pageInfo") or {}
-        if not pi.get("hasNextPage"):
-            break
-        cursor, pages = pi.get("endCursor"), pages + 1
-        if not cursor:
-            return out, "audit enumeration returned hasNextPage without an endCursor"
-    if pages == 30 and pi.get("hasNextPage"):
-        return out, "audit enumeration exceeded the 3,000-entry safety limit"
-    return out, None
+    """(SUCCESS Create* actions by `email` as (action, input name), alert). A partial list with an alert
+    is what the caller turns into FAILED."""
+    entries, alert = _audit_entries(lambda q, v: _gql(tok, dc, q, v), minutes)
+    out = [(n["action"], _input_name((n.get("actionParameters") or {}).get("input") or {}))
+           for n in entries
+           if (n.get("performer") or {}).get("name") == email and n.get("status") == "SUCCESS"
+           and n["action"].startswith("Create")]
+    return out, alert
+
+
+def _reap_list(tok, dc, h, name):
+    """Every node of a sweep type whose list filter matches `name`, all pages. Returns (nodes, error).
+    The filter value is a literal: each type declares its filter as String or [String], and a literal
+    coerces into either where a typed variable would not."""
+    extra = ", deleted: false" if h["soft"] else ""
+    qy = ("query ReapList($after: String) { " + h["list"] + "(first: 100, after: $after, filterBy: { "
+          + h["filter"] + ": " + json.dumps(name) + extra
+          + " }) { nodes { id name } pageInfo { hasNextPage endCursor } } }")
+    return _paged(lambda q, v: _gql(tok, dc, q, v), qy, {}, h["list"])
 
 
 def _reap_find(tok, dc, h, name):
     # Returns (id_if_exactly_one, exact_count, error). Exact-name guard is load-bearing: list filters
-    # are substring, so a shared tenant demands ==1 before delete.
-    extra = ", deleted: false" if h["soft"] else ""
-    qy = ("query { " + h["list"] + "(first: 50, filterBy: { " + h["filter"]
-          + ": " + json.dumps(name) + extra + " }) { nodes { id name } } }")
-    data, errs = _gql(tok, dc, qy)
-    if errs:
-        return None, None, errs[0].get("message", "?")
-    exact = [n for n in ((data.get(h["list"]) or {}).get("nodes") or []) if n.get("name") == name]
+    # are substring, so a shared tenant demands ==1 before delete — over the WHOLE list, never a page.
+    nodes, err = _reap_list(tok, dc, h, name)
+    if err:
+        return None, None, err
+    exact = [n for n in nodes if n.get("name") == name]
     return (exact[0]["id"] if len(exact) == 1 else None), len(exact), None
 
 
 def _reap_delete_uniform(tok, dc, h, rid, name):
     # Verified by re-lookup because the mutation can report success without removing the record.
-    _d, derr = _gql(tok, dc, "mutation { " + h["delete"] + '(input: { id: "' + rid + '" }) { _stub } }')
+    _d, derr = _gql(tok, dc, _delete_doc(h["delete"]), {"id": rid})
     if _reap_find(tok, dc, h, name)[1] == 0:
         return REMOVED, None
     return FAILED, derr[0].get("message", "?") if derr else "still present after delete"
@@ -2330,15 +2368,13 @@ def _reap_sweep_type(tok, dc, x, stem, commit):
     Counter of outcomes. A lookup error is FAILED, not UNKNOWN: every type swept here is a guaranteed
     type, so an error means this sweep did not complete."""
     h = _reap_handler(x)
-    extra = ", deleted: false" if h["soft"] else ""
-    qy = ("query { " + h["list"] + "(first: 100, filterBy: { " + h["filter"]
-          + ": " + json.dumps(stem) + extra + " }) { nodes { id name } } }")
-    data, errs = _gql(tok, dc, qy)
-    if errs:
-        print(f"FAILED sweep {x}: {errs[0].get('message', '?')}")
+    nodes, err = _reap_list(tok, dc, h, stem)
+    if err:
+        # Nothing from a partial list is deleted: the sweep either saw the whole set or did not run.
+        print(f"FAILED sweep {x}: {err}")
         return Counter({FAILED: 1})
     tally = Counter()
-    for n in (data.get(h["list"]) or {}).get("nodes") or []:
+    for n in nodes:
         nm = n.get("name") or ""
         if not nm.startswith(stem):
             continue
@@ -2374,16 +2410,23 @@ def cmd_reap(args):
         # FAILED, not UNKNOWN: a truncated audit list hides creates we never even tried to delete.
         print(f"FAILED {enumeration_alert}")
         tally[FAILED] += 1
+    # Removals the sweep could not have found by name. Every lab now instructs `lab-<sid>-*` names, so
+    # this count over the reap.yml logs decides whether the audit layer stays a delete path or becomes
+    # a report.
+    audit_only = 0
     for action, name in actions:
         outcome, review = _reap_one(tok, dc, action, name, commit)
         if review:
             print(review)
         tally[outcome] += 1
+        if outcome == REMOVED and not (name or "").startswith(stem):
+            audit_only += 1
     for x in _SWEEP_TYPES:
         tally += _reap_sweep_type(tok, dc, x, stem, commit)
     verb = "removed" if commit else "to remove (dry-run)"
     counts = ", ".join(f"{tally[o]} {o}" for o in (ABSENT, DEFERRED, UNKNOWN, FAILED))
-    print(f"# {tally[REMOVED]} {verb}, {counts} for {email} / {stem}*", file=sys.stderr)
+    print(f"# {tally[REMOVED]} {verb} ({audit_only} audit-only), {counts} for {email} / {stem}*",
+          file=sys.stderr)
     sys.exit(3 if commit and any(tally[o] for o in _REAP_BLOCKING) else 0)
 
 
@@ -2551,7 +2594,7 @@ def _fresh_nodes(match):
         seen_at = d.get("lastSeen")
         if not seen_at or match not in (d.get("hostname") or ""):
             continue
-        age = (now - datetime.datetime.fromisoformat(seen_at.replace("Z", "+00:00"))).total_seconds()
+        age = (now - datetime.datetime.fromisoformat(seen_at)).total_seconds()
         if age <= _NODE_FRESH_S:
             out.append((age, (d.get("addresses") or [""])[0], d["hostname"]))
     return sorted(out)
@@ -2773,8 +2816,6 @@ def main():
     # traceback exiting 1 (which a learner check would read as "you're wrong").
     try:
         VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
-    except SystemExit:
-        raise
     except Exception as e:
         die(2, f"internal error: {type(e).__name__}: {e}")
 

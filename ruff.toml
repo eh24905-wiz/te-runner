@@ -2,7 +2,7 @@
 # Correctness + style + modernization + simplification. Complexity is radon's job (see CLAUDE.md),
 # not C90's. BLE/S unselected on purpose: broad `except -> die(3)` is the intended transport-failure
 # contract, not an oversight.
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 
 [lint]

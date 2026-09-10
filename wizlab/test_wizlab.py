@@ -4,6 +4,7 @@
 # breadth, flag edges, and the main() dispatch guard. Run: python wizlab/test_wizlab.py
 import base64
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -17,7 +18,10 @@ import urllib.error
 from importlib.machinery import SourceFileLoader
 from unittest import mock
 
-wz = SourceFileLoader("wizlab_cli", str(pathlib.Path(__file__).resolve().parent / "wizlab")).load_module()
+_spec = importlib.util.spec_from_loader(
+    "wizlab_cli", SourceFileLoader("wizlab_cli", str(pathlib.Path(__file__).resolve().parent / "wizlab")))
+wz = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(wz)
 
 # `_keypair_dir` falls back to ~/.cache/wizlab/lease/<lab>, and the lease tests name a REAL lab
 # (te-dev-aws), so a suite run on an operator's box deleted the private key of a live play and still
@@ -116,6 +120,14 @@ class CliHelper(unittest.TestCase):
         self.assertEqual(calls[0][0], "aws")
         self.assertEqual(calls[1][0], "gcloud")
         self.assertEqual(calls[2][0], "az")
+
+
+    def test_a_hung_binary_is_environment_3(self):
+        with mock.patch.object(wz.subprocess, "run",
+                               side_effect=wz.subprocess.TimeoutExpired("aws", wz._CLI_TIMEOUT_S)), \
+             self.assertRaises(SystemExit) as cm:
+            wz._cli("aws", "sts", "get-caller-identity")
+        self.assertEqual(cm.exception.code, 3)
 
 
 class ExitCodeContract(unittest.TestCase):
@@ -387,6 +399,38 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         self.assertEqual(outcome, wz.FAILED)
         self.assertIn("denied", review)
 
+    def test_a_delete_id_is_a_variable_never_spliced_into_the_document(self):
+        hostile = 'x" }) { _stub } } mutation { deleteTenant(input: { id: "y'
+        sent = []
+
+        def gql(tok, dc, query, variables=None):
+            sent.append((query, variables))
+            return {}, []
+
+        with mock.patch.object(wz, "_gql", gql), \
+             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+            outcome, _ = wz._reap_delete_uniform("tok", "dc", self.HANDLER, hostile, "lab-s1-report")
+        self.assertEqual(outcome, wz.REMOVED)
+        (query, variables), = sent
+        self.assertIn(self.HANDLER["delete"], query)
+        self.assertNotIn(hostile, query)
+        self.assertEqual(variables, {"id": hostile})
+
+    def test_committed_reap_counts_removals_the_sweep_could_not_have_named(self):
+        actions = [("CreateReport", "lab-s1-r"), ("CreateReport", "Q3 report"), ("CreateReport", "old")]
+        outcomes = [(wz.REMOVED, None), (wz.REMOVED, None), (wz.ABSENT, None)]
+        err = io.StringIO()
+        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(wz, "_reap_enumerate", return_value=(actions, None)), \
+             mock.patch.object(wz, "_reap_one", side_effect=outcomes), \
+             mock.patch.object(wz, "_reap_sweep_type", return_value=wz.Counter({wz.REMOVED: 1})), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_reap(["--session", "s1", "--commit"])
+        self.assertEqual(cm.exception.code, 0)
+        swept = len(wz._SWEEP_TYPES)
+        self.assertIn(f"# {2 + swept} removed (1 audit-only), 1 absent", err.getvalue())
+
     def _outpost_reap(self, status, delete_err=None, status_err=None):
         """Drives the real _reap_outpost. Returns (outcome, detail, mutations issued)."""
         sent = []
@@ -454,6 +498,135 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             wz.cmd_wiz_type(["--name", "Type; DROP"])
         self.assertEqual(cm.exception.code, 2)
+
+
+class Pagination(unittest.TestCase):
+    """Every lookup that feeds a delete or an ==1 guard walks the whole connection, and a walk it cannot
+    finish is a refusal, never "absent"."""
+
+    @staticmethod
+    def _pages(field, *pages, cursors=None):
+        """An api() fake serving `pages` in order, keyed by the `after` variable it receives."""
+        cursors = cursors or [f"c{i}" for i in range(len(pages))]
+        by_after = {None: 0, **{cursors[i]: i + 1 for i in range(len(pages) - 1)}}
+        seen = []
+
+        def side(query, variables):
+            seen.append(variables.get("after"))
+            i = by_after[variables.get("after")]
+            last = i == len(pages) - 1
+            return {field: {"nodes": pages[i],
+                            "pageInfo": {"hasNextPage": not last, "endCursor": None if last else cursors[i]}}}, "tid"
+        side.seen = seen
+        return side
+
+    def test_an_exact_match_past_the_first_page_is_found(self):
+        page1 = [{"id": str(i), "name": f"lab-s1-sensor-{i}"} for i in range(50)]
+        side = self._pages("serviceAccounts", page1, [{"id": "sa", "name": "lab-s1-sensor"}])
+        with mock.patch.object(wz, "api", side_effect=side):
+            self.assertEqual(wz._find_sa("lab-s1-sensor")["id"], "sa")
+        self.assertEqual(side.seen, [None, "c0"])
+
+    def test_a_duplicate_past_the_first_page_is_deleted_by_ensure(self):
+        # Before paging, `live[1:]` was computed on one page and a duplicate on the next survived.
+        live = [{"id": "w1", "name": "lab-x", "enabled": True}], [{"id": "w2", "name": "lab-x", "enabled": False}]
+        side = self._pages("automationWorkflows", *live)
+        with mock.patch.object(wz, "api", side_effect=side):
+            hits = wz._resolve_workflows("lab-x", exact=True)
+        self.assertEqual([h["id"] for h in hits], ["w1", "w2"])
+
+    def test_a_server_that_ignores_after_is_environment_3_not_absent(self):
+        # Same page, same cursor, forever: without the guard the loop never ends or, capped, concludes
+        # "absent" on a set it never finished reading.
+        def side(query, variables):
+            return {"cicdScanPolicies": {"nodes": [{"id": "p", "name": "other"}],
+                                         "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, "tid"
+        with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit) as cm:
+            wz._find_policy("fixture")
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_has_next_page_without_a_cursor_is_environment_3(self):
+        def side(query, variables):
+            return {"outposts": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}}, "tid"
+        with mock.patch.object(wz, "api", side_effect=side), self.assertRaises(SystemExit) as cm:
+            wz._resolve_outpost("lab-s1")
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_the_page_cap_is_a_refusal(self):
+        def side(query, variables):
+            n = int(variables.get("after") or 0)
+            return {"sensors": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": str(n + 1)}}}, "tid"
+        with mock.patch.object(wz, "api", side_effect=side) as api, self.assertRaises(SystemExit) as cm:
+            wz._resolve_sensor("lab-s1")
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(api.call_count, wz._PAGE_CAP)
+
+    def test_a_response_without_page_info_is_one_complete_page(self):
+        with mock.patch.object(wz, "api", return_value=({"serviceAccounts": {"nodes": []}}, "tid")) as api:
+            self.assertIsNone(wz._find_sa("lab-s1-sensor"))
+        api.assert_called_once()
+
+    # --- the reaper's list, through _gql (errors returned, never die)
+    HANDLER: typing.ClassVar = {"list": "reports", "filter": "search", "delete": "deleteReport",
+                                "soft": False, "deleter": None}
+
+    def _gql_pages(self, *pages):
+        side = self._pages("reports", *pages)
+        return lambda tok, dc, q, v=None: (side(q, v or {})[0], []), side
+
+    def test_the_sweep_walks_every_page_before_deleting(self):
+        # The design review's F4 probe, inverted: 100 stem-named reports on page one and 3 on page two
+        # are all swept, and the second request carries the first page's cursor.
+        page1 = [{"id": str(i), "name": f"lab-s1-{i}"} for i in range(100)]
+        page2 = [{"id": f"x{i}", "name": f"lab-s1-x{i}"} for i in range(3)]
+        gql, side = self._gql_pages(page1, page2)
+        with mock.patch.object(wz, "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
+            tally = wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", False)
+        self.assertEqual(tally, wz.Counter({wz.REMOVED: 103}))
+        self.assertEqual(side.seen, [None, "c0"])
+
+    def test_a_sweep_that_cannot_finish_deletes_nothing_and_fails(self):
+        def gql(tok, dc, q, v=None):
+            if "mutation" in q:
+                self.fail("a delete was issued from a partial list")
+            return {"reports": {"nodes": [{"id": "r", "name": "lab-s1-r"}],
+                                "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, []
+        with mock.patch.object(wz, "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
+            tally = wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", True)
+        self.assertEqual(tally, wz.Counter({wz.FAILED: 1}))
+
+    def test_the_exact_one_guard_counts_across_pages(self):
+        gql, _ = self._gql_pages([{"id": "a", "name": "lab-s1-r"}], [{"id": "b", "name": "lab-s1-r"}])
+        with mock.patch.object(wz, "_gql", side_effect=gql):
+            rid, count, err = wz._reap_find("tok", "dc", self.HANDLER, "lab-s1-r")
+        self.assertEqual((rid, count, err), (None, 2, None))
+
+    def test_audit_enumeration_stops_at_the_cap_with_an_alert(self):
+        def gql(tok, dc, q, v=None):
+            n = int((v or {}).get("after") or 0)
+            return {"auditLogEntries": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": str(n + 1)}}}, []
+        with mock.patch.object(wz, "_gql", side_effect=gql):
+            actions, alert = wz._reap_enumerate("tok", "dc", "lab-s1@example.com", 60)
+        self.assertEqual(actions, [])
+        self.assertIn(f"more than {wz._PAGE_CAP} pages", alert)
+
+    def test_audit_user_shares_the_fetcher_and_reports_an_incomplete_list_as_3(self):
+        entry = {"action": "CreateReport", "actionType": "MUTATION", "status": "SUCCESS",
+                 "timestamp": "t", "performer": {"id": "u", "name": "lab-s1@example.com"}}
+        calls = []
+
+        def side(query, variables):
+            calls.append(variables.get("after"))
+            return {"auditLogEntries": {"nodes": [entry],
+                                        "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, "tid"
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(wz, "api", side_effect=side), contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            wz.cmd_audit_user(["--match", "lab-s1"])
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(calls, [None, "same"])
+        self.assertIn("CreateReport", out.getvalue())
+        self.assertIn("incomplete", err.getvalue())
 
 
 class CloudSelection(unittest.TestCase):
@@ -1115,9 +1288,9 @@ class WorkflowGrading(unittest.TestCase):
         return seen
 
     def test_ensure_sends_no_version_bearing_mutation(self):
-        # "Workflow versions are currently not supported" covers EVERY version-bearing path, not just
-        # publish: the first fix removed the publish call and left updateAutomationWorkflowDraft, so the
-        # same defect failed a second play. This asserts the class, not the one call.
+        # The version refusal (SPEC.md) covers EVERY version-bearing path: the first fix removed the
+        # publish call and left updateAutomationWorkflowDraft, so the same defect failed a second play.
+        # This asserts the class, not the one call.
         for nodes in ([], self.LIVE):
             seen = self._ensure_queries(nodes)
             for banned in ("publishAutomationWorkflowVersion", "updateAutomationWorkflowDraft",
@@ -1195,12 +1368,12 @@ class OutpostGrading(unittest.TestCase):
         return side, calls
 
     def _exit(self, fn, argv, side):
-        # A fake clock, not just a no-op sleep: the uninstall wait is bounded by time.time(), so a
+        # A fake clock, not just a no-op sleep: the uninstall wait is bounded by time.monotonic(), so a
         # patched-out sleep alone would spin on the real clock for the whole --timeout.
         clock = {"t": 1000.0}
         with mock.patch.object(wz, "api", side_effect=side), \
                 mock.patch.object(wz.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)), \
-                mock.patch.object(wz.time, "time", lambda: clock["t"]), \
+                mock.patch.object(wz.time, "monotonic", lambda: clock["t"]), \
                 self.assertRaises(SystemExit) as cm:
             fn(argv)
         return cm.exception.code
@@ -1478,6 +1651,42 @@ class ServiceAccountGrading(unittest.TestCase):
     def test_delete_by_name_and_noop_when_absent(self):
         self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._api(existing=True))[0], 0)
         self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._api(existing=False))[0], 0)
+
+
+    def test_delete_by_id_sends_the_id_as_a_variable(self):
+        calls = []
+
+        def side(query, variables):
+            calls.append((query, variables))
+            return {"deleteCliDeployment": {"id": "dep1"}}, "tid"
+
+        hostile = 'dep1" }) { id } } mutation { deleteTenant(input: { id: "t'
+        code, _ = self._run(wz.cmd_serviceaccount_delete, ["--id", hostile], side)
+        self.assertEqual(code, 0)
+        (query, variables), = calls
+        self.assertIn("deleteCliDeployment", query)
+        self.assertNotIn(hostile, query)
+        self.assertEqual(variables, {"id": hostile})
+
+
+class KeycloakUser(unittest.TestCase):
+    def test_ensure_refuses_to_join_a_group_when_the_created_user_is_not_found(self):
+        # A None re-lookup after a 201 used to PUT to users/None/groups/<gid>.
+        calls = []
+
+        def kc_call(method, url, token, body=None):
+            calls.append((method, url))
+            return 201, b""
+
+        with mock.patch.object(wz, "_kc_session", return_value=("https://kc", "wiz", "tok", "u@x", "U")), \
+             mock.patch.object(wz, "_kc_user_id", return_value=None), \
+             mock.patch.object(wz, "_kc_call", kc_call), \
+             mock.patch.object(wz, "_kc_group_id", return_value="g1"), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_user_ensure([])
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual([m for m, _ in calls], ["POST"])
+        self.assertFalse([u for _, u in calls if "/users/None/" in u])
 
 
 class CodeScanGrading(unittest.TestCase):

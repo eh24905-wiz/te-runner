@@ -6,10 +6,25 @@ permissions:
   contents: read
   packages: write
 jobs:
+  checks:
+    # The same gate main runs, on the exact sha being published: a tag on an unlinted commit otherwise
+    # ships to every lab that repins.
+    uses: ./.github/workflows/lint.yml
   image:
+    needs: checks
     runs-on: ubuntu-latest
+    env:
+      IMG: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+      # The reaper runs whatever reap.yml pins, so a reaper fix under a newer tag silently never runs.
+      # Refusing a tag reap.yml does not pin makes the bump part of every release.
+      - name: reap.yml pins this tag
+        run: |
+          if ! grep -q "te-runner:${{ github.ref_name }}\b" .github/workflows/reap.yml; then
+            echo "::error::.github/workflows/reap.yml does not pin te-runner:${{ github.ref_name }}"
+            exit 1
+          fi
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -19,17 +34,28 @@ jobs:
       # that tag changes under it, with no diff in any repo to show it. Refuse, and bump instead.
       - name: refuse to overwrite a published tag
         run: |
-          if docker manifest inspect "ghcr.io/${{ github.repository }}:${{ github.ref_name }}" >/dev/null 2>&1; then
-            echo "::error::ghcr.io/${{ github.repository }}:${{ github.ref_name }} is already published — bump the version instead of moving the tag"
+          if docker manifest inspect "$IMG" >/dev/null 2>&1; then
+            echo "::error::$IMG is already published — bump the version instead of moving the tag"
             exit 1
           fi
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          load: true
+          tags: ${{ env.IMG }}
           # Bakes the identity a grader reports back (`wizlab session verify`) and the floor gate reads.
           # Without these the image cannot name itself.
           build-args: |
             TE_RUNNER_TAG=${{ github.ref_name }}
             TE_RUNNER_REV=${{ github.sha }}
+      # Runs the artifact, not the source: a broken COPY, a CLI download that 404'd, or an entrypoint
+      # that no longer execs would otherwise be found by the first lab to repin.
+      - name: smoke-test the image
+        run: |
+          docker run --rm "$IMG" sh -c 'for b in wizlab aws terraform gcloud az wizcli tailscale tailscaled jq git; do command -v "$b" >/dev/null || { echo "missing $b"; exit 1; }; done'
+          docker run --rm "$IMG" sh -c 'test "$TE_RUNNER_TAG" = "${{ github.ref_name }}" && test "$TE_RUNNER_REV" = "${{ github.sha }}"'
+          rc=0; docker run --rm "$IMG" wizlab >/dev/null 2>&1 || rc=$?; test "$rc" -eq 2
+          docker run --rm "$IMG" python3 -c 'import ast, sys; ast.parse(open("/opt/reaper/reap_orphans.py").read())'
+          # Unpinned CLIs float: this log line is where a rebuilt tag's versions are on record.
+          docker run --rm "$IMG" sh -c 'aws --version; terraform version -json | jq -r .terraform_version; gcloud --version | head -1; az version -o tsv 2>/dev/null | cut -f1; wizcli version; tailscale version | head -1'
+      - run: docker push "$IMG"

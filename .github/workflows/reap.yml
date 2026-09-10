@@ -1,9 +1,9 @@
 name: reap-orphans
 # Out-of-band reaper: daily, finds stopped tagged lab sessions and reaps their Wiz footprint + Keycloak
 # user (via the baked-in reaper + wizlab).
-# The `commit` input below defaults true for MANUAL dispatch only — a scheduled run supplies no inputs,
-# so the cron deletes nothing unless repo variable REAP_COMMIT=true. With it unset the schedule is a
-# dry run that reports a backlog and leaves it, and every run is green either way.
+# Commit mode has one source per trigger: a manual run deletes iff its `commit` box is ticked, the
+# schedule deletes iff repo variable REAP_COMMIT=true. Neither overrides the other, so an unticked box
+# is always a dry run. Every run is green either way; a dry run reports the backlog and leaves it.
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -12,7 +12,7 @@ on:
       commit:
         description: "Delete (unchecked = dry-run)"
         type: boolean
-        default: true
+        default: false
       sessions:
         description: "Manual session ids to reap (comma-separated), bypassing the tag/window filter"
         type: string
@@ -20,7 +20,7 @@ on:
 jobs:
   reap:
     runs-on: ubuntu-latest
-    container: ghcr.io/eh24905-wiz/te-runner:v0.1.43 # the reaper-bearing tag; bump when the reaper changes
+    container: ghcr.io/eh24905-wiz/te-runner:v0.1.46 # build.yml refuses a tag this line does not pin
     steps:
       - name: reap orphans
         env:
@@ -32,8 +32,8 @@ jobs:
           LAB_KEYCLOAK_ADMIN_USER: ${{ secrets.LAB_KEYCLOAK_ADMIN_USER }}
           LAB_KEYCLOAK_ADMIN_PWD: ${{ secrets.LAB_KEYCLOAK_ADMIN_PWD }}
           REAP_SESSIONS: ${{ inputs.sessions }}
-        # --commit when the manual input asks, or when the repo variable REAP_COMMIT=true; else dry-run.
         run: |
-          COMMIT=""
-          if [ "${{ inputs.commit }}" = "true" ] || [ "${{ vars.REAP_COMMIT }}" = "true" ]; then COMMIT="--commit"; fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then MODE="${{ inputs.commit }}"; else MODE="${{ vars.REAP_COMMIT }}"; fi
+          COMMIT=""; [ "$MODE" = "true" ] && COMMIT="--commit"
+          echo "commit mode: ${COMMIT:-dry-run} (from ${{ github.event_name }})"
           python /opt/reaper/reap_orphans.py $COMMIT

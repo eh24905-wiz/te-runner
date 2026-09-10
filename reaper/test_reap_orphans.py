@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+import importlib.util
 import io
 import pathlib
 import unittest
-from importlib.machinery import SourceFileLoader
 from unittest import mock
 
-rp = SourceFileLoader(
-    "reap_orphans", str(pathlib.Path(__file__).resolve().parent / "reap_orphans.py")
-).load_module()
+_spec = importlib.util.spec_from_file_location(
+    "reap_orphans", pathlib.Path(__file__).resolve().parent / "reap_orphans.py")
+rp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rp)
 
 
 class SessionDiscovery(unittest.TestCase):

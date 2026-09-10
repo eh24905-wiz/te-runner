@@ -67,7 +67,7 @@ def stopped_sessions(tag):
 
 def _wizlab(tenant, *args):
     r = subprocess.run(["wizlab", *args], env={**os.environ, "WIZ_TENANT": tenant},
-                       capture_output=True, text=True, check=False)
+                       capture_output=True, text=True, check=False, timeout=300)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
     return r.returncode
