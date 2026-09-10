@@ -1124,12 +1124,29 @@ class WorkflowGrading(unittest.TestCase):
                            "revertAutomationWorkflowToVersion", "automationWorkflowVersion("):
                 self.assertFalse([q for q in seen if banned in q], f"{banned} sent with nodes={bool(nodes)}")
 
-    def test_ensure_converges_an_existing_workflow_by_rebuilding_it(self):
-        # A patch cannot work here, so converge is delete-then-create. Without the delete, a second
-        # solve would create a duplicate on the same stem.
-        seen = self._ensure_queries(self.LIVE)
-        self.assertTrue([q for q in seen if "deleteAutomationWorkflow" in q])
-        self.assertTrue([q for q in seen if "createAutomationWorkflow" in q])
+    def test_ensure_patches_a_live_workflow_and_keeps_its_id(self):
+        # A rebuild drops the test runs earlier activities graded; the patch keeps the workflow id, and
+        # the patch type has no projectId key.
+        sent = {}
+
+        def side(query, variables):
+            if "updateAutomationWorkflow(" in query:
+                sent.update(variables["input"])
+                return {"updateAutomationWorkflow": {"workflow": {"id": "w1", "name": "lab-x", "enabled": True}}}, "tid"
+            return self._api_validate([], wf_nodes=self.LIVE)(query, variables)
+        argv = ["--name", "lab-x", "--definition", self._definition_file(), "--project-id", "p1"]
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, side), 0)
+        self.assertEqual(sent["id"], "w1")
+        self.assertNotIn("projectId", sent["patchStrict"])
+        self.assertTrue(sent["patchStrict"]["enabled"])
+
+    def test_ensure_creates_when_absent_and_deletes_only_a_duplicate(self):
+        def names(seen):
+            return [q.split("(")[0].split()[-1] for q in seen if "mutation" in q]
+        self.assertEqual(names(self._ensure_queries([])), ["CreateWorkflow"])
+        self.assertEqual(names(self._ensure_queries(self.LIVE)), ["UpdateWorkflow"])
+        dup = [*self.LIVE, {**self.LIVE[0], "id": "w2"}]
+        self.assertEqual(names(self._ensure_queries(dup)), ["DeleteWorkflow", "UpdateWorkflow"])
 
     def test_run_inspect_spans_every_workflow_on_the_stem(self):
         # Two attempts on one stem: the edge lives on the second, and grading only the first would fail a

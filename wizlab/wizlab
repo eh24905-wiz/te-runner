@@ -1200,6 +1200,12 @@ DELETE_WORKFLOW = """mutation DeleteWorkflow($input: DeleteAutomationWorkflowInp
   deleteAutomationWorkflow(input: $input) { _stub }
 }"""
 
+# The in-place edit the console's Save button sends. UpdateAutomationWorkflowPatchStrict is
+# AutomationWorkflowDefinition minus `projectId`, so a definition converts by dropping that one key.
+UPDATE_WORKFLOW = """mutation UpdateWorkflow($input: UpdateAutomationWorkflowInput!) {
+  updateAutomationWorkflow(input: $input) { workflow { id name enabled } }
+}"""
+
 # The pre-flight that turns an opaque create failure into the actual reasons. A definition with
 # `enabled: true` and any validation issue is refused as "an enabled workflow cannot have validation
 # errors" — naming neither the step nor the expression. This query names both, costs no mutation, and
@@ -1311,13 +1317,12 @@ def cmd_workflow_ensure(args):
     "Workflow versions are currently not supported", and it is unnecessary anyway: a create carrying
     `enabled: true` is already live.
 
-    Converge is **delete-then-create**, not a patch. `updateAutomationWorkflowDraft` answers the same
-    "Workflow versions are currently not supported" as publish — the refusal covers every version-bearing
-    path, not just the publish call — so a patch fails whenever the workflow already exists, which is
-    always on a second solve. `deleteAutomationWorkflow` + `createAutomationWorkflow` are the two
-    mutations this tenant does honour (the reap sweep uses the first), so they are what `ensure` is built
-    from. `updateAutomationWorkflow(input:{id, patchStrict})` also exists and may work; untested, and a
-    patch that silently no-ops is worse than a rebuild that cannot.
+    Converge is **patch-in-place** when the workflow exists, create when it does not. The patch keeps
+    the workflow id, and a test run belongs to that id, so runs an earlier activity graded survive a later
+    activity's solve. `updateAutomationWorkflow(input:{id, patchStrict})` is the mutation the console's
+    Save sends; the "Workflow versions are currently not supported" refusal is confined to
+    `updateAutomationWorkflowDraft` and `publishAutomationWorkflowVersion`. A second exact-name match is
+    a learner's duplicate attempt and is deleted, so a check that takes "any match" grades one workflow.
 
     `--dry-run` validates and stops. That costs no mutation and needs no lease, so every CEL expression
     a lab ships — in its definition and in the text it hands a learner — is checkable before a play
@@ -1332,14 +1337,20 @@ def cmd_workflow_ensure(args):
         sys.exit(1 if issues else 0)
     if issues:
         die(2, f"definition has {len(issues)} validation issue(s); not submitted")
-    for stale in _resolve_workflows(name, exact="--exact-name" in args):
+    live = _resolve_workflows(name, exact="--exact-name" in args)
+    for stale in live[1:]:
         api(DELETE_WORKFLOW, {"input": {"id": stale["id"]}})
-        print(f"deleted existing workflow {stale['name']} ({stale['id']})")
-    data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
-    wf = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}
+        print(f"deleted duplicate workflow {stale['name']} ({stale['id']})")
+    if live:
+        patch = {k: v for k, v in definition.items() if k != "projectId"}
+        data, _ = api(UPDATE_WORKFLOW, {"input": {"id": live[0]["id"], "patchStrict": patch}})
+        wf, verb = (data.get("updateAutomationWorkflow") or {}).get("workflow") or {}, "updated"
+    else:
+        data, _ = api(CREATE_WORKFLOW, {"input": {"workflow": definition}})
+        wf, verb = (data.get("createAutomationWorkflow") or {}).get("workflow") or {}, "created"
     if not wf:
-        die(3, "createAutomationWorkflow returned no workflow")
-    print(f"created workflow {wf['name']} ({wf['id']}) enabled={wf.get('enabled')}")
+        die(3, f"{verb[:-1]}AutomationWorkflow returned no workflow")
+    print(f"{verb} workflow {wf['name']} ({wf['id']}) enabled={wf.get('enabled')}")
     sys.exit(0 if wf.get("enabled") else 3)
 
 

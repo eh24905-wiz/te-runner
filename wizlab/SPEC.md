@@ -103,16 +103,15 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   the suffix is not the lesson; `--exact-name` pins it, and an `enabled` hit outranks a disabled
   leftover on the same stem.
 
-  `ensure --definition <file.json>` **validates, then rebuilds, and touches no version-bearing
-  mutation.** `Workflow versions are currently not supported` is refused for `publishAutomationWorkflowVersion`
-  **and** `updateAutomationWorkflowDraft` — it covers the whole family, so removing only the publish call
-  leaves a converge that fails the moment the workflow exists, which is every second solve. Converge is
-  therefore `deleteAutomationWorkflow` + `createAutomationWorkflow`, the two this tenant honours, and a
-  create carrying `enabled: true` is already live so nothing needs publishing.
-  `updateAutomationWorkflow(input:{id, patchStrict})` also exists and may work; untested, and a patch that
-  silently no-ops is worse than a rebuild that cannot. The validate hop is not
-  politeness — a definition with `enabled: true` and any issue is refused as `an enabled workflow cannot
-  have validation errors`, naming neither the step nor the expression, while
+  `ensure --definition <file.json>` **validates, then patches in place, and creates only when absent.**
+  `updateAutomationWorkflow(input:{id, patchStrict})` is the mutation the console's Save sends, and
+  `UpdateAutomationWorkflowPatchStrict` is `AutomationWorkflowDefinition` minus `projectId`. The patch
+  keeps the workflow id, so the test runs earlier activities graded survive a later activity's solve.
+  `Workflow versions are currently not supported` is refused for `publishAutomationWorkflowVersion` and
+  `updateAutomationWorkflowDraft` only; a create carrying `enabled: true` is already live, so nothing
+  needs publishing. A second exact-name match is a learner's duplicate attempt and is deleted.
+  The validate hop is not politeness — a definition with `enabled: true` and any issue is refused as
+  `an enabled workflow cannot have validation errors`, naming neither the step nor the expression, while
   `validateAutomationWorkflow(input:{workflow:…}){issues{message target}}` names both, costs no mutation
   and runs on any tenant. So `--dry-run` validates and stops, which is **the only gate that exists for
   CEL**: nothing local parses it, so every expression a lab ships — in its definition and in the text it
