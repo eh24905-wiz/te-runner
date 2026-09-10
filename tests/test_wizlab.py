@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # Stdlib-only harness (no external deps, matching wizlab). Locks the load-bearing invariants so
 # refactors are safe without re-playing a lab: the 0/1/2/3 exit-code contract, IAM-trust parsing
-# breadth, flag edges, and the main() dispatch guard. Run: python wizlab/test_wizlab.py
+# breadth, flag edges, and the main() dispatch guard. Run: python tests/test_wizlab.py
 # What a new test may be, and where it goes: te-labkit-v2/CLAUDE.md §Tests. Contracts are tables
 # (`InspectContract.ROWS`, the grading tables), driven through `exit_code` and `FakeWiz`.
 import base64
 import contextlib
-import importlib.util
 import io
 import json
 import os
@@ -19,13 +18,17 @@ import types
 import typing
 import unittest
 import urllib.error
-from importlib.machinery import SourceFileLoader
 from unittest import mock
 
-_spec = importlib.util.spec_from_loader(
-    "wizlab_cli", SourceFileLoader("wizlab_cli", str(pathlib.Path(__file__).resolve().parent / "wizlab")))
-wz = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(wz)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import wizlab as wz
+
+
+def _owner(name):
+    """The module that defines `name`. Code inside the package addresses another module's name as
+    `module.name`, so patching the owner reaches every caller; patching the package would reach none.
+    Each name is defined in exactly one module and never imported by name into another."""
+    return next(m for m in wz.MODULES if name in vars(m))
 
 # `_keypair_dir` falls back to ~/.cache/wizlab/lease/<lab>, and the lease tests name a REAL lab
 # (te-dev-aws), so a suite run on an operator's box deleted the private key of a live play and still
@@ -162,16 +165,16 @@ def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches)
     with contextlib.ExitStack() as st:
         if wiz is not None:
             env = {**(os.environ if env is None else env), **FakeWiz.ENV}
-            st.enter_context(mock.patch.object(wz, "_post", wiz))
+            st.enter_context(mock.patch.object(_owner("_post"), "_post", wiz))
         if env is not None:
             st.enter_context(mock.patch.dict(wz.os.environ, env, clear=True))
         for name, value in patches.items():
             if isinstance(value, mock.Mock):
-                st.enter_context(mock.patch.object(wz, name, value))
+                st.enter_context(mock.patch.object(_owner(name), name, value))
             elif callable(value):
-                st.enter_context(mock.patch.object(wz, name, side_effect=value))
+                st.enter_context(mock.patch.object(_owner(name), name, side_effect=value))
             else:
-                st.enter_context(mock.patch.object(wz, name, return_value=value))
+                st.enter_context(mock.patch.object(_owner(name), name, return_value=value))
         st.enter_context(contextlib.redirect_stdout(io.StringIO() if out is None else out))
         st.enter_context(contextlib.redirect_stderr(io.StringIO() if err is None else err))
         with exits() as ended:
@@ -559,7 +562,7 @@ class CliHelper(unittest.TestCase):
 
     def test_aws_gcp_az_delegate_to_cli(self):
         proc = _proc(0, "ok")
-        with mock.patch.object(wz, "_cli", return_value=proc) as cli:
+        with mock.patch.object(_owner("_cli"), "_cli", return_value=proc) as cli:
             wz._aws("sts", "get-caller-identity")
             wz._gcp("auth", "list")
             wz._az("account", "show")
@@ -645,7 +648,7 @@ class ExitCodeContract(unittest.TestCase):
 
     def test_every_verb_declares_its_flags_and_every_flag_read_is_declared(self):
         self.assertEqual(set(wz.FLAGS), set(wz.VERBS))
-        src = pathlib.Path(wz.__file__).read_text()
+        src = "".join(pathlib.Path(m.__file__).read_text() for m in wz.MODULES)
         read = {a or b for a, b in re.findall(r'_flag\(args, "(--[a-z-]+)"\)|"(--[a-z-]+)" in args', src)}
         declared = set().union(*wz.FLAGS.values())
         self.assertEqual(read - declared, set())
@@ -682,7 +685,8 @@ class ExitCodeContract(unittest.TestCase):
 
     def test_an_expiring_token_is_reminted(self):
         wiz, clock = FakeWiz(), {"t": 1000.0}
-        with mock.patch.object(wz, "_post", wiz), mock.patch.dict(wz.os.environ, FakeWiz.ENV, clear=True), \
+        with mock.patch.object(_owner("_post"), "_post", wiz), \
+             mock.patch.dict(wz.os.environ, FakeWiz.ENV, clear=True), \
              mock.patch.object(wz.time, "time", lambda: clock["t"]):
             wz._TOKENS.clear()
             wz.token_and_dc()
@@ -699,8 +703,8 @@ class RoleInspectGrading(unittest.TestCase):
     TID = "6ca852a0-af83-4f2d-9da9-f2f3bd1d23a3"
 
     def _run(self, aws_proc, delegator=DELEGATOR, tid=TID):
-        with mock.patch.object(wz, "_aws", return_value=aws_proc), \
-             mock.patch.object(wz, "_wiz_delegator", return_value=(delegator, tid)), \
+        with mock.patch.object(_owner("_aws"), "_aws", return_value=aws_proc), \
+             mock.patch.object(_owner("_wiz_delegator"), "_wiz_delegator", return_value=(delegator, tid)), \
              exits() as cm:
             wz.cmd_role_inspect([])
         return cm.code
@@ -790,14 +794,14 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             {"id": "e", "enabled": True, "status": "ERROR", "type": {"id": "aws"}, "config": {}},
             {"id": "c", "enabled": True, "status": "CONNECTED", "type": {"id": "aws"}, "config": {}},
         ]
-        with mock.patch.object(wz, "api", side_effect=self._api(nodes)):
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(nodes)):
             self.assertEqual(wz.find_connector("111111111111")[0]["status"], "CONNECTED")
 
     def test_find_connector_by_type_fallback_when_no_parent(self):
         find = [{"id": "builtin", "type": {"id": "self-hosted"}, "config": {}}]  # no aws parent yet
         bytype = [{"id": "a", "enabled": True, "status": "CONNECTED", "type": {"id": "aws"},
                    "config": {"customerRoleARN": "arn:aws:iam::111111111111:role/WizAccess-Role"}}]
-        with mock.patch.object(wz, "api", side_effect=self._api(find, bytype)):
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(find, bytype)):
             self.assertEqual([n["id"] for n in wz.find_connector("111111111111")], ["a"])
 
     HANDLER: typing.ClassVar = {"list": "reports", "filter": "search", "delete": "deleteReport",
@@ -805,8 +809,8 @@ class ConnectorAndReaperSafety(unittest.TestCase):
 
     def test_reap_one_refuses_ambiguous_match(self):
         # Shared-tenant safety: >1 name match must skip, never delete — even with --commit.
-        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
-             mock.patch.object(wz, "_reap_find", return_value=(None, 2, None)):
+        with mock.patch.object(_owner("_reap_handler"), "_reap_handler", return_value=self.HANDLER), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", return_value=(None, 2, None)):
             outcome, review = wz._reap_one("tok", "dc", "CreateServiceAccount", "lab-s1-sa", True)
         self.assertEqual(outcome, wz.FAILED)  # the resource is still there
         self.assertIn("matched 2", review)
@@ -814,15 +818,15 @@ class ConnectorAndReaperSafety(unittest.TestCase):
     def test_reap_one_treats_an_already_gone_resource_as_absent(self):
         # The reap window overlaps by design, so a second pass over a reaped session finds the audit
         # Create with no resource behind it. That must not need review, and must not keep the user.
-        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
-             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+        with mock.patch.object(_owner("_reap_handler"), "_reap_handler", return_value=self.HANDLER), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", return_value=(None, 0, None)):
             self.assertEqual(wz._reap_one("tok", "dc", "CreateReport", "lab-s1-r", True), (wz.ABSENT, None))
 
     def test_an_unhandled_type_is_unknown_and_does_not_block(self):
         # Handler coverage is partial by construction: the generic plural+search handler misses most
         # create types, so blocking a miss would fail every reap and retain every user.
-        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
-             mock.patch.object(wz, "_reap_find", return_value=(None, None, "no such field")):
+        with mock.patch.object(_owner("_reap_handler"), "_reap_handler", return_value=self.HANDLER), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", return_value=(None, None, "no such field")):
             outcome, review = wz._reap_one("tok", "dc", "CreateWidget", "lab-s1-w", True)
         self.assertEqual(outcome, wz.UNKNOWN)
         self.assertIn("no handler", review)
@@ -848,8 +852,8 @@ class ConnectorAndReaperSafety(unittest.TestCase):
                 return {"deployments": {"nodes": [{"id": "dep1", "name": "lab-s1-cli"}]}}, None
             return {}, None
 
-        with mock.patch.object(wz, "_gql", side_effect=_gql), \
-             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+        with mock.patch.object(_owner("_gql"), "_gql", side_effect=_gql), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", return_value=(None, 0, None)):
             outcome, detail = wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", name)
         self.assertEqual((outcome, detail), (wz.REMOVED, None))
         self.assertTrue(any("deleteCliDeployment" in q for q in sent))
@@ -857,7 +861,8 @@ class ConnectorAndReaperSafety(unittest.TestCase):
 
     def test_a_non_cli_service_account_still_takes_the_uniform_delete(self):
         # The sensor account comes from createServiceAccount and is deletable directly.
-        with mock.patch.object(wz, "_reap_delete_uniform", return_value=(wz.REMOVED, None)) as uni:
+        with mock.patch.object(_owner("_reap_delete_uniform"), "_reap_delete_uniform",
+                               return_value=(wz.REMOVED, None)) as uni:
             wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", "lab-s1-sensor")
         uni.assert_called_once()
 
@@ -865,14 +870,14 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         # Nothing left can delete the record, so blocking would retain the user with no pass able to
         # clear it.
         name = "lab-s1-cli-deployment-26dc83b5-503a-4725-a087-0764b1ef671d"
-        with mock.patch.object(wz, "_gql", return_value=({"deployments": {"nodes": []}}, None)):
+        with mock.patch.object(_owner("_gql"), "_gql", return_value=({"deployments": {"nodes": []}}, None)):
             outcome, detail = wz._reap_service_account("tok", "dc", self.SA_HANDLER, "sa1", name)
         self.assertEqual(outcome, wz.UNKNOWN)
         self.assertIn("lab-s1-cli", detail)
         self.assertNotIn(wz.UNKNOWN, wz._REAP_BLOCKING)
 
     def test_reap_enumeration_surfaces_graphql_errors(self):
-        with mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
+        with mock.patch.object(_owner("_gql"), "_gql", return_value=({}, [{"message": "denied"}])):
             actions, alert = wz._reap_enumerate("tok", "dc", "lab-s1@example.com", 60)
         self.assertEqual(actions, [])
         self.assertIn("denied", alert)
@@ -881,19 +886,19 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         """cmd_reap over one audit outcome, with the sweep stubbed out. Returns the exit code."""
         one = (outcome_or_actions, "review") if isinstance(outcome_or_actions, str) else None
         actions = [("CreateWidget", "lab-s1-w")] if one else []
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "_reap_enumerate", return_value=(actions, None)), \
-             mock.patch.object(wz, "_reap_one", return_value=one), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=sweep or wz.Counter()), \
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(_owner("_reap_enumerate"), "_reap_enumerate", return_value=(actions, None)), \
+             mock.patch.object(_owner("_reap_one"), "_reap_one", return_value=one), \
+             mock.patch.object(_owner("_reap_sweep_type"), "_reap_sweep_type", return_value=sweep or wz.Counter()), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
             wz.cmd_reap(["--session", "s1", "--commit"])
         return cm.code
 
     def test_committed_reap_exits_3_when_enumeration_is_incomplete(self):
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "_reap_enumerate", return_value=([], "denied")), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=wz.Counter()), \
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(_owner("_reap_enumerate"), "_reap_enumerate", return_value=([], "denied")), \
+             mock.patch.object(_owner("_reap_sweep_type"), "_reap_sweep_type", return_value=wz.Counter()), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
             wz.cmd_reap(["--session", "s1", "--commit"])
@@ -910,9 +915,9 @@ class ConnectorAndReaperSafety(unittest.TestCase):
 
     def test_reap_one_reports_failed_when_delete_does_not_remove_resource(self):
         found = [("id1", 1, None), ("id1", 1, None)]
-        with mock.patch.object(wz, "_reap_handler", return_value=self.HANDLER), \
-             mock.patch.object(wz, "_reap_find", side_effect=found), \
-             mock.patch.object(wz, "_gql", return_value=({}, [{"message": "denied"}])):
+        with mock.patch.object(_owner("_reap_handler"), "_reap_handler", return_value=self.HANDLER), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", side_effect=found), \
+             mock.patch.object(_owner("_gql"), "_gql", return_value=({}, [{"message": "denied"}])):
             outcome, review = wz._reap_one("tok", "dc", "CreateReport", "lab-s1-report", True)
         self.assertEqual(outcome, wz.FAILED)
         self.assertIn("denied", review)
@@ -925,8 +930,8 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             sent.append((query, variables))
             return {}, []
 
-        with mock.patch.object(wz, "_gql", gql), \
-             mock.patch.object(wz, "_reap_find", return_value=(None, 0, None)):
+        with mock.patch.object(_owner("_gql"), "_gql", gql), \
+             mock.patch.object(_owner("_reap_find"), "_reap_find", return_value=(None, 0, None)):
             outcome, _ = wz._reap_delete_uniform("tok", "dc", self.HANDLER, hostile, "lab-s1-report")
         self.assertEqual(outcome, wz.REMOVED)
         (query, variables), = sent
@@ -938,10 +943,11 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         actions = [("CreateReport", "lab-s1-r"), ("CreateReport", "Q3 report"), ("CreateReport", "old")]
         outcomes = [(wz.REMOVED, None), (wz.REMOVED, None), (wz.ABSENT, None)]
         err = io.StringIO()
-        with mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "_reap_enumerate", return_value=(actions, None)), \
-             mock.patch.object(wz, "_reap_one", side_effect=outcomes), \
-             mock.patch.object(wz, "_reap_sweep_type", return_value=wz.Counter({wz.REMOVED: 1})), \
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(_owner("_reap_enumerate"), "_reap_enumerate", return_value=(actions, None)), \
+             mock.patch.object(_owner("_reap_one"), "_reap_one", side_effect=outcomes), \
+             mock.patch.object(_owner("_reap_sweep_type"), "_reap_sweep_type",
+                               return_value=wz.Counter({wz.REMOVED: 1})), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
              exits() as cm:
             wz.cmd_reap(["--session", "s1", "--commit"])
@@ -961,7 +967,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             sent.append("delete" if query is wz.DELETE_OUTPOST else "uninstall")
             return {}, ([{"message": delete_err}] if delete_err else [])
 
-        with mock.patch.object(wz, "_gql", gql):
+        with mock.patch.object(_owner("_gql"), "_gql", gql):
             outcome, detail = wz._reap_outpost("tok", "dc", None, "o1", "lab-s1")
         return outcome, detail, sent
 
@@ -998,8 +1004,8 @@ class ConnectorAndReaperSafety(unittest.TestCase):
     def test_kc_session_bundles_setup_in_field_order(self):
         # The three user verbs unpack this positionally, so field ORDER is the contract: a swap of
         # token/email would silently send the token as the lookup key.
-        with mock.patch.object(wz, "_kc_env", return_value=("http://kc", "realm", "admin", "pw")), \
-             mock.patch.object(wz, "_kc_token", return_value="tok"):
+        with mock.patch.object(_owner("_kc_env"), "_kc_env", return_value=("http://kc", "realm", "admin", "pw")), \
+             mock.patch.object(_owner("_kc_token"), "_kc_token", return_value="tok"):
             s = wz._kc_session(["--session", "s1"])
         self.assertEqual((s.endpoint, s.realm, s.token), ("http://kc", "realm", "tok"))
         self.assertEqual((s.email, s.name), ("lab-s1@titra-labs.ai", "lab-s1"))
@@ -1034,7 +1040,7 @@ class Pagination(unittest.TestCase):
     def test_an_exact_match_past_the_first_page_is_found(self):
         page1 = [{"id": str(i), "name": f"lab-s1-sensor-{i}"} for i in range(50)]
         side = self._pages("serviceAccounts", page1, [{"id": "sa", "name": "lab-s1-sensor"}])
-        with mock.patch.object(wz, "api", side_effect=side):
+        with mock.patch.object(_owner("api"), "api", side_effect=side):
             self.assertEqual(wz._find_sa("lab-s1-sensor")["id"], "sa")
         self.assertEqual(side.seen, [None, "c0"])
 
@@ -1042,7 +1048,7 @@ class Pagination(unittest.TestCase):
         # Before paging, `live[1:]` was computed on one page and a duplicate on the next survived.
         live = [{"id": "w1", "name": "lab-x", "enabled": True}], [{"id": "w2", "name": "lab-x", "enabled": False}]
         side = self._pages("automationWorkflows", *live)
-        with mock.patch.object(wz, "api", side_effect=side):
+        with mock.patch.object(_owner("api"), "api", side_effect=side):
             hits = wz._resolve_workflows("lab-x", exact=True)
         self.assertEqual([h["id"] for h in hits], ["w1", "w2"])
 
@@ -1052,14 +1058,14 @@ class Pagination(unittest.TestCase):
         def side(query, variables):
             return {"cicdScanPolicies": {"nodes": [{"id": "p", "name": "other"}],
                                          "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, "tid"
-        with mock.patch.object(wz, "api", side_effect=side), exits() as cm:
+        with mock.patch.object(_owner("api"), "api", side_effect=side), exits() as cm:
             wz._find_policy("fixture")
         self.assertEqual(cm.code, 3)
 
     def test_has_next_page_without_a_cursor_is_environment_3(self):
         def side(query, variables):
             return {"outposts": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}}, "tid"
-        with mock.patch.object(wz, "api", side_effect=side), exits() as cm:
+        with mock.patch.object(_owner("api"), "api", side_effect=side), exits() as cm:
             wz._resolve_outpost("lab-s1")
         self.assertEqual(cm.code, 3)
 
@@ -1067,13 +1073,13 @@ class Pagination(unittest.TestCase):
         def side(query, variables):
             n = int(variables.get("after") or 0)
             return {"sensors": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": str(n + 1)}}}, "tid"
-        with mock.patch.object(wz, "api", side_effect=side) as api, exits() as cm:
+        with mock.patch.object(_owner("api"), "api", side_effect=side) as api, exits() as cm:
             wz._resolve_sensor("lab-s1")
         self.assertEqual(cm.code, 3)
         self.assertEqual(api.call_count, wz._PAGE_CAP)
 
     def test_a_response_without_page_info_is_one_complete_page(self):
-        with mock.patch.object(wz, "api", return_value=({"serviceAccounts": {"nodes": []}}, "tid")) as api:
+        with mock.patch.object(_owner("api"), "api", return_value=({"serviceAccounts": {"nodes": []}}, "tid")) as api:
             self.assertIsNone(wz._find_sa("lab-s1-sensor"))
         api.assert_called_once()
 
@@ -1091,7 +1097,7 @@ class Pagination(unittest.TestCase):
         page1 = [{"id": str(i), "name": f"lab-s1-{i}"} for i in range(100)]
         page2 = [{"id": f"x{i}", "name": f"lab-s1-x{i}"} for i in range(3)]
         gql, side = self._gql_pages(page1, page2)
-        with mock.patch.object(wz, "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(_owner("_gql"), "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
             tally = wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", False)
         self.assertEqual(tally, wz.Counter({wz.REMOVED: 103}))
         self.assertEqual(side.seen, [None, "c0"])
@@ -1102,13 +1108,13 @@ class Pagination(unittest.TestCase):
                 self.fail("a delete was issued from a partial list")
             return {"reports": {"nodes": [{"id": "r", "name": "lab-s1-r"}],
                                 "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, []
-        with mock.patch.object(wz, "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(_owner("_gql"), "_gql", side_effect=gql), contextlib.redirect_stdout(io.StringIO()):
             tally = wz._reap_sweep_type("tok", "dc", "Report", "lab-s1", True)
         self.assertEqual(tally, wz.Counter({wz.FAILED: 1}))
 
     def test_the_exact_one_guard_counts_across_pages(self):
         gql, _ = self._gql_pages([{"id": "a", "name": "lab-s1-r"}], [{"id": "b", "name": "lab-s1-r"}])
-        with mock.patch.object(wz, "_gql", side_effect=gql):
+        with mock.patch.object(_owner("_gql"), "_gql", side_effect=gql):
             rid, count, err = wz._reap_find("tok", "dc", self.HANDLER, "lab-s1-r")
         self.assertEqual((rid, count, err), (None, 2, None))
 
@@ -1116,7 +1122,7 @@ class Pagination(unittest.TestCase):
         def gql(tok, dc, q, v=None):
             n = int((v or {}).get("after") or 0)
             return {"auditLogEntries": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": str(n + 1)}}}, []
-        with mock.patch.object(wz, "_gql", side_effect=gql):
+        with mock.patch.object(_owner("_gql"), "_gql", side_effect=gql):
             actions, alert = wz._reap_enumerate("tok", "dc", "lab-s1@example.com", 60)
         self.assertEqual(actions, [])
         self.assertIn(f"more than {wz._PAGE_CAP} pages", alert)
@@ -1131,7 +1137,7 @@ class Pagination(unittest.TestCase):
             return {"auditLogEntries": {"nodes": [entry],
                                         "pageInfo": {"hasNextPage": True, "endCursor": "same"}}}, "tid"
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(wz, "api", side_effect=side), contextlib.redirect_stdout(out), \
+        with mock.patch.object(_owner("api"), "api", side_effect=side), contextlib.redirect_stdout(out), \
              contextlib.redirect_stderr(err), exits() as cm:
             wz.cmd_audit_user(["--match", "lab-s1"])
         self.assertEqual(cm.code, 3)
@@ -1155,28 +1161,28 @@ class CloudSelection(unittest.TestCase):
         self.assertEqual(cm.code, 2)
 
     def test_gcp_connector_found_only_when_cloud_is_gcp(self):
-        with mock.patch.object(wz, "api", return_value=({"connectors": {"nodes": [self.GCP_NODE]}}, "tid")):
+        with mock.patch.object(_owner("api"), "api", return_value=({"connectors": {"nodes": [self.GCP_NODE]}}, "tid")):
             self.assertEqual([n["id"] for n in wz.find_connector("wiz-lab-42", "gcp")], ["g"])
             self.assertEqual(wz.find_connector("wiz-lab-42", "aws"), [])  # the old bug, locked down
 
     def test_gcp_inspect_healthy_exit_0(self):
-        with mock.patch.object(wz, "find_connector", return_value=[self.GCP_NODE]), \
+        with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[self.GCP_NODE]), \
              exits() as cm:
             wz.cmd_connector_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--require", "healthy"])
         self.assertEqual(cm.code, 0)
 
     def test_gcp_ensure_is_create_if_absent_never_patch(self):
         # No customerRoleARN equivalent to drift, so an existing connector is a no-op, not an update.
-        with mock.patch.object(wz, "find_connector", return_value=[self.GCP_NODE]), \
-             mock.patch.object(wz, "api") as api, exits() as cm:
+        with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[self.GCP_NODE]), \
+             mock.patch.object(_owner("api"), "api") as api, exits() as cm:
             wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
         self.assertEqual(cm.code, 0)
         api.assert_not_called()
 
     def test_gcp_create_payload_is_managed_identity_with_empty_scopes(self):
         created = {"createConnector": {"connector": {"id": "n", "name": "lab-s1-connector", "status": "INITIAL"}}}
-        with mock.patch.object(wz, "find_connector", return_value=[]), \
-             mock.patch.object(wz, "api", return_value=(created, "tid")) as api, \
+        with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[]), \
+             mock.patch.object(_owner("api"), "api", return_value=(created, "tid")) as api, \
              exits() as cm:
             wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--session", "s1"])
         self.assertEqual(cm.code, 0)
@@ -1206,8 +1212,8 @@ class TransientGraphqlErrors(unittest.TestCase):
         boom = {"errors": [{"message": "Internal server error"}], "data": None}
         ok = {"data": {"connectors": {"totalCount": 1}}}
         post = self._post_returning(boom, boom, ok)
-        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
-             mock.patch.object(wz, "_post", post), mock.patch.object(wz.time, "sleep"):
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(_owner("_post"), "_post", post), mock.patch.object(wz.time, "sleep"):
             data, _ = wz.api("query Q { connectors { totalCount } }", {})
         self.assertEqual(data["connectors"]["totalCount"], 1)
         self.assertEqual(post.call_count, 3)
@@ -1216,8 +1222,8 @@ class TransientGraphqlErrors(unittest.TestCase):
         # It may have applied; retrying could create a second connector.
         boom = {"errors": [{"message": "Internal server error"}], "data": None}
         post = self._post_returning(boom, boom, boom)
-        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
-             mock.patch.object(wz, "_post", post), mock.patch.object(wz.time, "sleep"), \
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(_owner("_post"), "_post", post), mock.patch.object(wz.time, "sleep"), \
              exits() as cm:
             wz.api("mutation M { createConnector { id } }", {})
         self.assertEqual(cm.code, 3)
@@ -1226,8 +1232,8 @@ class TransientGraphqlErrors(unittest.TestCase):
     def test_a_real_error_is_not_retried(self):
         bad = {"errors": [{"message": "Resource not found"}], "data": None}
         post = self._post_returning(bad, bad, bad)
-        with mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")), \
-             mock.patch.object(wz, "_post", post), exits() as cm:
+        with mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("t", "dc", "tid")), \
+             mock.patch.object(_owner("_post"), "_post", post), exits() as cm:
             wz.api("query Q { x }", {})
         self.assertEqual(cm.code, 3)
         self.assertEqual(post.call_count, 1)
@@ -1240,7 +1246,7 @@ class MutationSubmissionBudget(unittest.TestCase):
 
     def setUp(self):
         self.enterContext(mock.patch.object(wz.time, "sleep"))
-        self.enterContext(mock.patch.object(wz, "token_and_dc", return_value=("t", "dc", "tid")))
+        self.enterContext(mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("t", "dc", "tid")))
 
     def _sends(self, fn, *args, side_effect=None, body=None):
         """Returns (exit_code, submissions, message)."""
@@ -1319,32 +1325,32 @@ class ConnectorLookupLayers(unittest.TestCase):
     def test_name_search_covers_the_pre_link_window(self):
         # Nothing linked yet, but the stem finds it — and BY_TYPE is never consulted.
         api = mock.MagicMock(side_effect=self._api(find=[], search=[self.GCP]))
-        with mock.patch.object(wz, "api", api):
+        with mock.patch.object(_owner("api"), "api", api):
             self.assertEqual([n["id"] for n in wz.find_connector("proj-1", "gcp", "lab-s1")], ["g"])
         self.assertNotIn(wz.BY_TYPE, [c[0][0] for c in api.call_args_list])
 
     def test_search_result_must_still_target_the_account(self):
         # A same-stem connector for a DIFFERENT project is not this lab's connector.
         other = {**self.GCP, "config": {"projectId": "proj-2"}}
-        with mock.patch.object(wz, "api", side_effect=self._api(search=[other], total=1)):
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(search=[other], total=1)):
             self.assertEqual(wz.find_connector("proj-1", "gcp", "lab-s1"), [])
 
     def test_search_ignores_child_deployments(self):
         child = {"id": "c", "name": "GAR in lab-s1-connector", "enabled": True, "status": "CONNECTED",
                  "type": {"id": "gar"}, "config": {"projectId": "proj-1"}}
-        with mock.patch.object(wz, "api", side_effect=self._api(search=[child, self.GCP])):
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(search=[child, self.GCP])):
             self.assertEqual([n["id"] for n in wz.find_connector("proj-1", "gcp", "lab-s1")], ["g"])
 
     def test_beyond_the_page_is_environment_3_not_learner_1(self):
         # Past BY_TYPE_PAGE, "no match" stops meaning "absent". Reporting 1 would tell a learner they
         # did nothing; it would also let `ensure` create a duplicate of a connector it cannot see.
-        with mock.patch.object(wz, "api", side_effect=self._api(total=wz.BY_TYPE_PAGE + 1)), \
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(total=wz.BY_TYPE_PAGE + 1)), \
              exits() as cm:
             wz.find_connector("proj-1", "gcp", None)
         self.assertEqual(cm.code, 3)
 
     def test_within_the_page_absence_is_still_learner_state(self):
-        with mock.patch.object(wz, "api", side_effect=self._api(total=wz.BY_TYPE_PAGE)):
+        with mock.patch.object(_owner("api"), "api", side_effect=self._api(total=wz.BY_TYPE_PAGE)):
             self.assertEqual(wz.find_connector("proj-1", "gcp", None), [])
 
     def test_stem_is_optional_and_never_dies(self):
@@ -1370,8 +1376,8 @@ class AzureConnector(unittest.TestCase):
 
     def test_ensure_payload_is_managed_identity_with_subscription_and_tenant(self):
         created = {"createConnector": {"connector": {"id": "n", "name": "lab-s1-connector", "status": "INITIAL"}}}
-        with mock.patch.object(wz, "find_connector", return_value=[]), \
-             mock.patch.object(wz, "api", return_value=(created, "tid")) as api, \
+        with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[]), \
+             mock.patch.object(_owner("api"), "api", return_value=(created, "tid")) as api, \
              exits() as cm:
             wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", self.SUB,
                                      "--tenant-id", "dir-1", "--session", "s1"])
@@ -1392,7 +1398,7 @@ class AzureRoleInspect(unittest.TestCase):
 
     def _run(self, proc, argv=None, env=None):
         env = {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID} if env is None else env
-        with mock.patch.object(wz, "_az", return_value=proc) as az, \
+        with mock.patch.object(_owner("_az"), "_az", return_value=proc) as az, \
              mock.patch.dict(wz.os.environ, env, clear=True), \
              exits() as cm:
             wz.cmd_role_inspect(argv if argv is not None else self.DEFAULT_ARGV)
@@ -1429,7 +1435,7 @@ class AzureRoleInspect(unittest.TestCase):
 
 class WizTenantFacts(unittest.TestCase):
     def _run(self, params, tid="tid-1"):
-        with mock.patch.object(wz, "api", return_value=({"managedIdentityParameters": params}, tid)), \
+        with mock.patch.object(_owner("api"), "api", return_value=({"managedIdentityParameters": params}, tid)), \
              mock.patch.dict(wz.os.environ, {}, clear=True), \
              mock.patch.object(wz.sys, "stdout", io.StringIO()) as out, \
              exits() as cm:
@@ -1454,14 +1460,14 @@ class WizTenantFacts(unittest.TestCase):
 
 class SessionVerifyCsp(unittest.TestCase):
     def _mock_wiz(self):
-        return mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid"))
+        return mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("tok", "dc", "tid"))
 
     def _mock_api(self):
-        return mock.patch.object(wz, "api", return_value=({"connectors": {"totalCount": 0}}, "tid"))
+        return mock.patch.object(_owner("api"), "api", return_value=({"connectors": {"totalCount": 0}}, "tid"))
 
     def test_no_cloud_skips_csp_probe(self):
         with self._mock_wiz(), self._mock_api(), \
-             mock.patch.object(wz, "_aws") as csp, \
+             mock.patch.object(_owner("_aws"), "_aws") as csp, \
              exits() as cm:
             wz.cmd_session_verify([])
         self.assertEqual(cm.code, 0)
@@ -1483,7 +1489,7 @@ class SessionVerifyCsp(unittest.TestCase):
         env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
         with self._mock_wiz(), self._mock_api(), \
              mock.patch.dict(wz.os.environ, env, clear=True), \
-             mock.patch.object(wz, "_aws", return_value=_proc(1, "", "ExpiredToken")), \
+             mock.patch.object(_owner("_aws"), "_aws", return_value=_proc(1, "", "ExpiredToken")), \
              exits() as cm:
             wz.cmd_session_verify(["--cloud", "aws"])
         self.assertEqual(cm.code, 3)
@@ -1492,7 +1498,7 @@ class SessionVerifyCsp(unittest.TestCase):
         env = {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
         with self._mock_wiz(), self._mock_api(), \
              mock.patch.dict(wz.os.environ, env, clear=True), \
-             mock.patch.object(wz, "_aws", return_value=_proc(0, '{"Account": "123456789012"}')), \
+             mock.patch.object(_owner("_aws"), "_aws", return_value=_proc(0, '{"Account": "123456789012"}')), \
              exits() as cm:
             wz.cmd_session_verify(["--cloud", "aws"])
         self.assertEqual(cm.code, 0)
@@ -1501,7 +1507,7 @@ class SessionVerifyCsp(unittest.TestCase):
         binary = {"aws": "_aws", "gcp": "_gcp", "azure": "_az"}[cloud]
         with self._mock_wiz(), self._mock_api(), \
              mock.patch.dict(wz.os.environ, env, clear=True), \
-             mock.patch.object(wz, binary, return_value=proc), \
+             mock.patch.object(_owner(binary), binary, return_value=proc), \
              contextlib.redirect_stdout(io.StringIO()), exits() as cm:
             wz.cmd_session_verify(["--cloud", cloud, *args])
         return cm.code
@@ -1544,8 +1550,8 @@ class GcpRoleInspect(unittest.TestCase):
         return json.dumps({"bindings": [{"role": r, "members": [member]} for r in roles]})
 
     def _run(self, proc, sa=SA):
-        with mock.patch.object(wz, "_gcp", return_value=proc), \
-             mock.patch.object(wz, "_wiz_gcp_sa", return_value=sa), \
+        with mock.patch.object(_owner("_gcp"), "_gcp", return_value=proc), \
+             mock.patch.object(_owner("_wiz_gcp_sa"), "_wiz_gcp_sa", return_value=sa), \
              exits() as cm:
             wz.cmd_role_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
         return cm.code
@@ -1894,7 +1900,7 @@ class OutpostConnectorBinding(unittest.TestCase):
                                     self._node({"id": "o1", "name": "lab-x"}), {"id": "o1"}), 0)
 
     def test_explicit_outpost_id_needs_no_name_lookup(self):
-        with mock.patch.object(wz, "_resolve_outpost") as resolve:
+        with mock.patch.object(_owner("_resolve_outpost"), "_resolve_outpost") as resolve:
             self.assertEqual(self._exit(wz.cmd_connector_inspect,
                                         [*self.ARGS, "--outpost-id", "o1"],
                                         self._node({"id": "o1", "name": "lab-x"})), 0)
@@ -1953,9 +1959,9 @@ class OutpostConnectorBinding(unittest.TestCase):
                                     outposts=None), 3)
 
     def test_ensure_is_a_no_op_when_already_bound_to_that_outpost(self):
-        with mock.patch.object(wz, "find_connector",
+        with mock.patch.object(_owner("find_connector"), "find_connector",
                                return_value=[self._node({"id": "o1", "name": "lab-x"})]), \
-             mock.patch.object(wz, "api") as api, exits() as cm:
+             mock.patch.object(_owner("api"), "api") as api, exits() as cm:
             wz.cmd_connector_ensure(["--account-id", "111111111111", "--outpost-id", "o1",
                                      "--scanner-role-arn", "arn:s", "--role-arn",
                                      "arn:aws:iam::111111111111:role/WizAccess-Role"])
@@ -2164,7 +2170,7 @@ class LeaseDevAccess(unittest.TestCase):
             self.assertEqual(self._exit(wz.cmd_lease_verify, ["--no-self"]), 3)
 
     def test_inspect_not_yet_joined_is_1_not_3(self):
-        with mock.patch.object(wz, "_fresh_nodes", return_value=[]):
+        with mock.patch.object(_owner("_fresh_nodes"), "_fresh_nodes", return_value=[]):
             self.assertEqual(self._exit(wz.cmd_lease_inspect, ["--lab", "te-dev-aws", "--session", "s1"]), 1)
 
     def test_reachable_means_usable_ssh_not_a_fresh_node(self):
@@ -2189,7 +2195,7 @@ class LeaseDevAccess(unittest.TestCase):
         # Two live graders on one substring: the freshest is another play's node as often as ours.
         two = [(5.0, "100.64.0.7", "awsconn101-aaa"), (9.0, "100.64.0.8", "awsconn101-bbb")]
         err = io.StringIO()
-        with mock.patch.object(wz, "_fresh_nodes", return_value=two), \
+        with mock.patch.object(_owner("_fresh_nodes"), "_fresh_nodes", return_value=two), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
              exits() as cm:
             wz.cmd_lease_inspect(["--lab", "te-dev-aws", "--hostname", "awsconn101-"])
@@ -2203,7 +2209,7 @@ class LeaseDevAccess(unittest.TestCase):
         old = (wz.datetime.datetime.now(wz.datetime.UTC)
                - wz.datetime.timedelta(seconds=wz._NODE_FRESH_S + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         devices = {"devices": [{"hostname": "grader-aws-s1", "addresses": ["100.64.0.7"], "lastSeen": old}]}
-        with mock.patch.object(wz, "_ts", return_value=devices):
+        with mock.patch.object(_owner("_ts"), "_ts", return_value=devices):
             self.assertEqual(wz._fresh_nodes("s1"), [])
 
     @staticmethod
@@ -2220,9 +2226,10 @@ class LeaseDevAccess(unittest.TestCase):
     def _ensure(self, ts, iq, args, keypair=("/tmp/k/id_ed25519", "ssh-ed25519 AAAAPUB test"),
                 joined="joined"):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(wz, "_ts", ts), mock.patch.object(wz, "_iq", iq), \
-             mock.patch.object(wz, "_mint_keypair", return_value=(wz.pathlib.Path(keypair[0]), keypair[1])), \
-             mock.patch.object(wz, "_self_join", return_value=joined), \
+        with mock.patch.object(_owner("_ts"), "_ts", ts), mock.patch.object(_owner("_iq"), "_iq", iq), \
+             mock.patch.object(_owner("_mint_keypair"), "_mint_keypair",
+                               return_value=(wz.pathlib.Path(keypair[0]), keypair[1])), \
+             mock.patch.object(_owner("_self_join"), "_self_join", return_value=joined), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
              exits() as cm:
             wz.cmd_lease_ensure(args)
@@ -2249,9 +2256,9 @@ class LeaseDevAccess(unittest.TestCase):
         sent = []
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
-             mock.patch.object(wz, "_ts", self._ts_stub([], [])), \
-             mock.patch.object(wz, "_self_join", return_value="joined"), \
-             mock.patch.object(wz, "_iq", lambda q, v, **k: sent.append(v) or {}), \
+             mock.patch.object(_owner("_ts"), "_ts", self._ts_stub([], [])), \
+             mock.patch.object(_owner("_self_join"), "_self_join", return_value="joined"), \
+             mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: sent.append(v) or {}), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits():
             wz.cmd_lease_ensure(["--lab", "te-dev-aws"])
@@ -2281,8 +2288,8 @@ class LeaseDevAccess(unittest.TestCase):
                 order.append("revoke")
             return {"keys": [{"id": "kNEW", "description": "dev-te-dev-aws-cccccccc"}]}
 
-        with mock.patch.object(wz, "_ts", ts), \
-             mock.patch.object(wz, "_iq", lambda q, v, **k: order.append(v["n"]) or {}):
+        with mock.patch.object(_owner("_ts"), "_ts", ts), \
+             mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: order.append(v["n"]) or {}):
             self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
         self.assertEqual(order, ["revoke", "TS_AUTHKEY_DEV_AWS", "TE_DEV_SSH_PUBKEY_DEV_AWS"])
 
@@ -2301,8 +2308,8 @@ class LeaseDevAccess(unittest.TestCase):
                 {"id": "kB", "description": "dev-te-dev-aws-dddddddd"},
                 {"id": "kEXTRA", "description": "dev-te-dev-aws-extra-bbbbbbbb"}]
         revoked = []
-        with mock.patch.object(wz, "_ts", self._ts_stub(keys, revoked)), \
-             mock.patch.object(wz, "_iq", lambda q, v, **k: {}):
+        with mock.patch.object(_owner("_ts"), "_ts", self._ts_stub(keys, revoked)), \
+             mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: {}):
             self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
         self.assertEqual(revoked, ["kA", "kB"])  # leaving one live leaves a way onto the tailnet
 
@@ -2313,8 +2320,8 @@ class LeaseDevAccess(unittest.TestCase):
             priv.write_text("PRIVATE")
             priv.with_suffix(".pub").write_text("PUB")
             with mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
-                 mock.patch.object(wz, "_ts", return_value={"keys": []}), \
-                 mock.patch.object(wz, "_iq", lambda q, v, **k: {}):
+                 mock.patch.object(_owner("_ts"), "_ts", return_value={"keys": []}), \
+                 mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: {}):
                 self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
             self.assertFalse(priv.exists())
             self.assertFalse(priv.with_suffix(".pub").exists())
@@ -2361,7 +2368,7 @@ class LeaseDevAccess(unittest.TestCase):
     def _join(self, state, proc, key="tskey-auth-SUPERSECRET"):
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
-             mock.patch.object(wz, "_backend_state", return_value=state), \
+             mock.patch.object(_owner("_backend_state"), "_backend_state", return_value=state), \
              mock.patch.object(wz.subprocess, "run", return_value=proc) as run:
             msg = wz._self_join(["--lab", "te-dev-aws"], key)
             argv = run.call_args[0][0] if run.call_args else []
@@ -2415,9 +2422,9 @@ class LeaseDevAccess(unittest.TestCase):
         # A revoked-but-present token passes every local check and then fails at mint, burning a play.
         calls = []
         with mock.patch.dict(wz.os.environ, {"TAILSCALE_API_KEY": "x", "INSTRUQT_API": "y"}), \
-             mock.patch.object(wz, "_ts", lambda m, p, b=None: calls.append(("ts", p)) or {"keys": []}), \
-             mock.patch.object(wz, "_iq", lambda q, v, **k: calls.append(("iq", None)) or {}), \
-             mock.patch.object(wz, "_self_on_tailnet", lambda: None), \
+             mock.patch.object(_owner("_ts"), "_ts", lambda m, p, b=None: calls.append(("ts", p)) or {"keys": []}), \
+             mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: calls.append(("iq", None)) or {}), \
+             mock.patch.object(_owner("_self_on_tailnet"), "_self_on_tailnet", lambda: None), \
              contextlib.redirect_stdout(io.StringIO()), exits() as cm:
             wz.cmd_lease_verify([])
         self.assertEqual(cm.code, 0)
@@ -2428,7 +2435,7 @@ class LeaseDevAccess(unittest.TestCase):
         def dead_ts(m, p, b=None):
             wz.die(3, "tailscale: 401")
         with mock.patch.dict(wz.os.environ, {"TAILSCALE_API_KEY": "revoked", "INSTRUQT_API": "y"}), \
-             mock.patch.object(wz, "_ts", dead_ts), \
+             mock.patch.object(_owner("_ts"), "_ts", dead_ts), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
             wz.cmd_lease_verify([])
@@ -2441,13 +2448,13 @@ class LeaseDevAccess(unittest.TestCase):
         token = {"id": "kTOKEN", "description": "dev-te-dev-aws-tok", "capabilities": {}}
         authkey = {"id": "kAUTH", "description": "dev-te-dev-aws-aaaa",
                    "capabilities": {"devices": {"create": {"reusable": True}}}}
-        with mock.patch.object(wz, "_ts", lambda m, p, b=None: {"keys": [token, authkey]}):
+        with mock.patch.object(_owner("_ts"), "_ts", lambda m, p, b=None: {"keys": [token, authkey]}):
             self.assertEqual([k["id"] for k in wz._lease_keys()], ["kAUTH"])
 
     def test_a_list_payload_without_capabilities_still_sweeps(self):
         # Capabilities are not always summarized in the list response; dropping such keys would silently
         # strand every prior lease key as an unrevokable orphan.
-        with mock.patch.object(wz, "_ts",
+        with mock.patch.object(_owner("_ts"), "_ts",
                                lambda m, p, b=None: {"keys": [{"id": "kA", "description": "dev-te-dev-aws-a"}]}):
             self.assertEqual([k["id"] for k in wz._lease_keys()], ["kA"])
 
@@ -2460,8 +2467,8 @@ class RunnerFloor(unittest.TestCase):
 
     def _verify(self, args, env):
         with mock.patch.dict(wz.os.environ, env, clear=False), \
-             mock.patch.object(wz, "token_and_dc", return_value=("tok", "dc", "tid")), \
-             mock.patch.object(wz, "api", return_value=({"connectors": {"totalCount": 0}}, "tid")), \
+             mock.patch.object(_owner("token_and_dc"), "token_and_dc", return_value=("tok", "dc", "tid")), \
+             mock.patch.object(_owner("api"), "api", return_value=({"connectors": {"totalCount": 0}}, "tid")), \
              contextlib.redirect_stdout(io.StringIO()) as out, \
              contextlib.redirect_stderr(io.StringIO()) as err, \
              exits() as cm:
@@ -2487,7 +2494,7 @@ class RunnerFloor(unittest.TestCase):
 
     def test_the_floor_is_checked_before_any_credential_is_spent(self):
         with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "v0.1.29"}, clear=False), \
-             mock.patch.object(wz, "token_and_dc") as tok, \
+             mock.patch.object(_owner("token_and_dc"), "token_and_dc") as tok, \
              contextlib.redirect_stderr(io.StringIO()), exits() as cm:
             wz.cmd_session_verify(["--min-runner", "v0.1.33"])
         self.assertEqual(cm.code, 2)

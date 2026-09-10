@@ -15,8 +15,8 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: ruff check .
       # Gate complexity so it can't regress; thresholds pass today (worst functions are C).
-      - run: xenon --max-absolute C --max-average B wizlab/wizlab
-      - run: radon cc wizlab/wizlab -s -a   # report in the log; xenon above is the gate
-      - run: python wizlab/test_wizlab.py
+      - run: xenon --max-absolute C --max-average B wizlab
+      - run: radon cc wizlab -s -a   # report in the log; xenon above is the gate
+      - run: python tests/test_wizlab.py
       - run: python reaper/test_reap_orphans.py
       - run: python test_entrypoint.py

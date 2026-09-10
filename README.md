@@ -46,4 +46,4 @@ which prints the real code on stderr; consume them raw in CI.
 Review backlog, ranked by return on effort: `research/review.md`.
 
 Next action: measure the post-role connector `healthy` enum on a live lease
-(TODO in `wizlab/wizlab`).
+(TODO in `wizlab/connector.py`).

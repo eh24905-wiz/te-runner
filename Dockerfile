@@ -58,7 +58,8 @@ LABEL org.opencontainers.image.version=${TE_RUNNER_TAG} \
       org.opencontainers.image.revision=${TE_RUNNER_REV} \
       org.opencontainers.image.source=https://github.com/eh24905-wiz/te-runner
 
-COPY wizlab/wizlab /usr/local/bin/wizlab
+COPY bin/wizlab /usr/local/bin/wizlab
+COPY wizlab/*.py /usr/local/lib/python3.12/site-packages/wizlab/
 COPY reaper/reap_orphans.py /opt/reaper/reap_orphans.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod 755 /usr/local/bin/wizlab /entrypoint.sh
