@@ -55,12 +55,14 @@ class _Ended:
 
 @contextlib.contextmanager
 def exits():
-    """The suite's one statement of how a handler ends: `.code` is the exit code, and a plain return
-    is 0, which is what main() reports for it. When die() stops raising SystemExit, this is the only
-    place that follows."""
+    """The suite's one statement of how a handler ends: `.code` is what main() would exit with. A
+    WizlabError is reported the way main() reports it, a learner-state sys.exit passes its code through,
+    and a plain return is 0."""
     ended = _Ended()
     try:
         yield ended
+    except wz.WizlabError as e:
+        ended.code = wz._fail(e)
     except SystemExit as e:
         ended.code = e.code
     else:
@@ -86,11 +88,12 @@ class FakeWiz:
             self.message = message
 
     def __init__(self, tid="tid", **fields):
-        self.tid, self.fields, self.calls, self.docs = tid, fields, [], []
+        self.tid, self.fields, self.calls, self.docs, self.mints = tid, fields, [], [], 0
 
     def __call__(self, url, data, headers, attempts=3):
         if url == wz.AUTH_URL:
-            return {"access_token": _jwt(dc="dc", tid=self.tid)}
+            self.mints += 1
+            return {"access_token": _jwt(dc="dc", tid=self.tid, exp=int(wz.time.time()) + 3600)}
         m = self._FIELD.match(data["query"])
         field, variables = m.group(1) or m.group(2), data.get("variables") or {}
         self.calls.append((field, variables))
@@ -111,6 +114,7 @@ def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches)
     or dropped. `env` replaces the environment. `patches` name wz attributes: a Mock replaces the
     attribute, another callable is its side_effect, anything else its return_value. `wiz` is a FakeWiz
     behind _post, with the credentials token_and_dc reads."""
+    wz._TOKENS.clear()
     with contextlib.ExitStack() as st:
         if wiz is not None:
             env = {**(os.environ if env is None else env), **FakeWiz.ENV}
@@ -266,6 +270,40 @@ class ExitCodeContract(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("denied", err.getvalue())
         self.assertEqual([f for f, _ in wiz.calls], ["deployments"])
+
+    def test_main_reports_a_wizlab_error_once_with_its_code(self):
+        err = io.StringIO()
+        with mock.patch.object(wz.sys, "argv", ["wizlab", "policy", "inspect"]), \
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            wz.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(err.getvalue().count("wizlab:"), 1)
+        self.assertIn("--name", err.getvalue())
+
+    def test_main_exits_0_when_the_handler_returns(self):
+        with mock.patch.dict(wz.VERBS, {("session", "verify"): lambda argv: None}), \
+             mock.patch.object(wz.sys, "argv", ["wizlab", "session", "verify"]):
+            self.assertIsNone(wz.main())
+
+    def test_one_token_serves_every_call_in_a_process(self):
+        # session verify used to mint twice back to back; the cache holds until a minute before `exp`.
+        wiz = FakeWiz(connectors={"totalCount": 0})
+        self.assertEqual(exit_code(wz.cmd_session_verify, [], wiz=wiz), 0)
+        self.assertEqual(wiz.mints, 1)
+        self.assertGreaterEqual(len(wiz.calls), 1)
+
+    def test_an_expiring_token_is_reminted(self):
+        wiz, clock = FakeWiz(), {"t": 1000.0}
+        with mock.patch.object(wz, "_post", wiz), mock.patch.dict(wz.os.environ, FakeWiz.ENV, clear=True), \
+             mock.patch.object(wz.time, "time", lambda: clock["t"]):
+            wz._TOKENS.clear()
+            wz.token_and_dc()
+            wz.token_and_dc()
+            self.assertEqual(wiz.mints, 1)
+            clock["t"] += 3600 - 30  # inside the minute before exp
+            wz.token_and_dc()
+        self.assertEqual(wiz.mints, 2)
+        wz._TOKENS.clear()
 
     def test_user_inspect_group_transport_failure_is_environment_3(self):
         session = wz._KcSession("https://kc", "realm", "tok", "lab-s1@example.com", "lab-s1")
@@ -1939,7 +1977,7 @@ class LeaseDevAccess(unittest.TestCase):
 
     @staticmethod
     def _ts_stub(keys, revoked, key="tskey-auth-SUPERSECRET"):
-        def ts(method, path, body=None):
+        def ts(method, path, body=None, **k):
             if method == "GET":
                 return {"keys": keys}
             if method == "DELETE":
@@ -1984,7 +2022,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.object(wz, "_self_join", return_value="joined"), \
              mock.patch.object(wz, "_iq", lambda q, v, **k: sent.append(v) or {}), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
-             contextlib.suppress(SystemExit):
+             exits():
             wz.cmd_lease_ensure(["--lab", "te-dev-aws"])
         for s in sent:
             self.assertNotIn("PRIVATE KEY", base64.b64decode(s["s"]).decode())
@@ -1998,7 +2036,7 @@ class LeaseDevAccess(unittest.TestCase):
             if "deleteTeamSecret" in q:
                 dropped.append(v["n"])
                 return {}
-            raise SystemExit(3)
+            wz.die(3, "instruqt: 502")
 
         self._ensure(self._ts_stub([], revoked, key="tskey-auth-X"), iq, ["--lab", "te-dev-aws"])
         self.assertEqual(revoked, ["kNEW"])
@@ -2007,7 +2045,7 @@ class LeaseDevAccess(unittest.TestCase):
     def test_delete_revokes_before_dropping_either_secret(self):
         order = []
 
-        def ts(method, path, body=None):
+        def ts(method, path, body=None, **k):
             if method == "DELETE":
                 order.append("revoke")
             return {"keys": [{"id": "kNEW", "description": "dev-te-dev-aws-cccccccc"}]}
@@ -2051,11 +2089,43 @@ class LeaseDevAccess(unittest.TestCase):
             self.assertFalse(priv.with_suffix(".pub").exists())
 
     def test_delete_is_idempotent_when_both_sides_are_already_gone(self):
-        def boom(*a, **k):
-            raise SystemExit(3)
+        # Absent is the tolerated answer (None from _iq, 404 from _ts), not a swallowed failure.
+        out = io.StringIO()
+        code = exit_code(wz.cmd_lease_delete, ["--lab", "te-dev-aws", "--key-id", "kOLD"], out=out,
+                         _ts=lambda m, p, body=None, tolerate=None: None if m == "DELETE" else {"keys": []},
+                         _iq=lambda q, v, **k: None)
+        self.assertEqual(code, 0)
+        self.assertIn("revoked kOLD; dropped (no secrets)", out.getvalue())
 
-        with mock.patch.object(wz, "_ts", return_value={"keys": []}), mock.patch.object(wz, "_iq", boom):
-            self.assertEqual(self._exit(wz.cmd_lease_delete, ["--lab", "te-dev-aws"]), 0)
+    def test_delete_reports_a_failed_revocation_and_drops_nothing(self):
+        # The design review's F8 probe, inverted: a revoke the API refused is exit 3, the secrets and
+        # the private key stay so a re-run can retry, and nothing prints "revoked".
+        dropped = []
+
+        def ts(method, path, body=None, **k):
+            if method == "DELETE":
+                wz.die(3, "tailscale HTTP 500: boom")
+            return {"keys": [{"id": "kA", "description": "dev-te-dev-aws-aaaaaaaa"}]}
+        priv = pathlib.Path(os.environ["WIZLAB_LEASE_DIR"]) / "te-dev-aws" / "id_ed25519"
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.write_text("PRIVATE")
+        out, err = io.StringIO(), io.StringIO()
+        code = exit_code(wz.cmd_lease_delete, ["--lab", "te-dev-aws"], out=out, err=err,
+                         _ts=ts, _iq=lambda q, v, **k: dropped.append(v["n"]) or {})
+        self.assertEqual(code, 3)
+        self.assertEqual(dropped, [])
+        self.assertNotIn("revoked", out.getvalue())
+        self.assertIn("kA not revoked", err.getvalue())
+        self.assertTrue(priv.exists())
+        priv.unlink()
+
+    def test_delete_reports_a_secret_that_would_not_drop(self):
+        def iq(q, v, **k):
+            wz.die(3, "instruqt: 502")
+        err = io.StringIO()
+        code = exit_code(wz.cmd_lease_delete, ["--lab", "te-dev-aws"], err=err, _ts={"keys": []}, _iq=iq)
+        self.assertEqual(code, 3)
+        self.assertIn("TS_AUTHKEY_DEV_AWS not dropped", err.getvalue())
 
     def _join(self, state, proc, key="tskey-auth-SUPERSECRET"):
         with tempfile.TemporaryDirectory() as d, \

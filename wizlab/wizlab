@@ -201,9 +201,21 @@ INTROSPECT_TYPE = ('query { __type(name: "%s") { fields { name type { kind name 
                    '{ kind name ofType { kind name } } } } inputFields { name } enumValues { name } } }')
 
 
+class WizlabError(Exception):
+    """A verb's failure with its exit code: 2 the caller's, 3 the environment's. Raised anywhere and
+    reported once by main(); a handler that returns has succeeded."""
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
 def die(code, msg):
-    print(f"wizlab: {msg}", file=sys.stderr)
-    sys.exit(code)
+    raise WizlabError(code, msg)
+
+
+def _fail(e):
+    print(f"wizlab: {e}", file=sys.stderr)
+    return e.code
 
 
 def _runner_id():
@@ -290,8 +302,16 @@ def _post(url, data, headers, attempts=3):
     die(3, f"after {attempts} attempts: {last}")
 
 
+_TOKENS = {}
+
+
 def token_and_dc():
+    """(token, dc, tid) for the tenant, minted once and reused until a minute before its `exp`: one
+    verdict used to cost up to six mints, each a round trip to the auth server."""
     tenant = os.getenv("WIZ_TENANT", "TBCMP")
+    hit = _TOKENS.get(tenant)
+    if hit and hit[3] - time.time() > 60:
+        return hit[:3]
     cid = os.getenv(f"WIZ_{tenant}_CLIENT_ID") or os.getenv("WIZ_CLIENT_ID")
     sec = os.getenv(f"WIZ_{tenant}_CLIENT_SECRET") or os.getenv("WIZ_CLIENT_SECRET")
     if not cid or not sec:
@@ -309,7 +329,8 @@ def token_and_dc():
     if not tok:
         die(3, f"no token returned: {res.get('message') or res}")
     claims = _claims(tok)
-    return tok, claims["dc"], claims.get("tid")
+    _TOKENS[tenant] = (tok, claims["dc"], claims.get("tid"), claims.get("exp", 0))
+    return _TOKENS[tenant][:3]
 
 
 # Wiz answers a transient fault as a GraphQL error with HTTP 200, so _post's 5xx retry never sees it.
@@ -386,19 +407,22 @@ def _delete_doc(mutation, select="_stub"):
     return f"mutation DeleteById($id: ID!) {{ {mutation}(input: {{ id: $id }}) {{ {select} }} }}"
 
 
+def _graphql(tok, dc, query, variables=None):
+    """(data, errors) for one document, sent within its own submission budget."""
+    body = {"query": query} if variables is None else {"query": query, "variables": variables}
+    res = _post(f"https://api.{dc}.app.wiz.io/graphql", body,
+                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
+                attempts=_submissions(query))
+    return res.get("data") or {}, res.get("errors") or []
+
+
 def api(query, variables, attempts=3):
+    """(data, tid); a GraphQL error is fatal, except a transient one on a read, which is retried."""
     for i in range(attempts):
         tok, dc, tid = token_and_dc()
-        res = _post(
-            f"https://api.{dc}.app.wiz.io/graphql",
-            {"query": query, "variables": variables},
-            {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
-            attempts=_submissions(query),
-        )
-        errors = res.get("errors") or []
-        data = res.get("data")
-        if not errors or any((data or {}).get(k) is not None for k in (data or {})):
-            return data or {}, tid
+        data, errors = _graphql(tok, dc, query, variables)
+        if not errors or any(data.get(k) is not None for k in data):
+            return data, tid
         msg = "; ".join(e.get("message", "?") for e in errors)
         # One rule for both layers: whatever may not be resubmitted over HTTP may not be replayed here
         # either, so a transient GraphQL fault is retried for reads and fatal for everything else.
@@ -520,7 +544,6 @@ def cmd_session_verify(args):
     # the tag in a repo is what main held at import, not what this container is.
     tag, rev = _runner_id()
     print(f"ok: authenticated to dc={dc} tenant={tid} runner={tag or 'unknown'}@{rev[:7] or 'unknown'}")
-    sys.exit(0)
 
 
 def _typename(t):
@@ -561,7 +584,6 @@ def cmd_wiz_tenant(args):
     if out:
         with open(out, "a") as f:
             f.write(lines)
-    sys.exit(0)
 
 
 def cmd_wiz_queries(args):
@@ -575,7 +597,6 @@ def cmd_wiz_queries(args):
         argnames = ", ".join(a["name"] for a in (f.get("args") or []))
         print(f"{f['name']}({argnames}) -> {_typename(f.get('type'))}")
     print(f"# {len(hits)} match of {len(fields)} top-level queries", file=sys.stderr)
-    sys.exit(0)
 
 
 def cmd_wiz_type(args):
@@ -593,7 +614,6 @@ def cmd_wiz_type(args):
         print(f"(in) {f['name']}")
     for v in t.get("enumValues") or []:
         print(f"(enum) {v['name']}")
-    sys.exit(0)
 
 
 def _audit_entries(send, minutes, mutations_only=True):
@@ -628,7 +648,6 @@ def cmd_audit_user(args):
     print(f"# {hits} {kind} action(s) by {email or match} in last {minutes}m", file=sys.stderr)
     if alert:
         die(3, f"{alert}; the list above is incomplete")
-    sys.exit(0)
 
 
 def _cloud(args):
@@ -662,7 +681,7 @@ def cmd_connector_inspect(args):
     node = matches[0]
     print(f"connector {node['name']} ({node['id']}): enabled={node['enabled']} status={node['status']}")
     if require == "exists":
-        sys.exit(0)
+        return
     if require == "outpost-bound":
         return _assert_outpost_bound(args, node)
     # healthy: role-first, a connector sits in INITIAL_SCANNING for ~2-3 min, then CONNECTED, never
@@ -696,7 +715,6 @@ def _create_connector(name, cloud, auth, extra):
     if not c:
         die(3, "createConnector returned no connector")
     print(f"created connector {c['name']} ({c['id']}) status={c['status']}")
-    sys.exit(0)
 
 
 def _ensure_gcp(args, account):
@@ -706,7 +724,7 @@ def _ensure_gcp(args, account):
     matches = find_connector(account, "gcp", _stem_opt(args))
     if matches:
         print(f"connector {matches[0]['name']} already targets project {account}; nothing to do")
-        sys.exit(0)
+        return
     # Project scope means every scope list is empty, NOT absent.
     extra = {
         "projects": [],
@@ -717,7 +735,7 @@ def _ensure_gcp(args, account):
         "excludedRegions": [],
     }
     name = f"{_lab_stem(_session_id(args))}-connector"
-    _create_connector(name, "gcp", {"isManagedIdentity": True, "project_id": account}, extra)
+    return _create_connector(name, "gcp", {"isManagedIdentity": True, "project_id": account}, extra)
 
 
 def _ensure_azure(args, account):
@@ -733,7 +751,7 @@ def _ensure_azure(args, account):
     matches = find_connector(account, "azure", _stem_opt(args))
     if matches:
         print(f"connector {matches[0]['name']} already targets subscription {account}; nothing to do")
-        sys.exit(0)
+        return
     # Subscription scope: every scope list present and EMPTY, not absent (readback of the live 89).
     extra = {
         "includedSubscriptions": [],
@@ -744,7 +762,7 @@ def _ensure_azure(args, account):
         "excludedRegions": [],
     }
     auth = {"isManagedIdentity": True, "subscriptionId": account, "tenantId": tenant_id}
-    _create_connector(f"{_lab_stem(_session_id(args))}-connector", "azure", auth, extra)
+    return _create_connector(f"{_lab_stem(_session_id(args))}-connector", "azure", auth, extra)
 
 
 def _outpost_target(args):
@@ -778,7 +796,6 @@ def _assert_outpost_bound(args, node):
         print(f"connector is bound to outpost {bound.get('name')} ({bound.get('id')}), not {want}")
         sys.exit(1)
     print(f"connector bound to outpost {bound.get('name')} ({bound['id']}), customerRoleARN={role}")
-    sys.exit(0)
 
 
 def _aws_auth_params(args, account):
@@ -824,18 +841,18 @@ def cmd_connector_ensure(args):
         cur_outpost = (n.get("outpost") or {}).get("id") or ""
         if cur == role_arn and (not outpost_id or cur_outpost == outpost_id):
             print(f"connector {n['name']} already targets {account} with {role_arn}; nothing to do")
-            sys.exit(0)
+            return
         # Only the create path above is proven against the API; a patch that adds outpostId to an
         # existing connector is the repair case and is unexercised.
         api(UPDATE, {"input": {"id": n["id"], "patch": {"authParams": auth}}})
         print(f"connector {n['name']}: customerRoleARN {cur or '(none)'} -> {role_arn}"
               + (f", outpost {cur_outpost or '(none)'} -> {outpost_id}" if outpost_id else ""))
-        sys.exit(0)
+        return
     name = f"{_lab_stem(_session_id(args))}-connector"
     # customerRoleARN goes in authParams, NOT extraConfig; extraConfig carries only
     # skipOrganizationScan. The role need not exist yet — the connector sits in ERROR until task 2
     # deploys WizAccess-Role.
-    _create_connector(name, "aws", auth, {"skipOrganizationScan": True})
+    return _create_connector(name, "aws", auth, {"skipOrganizationScan": True})
 
 
 def cmd_connector_delete(args):
@@ -844,11 +861,10 @@ def cmd_connector_delete(args):
     matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}; nothing to delete")
-        sys.exit(0)
+        return
     for n in matches:
         api(DELETE, {"input": {"id": n["id"]}})
         print(f"deleted connector {n['name']} ({n['id']})")
-    sys.exit(0)
 
 
 def cmd_instance_inspect(args):
@@ -891,7 +907,7 @@ def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
     Solve/setup only — never a learner check (it prints a secret)."""
     if _find_sa(name):
         print(f"service account {name} already exists; secret not re-fetchable", file=sys.stderr)
-        sys.exit(0)
+        return
     inp = {"name": name, "type": sa_type}
     if scopes:
         inp["scopes"] = scopes
@@ -907,7 +923,6 @@ def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
         with open(out, "a") as f:
             f.write(lines)
     print(f"created {label} service account {name} ({sa['id']})", file=sys.stderr)
-    sys.exit(0)
 
 
 def _delete_sa(args, name):
@@ -918,23 +933,22 @@ def _delete_sa(args, name):
         node = _find_sa(name)
         if not node:
             print(f"no service account named {name}; nothing to delete")
-            sys.exit(0)
+            return
         sid = node["id"]
     api(_delete_doc("deleteServiceAccount"), {"id": sid})
     print(f"deleted service account {sid}")
-    sys.exit(0)
 
 
 def cmd_sensor_ensure(args):
     """Mint the type:SENSOR service account the Runtime Sensor authenticates with, emitting
     WIZ_API_CLIENT_ID / WIZ_API_CLIENT_SECRET (the install one-liner's own variable names). See
     _ensure_sa for the shared idempotency + emit contract."""
-    _ensure_sa(_sa_name(args), "SENSOR", None, "WIZ_API_CLIENT_ID", "WIZ_API_CLIENT_SECRET", "sensor")
+    return _ensure_sa(_sa_name(args), "SENSOR", None, "WIZ_API_CLIENT_ID", "WIZ_API_CLIENT_SECRET", "sensor")
 
 
 def cmd_sensor_delete(args):
     """Delete the sensor service account (see _delete_sa)."""
-    _delete_sa(args, _sa_name(args))
+    return _delete_sa(args, _sa_name(args))
 
 
 def cmd_sensor_inspect(args):
@@ -950,7 +964,7 @@ def cmd_sensor_inspect(args):
         sys.exit(1)
     print(f"sensor {node['name']} ({node['id']}): status={node['status']} type={node['type']}")
     if require == "exists":
-        sys.exit(0)
+        return
     sys.exit(0 if node["status"] == "ACTIVE" else 1)
 
 
@@ -1030,7 +1044,6 @@ def cmd_serviceaccount_ensure(args):
         with open(out, "a") as f:
             f.write(lines)
     print(f"created wiz cli deployment {name} ({dep.get('id')})", file=sys.stderr)
-    sys.exit(0)
 
 
 def cmd_serviceaccount_inspect(args):
@@ -1044,7 +1057,6 @@ def cmd_serviceaccount_inspect(args):
         print(f"no wiz cli deployment named {name}")
         sys.exit(1)
     print(f"wiz cli deployment {node['name']} ({node['id']})")
-    sys.exit(0)
 
 
 def cmd_serviceaccount_delete(args):
@@ -1056,11 +1068,10 @@ def cmd_serviceaccount_delete(args):
         node = _find_cli_deployment(name)
         if not node:
             print(f"no wiz cli deployment named {name}; nothing to delete")
-            sys.exit(0)
+            return
         dep_id = node["id"]
     _delete_cli_deployment(dep_id)
     print(f"deleted wiz cli deployment {dep_id}")
-    sys.exit(0)
 
 
 # --- Wiz Code CI/CD scan, published by `wizcli scan dir --tags session=<stem>`. A learner check must
@@ -1104,10 +1115,10 @@ def cmd_codescan_inspect(args):
             state, verdict = st.get("state"), st.get("verdict")
             if require == "published":
                 print(f"code-scan: {node['id']} present ({tag_key}={tag_value}) state={state} verdict={verdict}")
-                sys.exit(0)
+                return
             if verdict == "PASSED_BY_POLICY":
                 print(f"code-scan: {node['id']} PASSED_BY_POLICY")
-                sys.exit(0)
+                return
             if verdict == "FAILED_BY_POLICY":
                 print(f"code-scan: {node['id']} FAILED_BY_POLICY")
                 sys.exit(1)
@@ -1172,7 +1183,7 @@ def cmd_policy_ensure(args):
     existing = _find_policy(name)
     if existing:
         print(f"cicd scan policy {name} exists ({existing['id']})")
-        sys.exit(0)
+        return
     rule_id = _flag(args, "--rule-id")
     if not rule_id:
         ctl = _resolve_dockerfile_control(_flag(args, "--control-search") or "Last User Is")
@@ -1197,7 +1208,6 @@ def cmd_policy_ensure(args):
     if not pol.get("id"):
         die(3, "createCICDScanPolicy returned no policy id")
     print(f"created cicd scan policy {name} ({pol['id']}) scoped to control {rule_id}")
-    sys.exit(0)
 
 
 def cmd_policy_inspect(args):
@@ -1211,7 +1221,6 @@ def cmd_policy_inspect(args):
         print(f"no cicd scan policy named {name}")
         sys.exit(1)
     print(f"cicd scan policy {node['name']} ({node['id']})")
-    sys.exit(0)
 
 
 def cmd_policy_delete(args):
@@ -1221,10 +1230,9 @@ def cmd_policy_delete(args):
     node = _find_policy(name)
     if not node:
         print(f"no cicd scan policy named {name}; nothing to delete")
-        sys.exit(0)
+        return
     api(_delete_doc("deleteCICDScanPolicy", "id"), {"id": node["id"]})
     print(f"deleted cicd scan policy {node['id']}")
-    sys.exit(0)
 
 
 # --- Workflows (Automation > Workflows). A learner's artifact is a workflow DEFINITION, so the graded
@@ -1317,7 +1325,7 @@ def cmd_workflow_inspect(args):
     print(f"workflow {node['name']} ({node['id']}): enabled={node['enabled']} "
           f"project={(node.get('project') or {}).get('name')} steps={len(node.get('steps') or [])}")
     if require == "exists":
-        sys.exit(0)
+        return
     sys.exit(0 if node["enabled"] else 1)
 
 
@@ -1499,7 +1507,6 @@ def cmd_workflowrun_ensure(args):
     _wait_for_run(run["id"], int(_flag(args, "--timeout") or "60"),
                   float(_flag(args, "--interval") or "2"))
     print(f"test run {run['id']} reached COMPLETED")
-    sys.exit(0)
 
 
 def _outpost_name(args):
@@ -1536,7 +1543,7 @@ def cmd_outpost_inspect(args):
     st = node["status"]
     print(f"outpost {node['name']} ({node['id']}): status={st}")
     if require == "exists":
-        sys.exit(0)
+        return
     if require == "connected":
         sys.exit(0 if st == "CONNECTED" else 1)
     if require == "scanned":
@@ -1575,7 +1582,7 @@ def cmd_outpost_ensure(args):
     existing = _resolve_outpost(name)
     if existing:
         print(f"outpost {name} already exists ({existing['id']}) status={existing['status']}; nothing to do")
-        sys.exit(0)
+        return
     # allowedRegions pins the scan cluster to the workload region (the EC2's). The capture used []
     # (unrestricted); [region] is the deterministic form — the validator confirms the cluster lands
     # in <region>. awsConfig keys are the capture's exact shape (roleARN is caps).
@@ -1596,7 +1603,6 @@ def cmd_outpost_ensure(args):
     if not o:
         die(3, "createOutpost returned no outpost")
     print(f"created outpost {o['name']} ({o['id']}) status={o.get('status')}")
-    sys.exit(0)
 
 
 _OUTPOST_DELETABLE = ("UNINSTALLED", "UNINSTALLATION_FAILED")
@@ -1615,7 +1621,7 @@ def cmd_outpost_delete(args):
         node = _resolve_outpost(name)
         if not node:
             print(f"no outpost named {name}; nothing to delete")
-            sys.exit(0)
+            return
         oid, status = node["id"], node["status"]
     else:
         status = (_outpost_by_id(oid) or {}).get("status")
@@ -1626,13 +1632,12 @@ def cmd_outpost_delete(args):
         status = _await_uninstalled(oid, int(_flag(args, "--timeout") or 600))
         if status == "GONE":
             print(f"outpost {oid} no longer exists; nothing left to delete")
-            sys.exit(0)
+            return
         if status not in _OUTPOST_DELETABLE:
             print(f"outpost {oid} still {status} after the wait; leaving the record for the daily reaper")
-            sys.exit(0)
+            return
     api(DELETE_OUTPOST, {"input": {"id": oid}})
     print(f"deleted outpost {oid}")
-    sys.exit(0)
 
 
 def _outpost_by_id(oid):
@@ -1795,7 +1800,6 @@ def _role_inspect_azure(args):
         print(f"subscription {sub}: Wiz's service principal is missing {', '.join(missing)}")
         sys.exit(1)
     print(f"subscription {sub}: Wiz's service principal holds Reader and {custom}")
-    sys.exit(0)
 
 
 def _role_inspect_gcp(args):
@@ -1821,7 +1825,6 @@ def _role_inspect_gcp(args):
         print(f"project {project}: Wiz identity is missing {', '.join(missing)}")
         sys.exit(1)
     print(f"project {project}: all {len(GCP_WIZ_ROLES)} Wiz roles bound to the tenant's managed identity")
-    sys.exit(0)
 
 
 def _aws_role(role):
@@ -1868,7 +1871,6 @@ def _inspect_aws_trust(role, role_obj):
         print(f"role {role}: sts:ExternalId {ext} != tenant id {tid}")
         sys.exit(1)
     print(f"role {role}: trust valid (assume-role to {delegator or 'Wiz delegator'}, externalId={tid})")
-    sys.exit(0)
 
 
 def cmd_role_inspect(args):
@@ -1924,7 +1926,6 @@ def cmd_role_ensure(args):
         print(f"role {role}: trust updated, trusts {delegator} (externalId={ext})")
     else:
         die(3, f"create-role failed: {res.stderr.strip()}")
-    sys.exit(0)
 
 
 # --- lab user (Keycloak): backs Wiz SSO for a learner. Realm/endpoint come from grader-only env,
@@ -2128,7 +2129,6 @@ def cmd_user_ensure(args):
         die(3, f"group-join HTTP {status}: {body[:300]!r}")
     _publish_user(email, pwd)
     print(f"user {action}: {email} (group {group})")
-    sys.exit(0)
 
 
 def cmd_user_inspect(args):
@@ -2147,7 +2147,6 @@ def cmd_user_inspect(args):
         print(f"user {email} exists but is not in group {group}; groups={groups}")
         sys.exit(1)
     print(f"user {email} exists and is in group {group}")
-    sys.exit(0)
 
 
 def cmd_user_delete(args):
@@ -2155,12 +2154,11 @@ def cmd_user_delete(args):
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         print(f"no Keycloak user {email}; nothing to delete")
-        sys.exit(0)
+        return
     status, body = _kc_call("DELETE", f"{endpoint}/admin/realms/{realm}/users/{uid}", token)
     if status not in (204, 404):
         die(3, f"delete user HTTP {status}: {body[:300]!r}")
     print(f"deleted Keycloak user {email}")
-    sys.exit(0)
 
 
 def cmd_user_login_url(args):
@@ -2171,7 +2169,6 @@ def cmd_user_login_url(args):
     if not url:
         die(3, "cannot build login URL: no SSO entry for tenant or no tid in token")
     print(url)
-    sys.exit(0)
 
 
 # reap: delete a lab user's Wiz footprint from the audit log. Delete is uniform delete<Type>(input:{id})
@@ -2267,12 +2264,8 @@ def _reap_handler(x):
 
 
 def _gql(tok, dc, query, variables=None):
-    # Non-fatal twin of api(): returns (data, errors) so one unresolvable type alerts, not aborts.
-    body = {"query": query} if variables is None else {"query": query, "variables": variables}
-    res = _post(f"https://api.{dc}.app.wiz.io/graphql", body,
-                {"Content-Type": "application/json", "Authorization": f"Bearer {tok}"},
-                attempts=_submissions(query))
-    return res.get("data") or {}, res.get("errors") or []
+    # The reaper's view of the transport: errors come back so one unresolvable type alerts, not aborts.
+    return _graphql(tok, dc, query, variables)
 
 
 def _input_name(d):
@@ -2451,7 +2444,8 @@ def _scrub(text):
     return _TSKEY_RE.sub("tskey-***REDACTED***", text or "")
 
 
-def _ts(method, path, body=None):
+def _ts(method, path, body=None, tolerate=None):
+    """`tolerate` is an HTTP status that is an expected answer (a key already gone), returned as None."""
     tok = os.getenv("TAILSCALE_API_KEY") or die(3, "TAILSCALE_API_KEY not in environment")
     req = urllib.request.Request(
         TS_API + path,
@@ -2464,6 +2458,8 @@ def _ts(method, path, body=None):
             txt = r.read().decode()
             return json.loads(txt) if txt.strip() else {}
     except urllib.error.HTTPError as e:
+        if e.code == tolerate:
+            return None
         die(3, f"tailscale HTTP {e.code}: {_scrub(e.read().decode(errors='replace'))[:300]}")
     except Exception as e:
         die(3, f"tailscale unreachable: {type(e).__name__}: {e}")
@@ -2539,12 +2535,10 @@ def _upsert_secret(name, value, description):
 
 
 def _drop_secret(name):
-    """True if there was a value to drop. Absent is the normal state after a clean teardown, so it is
-    reported rather than raised — `delete` has to be idempotent."""
-    with contextlib.suppress(SystemExit):
-        return _iq("mutation($t: String!, $n: String!) { deleteTeamSecret(teamSlug: $t, name: $n) }",
-                   {"t": IQ_TEAM, "n": name}, tolerate="BE_034_EntityNotFound") is not None
-    return False
+    """True if there was a value to drop. Absent is the normal state after a clean teardown and reads
+    False; any other failure raises, so `delete` never reports a drop that did not happen."""
+    return _iq("mutation($t: String!, $n: String!) { deleteTeamSecret(teamSlug: $t, name: $n) }",
+               {"t": IQ_TEAM, "n": name}, tolerate="BE_034_EntityNotFound") is not None
 
 
 def _lease_keys():
@@ -2580,11 +2574,11 @@ def _owned_keys(lab_desc):
 
 
 def _revoke(key_id):
-    """Best-effort. A key is consumed at join, so revoking after a node is up does not drop it — it
-    only closes the window the secret is usable. An ephemeral key self-expires, so a miss is not fatal."""
+    """A key is consumed at join, so revoking after a node is up does not drop it — it only closes the
+    window the secret is usable. Already gone (404) is success; anything else raises, because a
+    swallowed failure once left a live key behind a summary line that read "revoked"."""
     if key_id:
-        with contextlib.suppress(SystemExit):
-            _ts("DELETE", f"/tailnet/{_TS_TAILNET}/keys/{key_id}")
+        _ts("DELETE", f"/tailnet/{_TS_TAILNET}/keys/{key_id}", tolerate=404)
 
 
 def _fresh_nodes(match):
@@ -2659,7 +2653,6 @@ def cmd_lease_verify(args):
     if "--no-self" not in args:
         _self_on_tailnet()
     print(f"ok: dev path ready (tailnet + instruqt team {IQ_TEAM})")
-    sys.exit(0)
 
 
 def _mint_authkey(args, lab_desc, ttl):
@@ -2692,17 +2685,19 @@ def cmd_lease_ensure(args):
     try:
         _upsert_secret(ts_name, key, f"wizlab per-play tailnet key ({desc})")
         _upsert_secret(pub_name, pub, f"wizlab per-play dev ssh pubkey ({desc})")
-    except SystemExit:
-        # A live key nothing references is the worst outcome; a half-pushed pair burns the play.
-        _revoke(key_id)
-        _drop_secret(ts_name)
-        _drop_secret(pub_name)
+    except WizlabError:
+        # A live key nothing references is the worst outcome; a half-pushed pair burns the play. The
+        # rollback is best-effort — the push failure is the one to report.
+        with contextlib.suppress(WizlabError):
+            _revoke(key_id)
+        for n in (ts_name, pub_name):
+            with contextlib.suppress(WizlabError):
+                _drop_secret(n)
         raise
     joined = _self_join(args, key)
     print(f"LEASE_KEY_ID={key_id}\nLEASE_SECRET={ts_name}\nLEASE_SSH_KEY={priv}")
     print(f"rotated {ts_name} + {pub_name}; {joined}; start the play now (expires in {ttl}s)",
           file=sys.stderr)
-    sys.exit(0)
 
 
 def cmd_lease_inspect(args):
@@ -2727,7 +2722,6 @@ def cmd_lease_inspect(args):
     print(f"GRADER_IP={addr}")
     print(f"LEASE_SSH_KEY={priv if priv.exists() else ''}")
     print(f"{host} seen {int(age)}s ago", file=sys.stderr)
-    sys.exit(0)
 
 
 def cmd_lease_delete(args):
@@ -2743,14 +2737,23 @@ def cmd_lease_delete(args):
     # live key behind leaves a usable way onto the tailnet.
     key_ids = [key_id] if key_id else [k["id"] for k in _owned_keys(_lease_desc(args))]
     for k in key_ids:
-        _revoke(k)
-    dropped = [n for n in (ts_name, pub_name) if _drop_secret(n)]
+        try:
+            _revoke(k)
+        except WizlabError as e:
+            # Stop before the secrets: dropping them now strands a live key nothing points at.
+            die(3, f"key {k} not revoked ({e}); secrets and the private key are kept, re-run to retry")
+    dropped = []
+    for n in (ts_name, pub_name):
+        try:
+            if _drop_secret(n):
+                dropped.append(n)
+        except WizlabError as e:
+            die(3, f"{n} not dropped ({e}); {', '.join(key_ids) or 'no key'} revoked, re-run to retry")
     d = _keypair_dir(args)
     priv = d / "id_ed25519"
     for f in (priv, priv.with_suffix(".pub"), d / "authkey"):
         f.unlink(missing_ok=True)
     print(f"revoked {', '.join(key_ids) or '(no key)'}; dropped {', '.join(dropped) or '(no secrets)'}")
-    sys.exit(0)
 
 
 def _flag(args, name):
@@ -2810,14 +2813,16 @@ VERBS = {
 
 
 def main():
-    if len(sys.argv) < 3 or (sys.argv[1], sys.argv[2]) not in VERBS:
-        die(2, f"usage: wizlab {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
     # One structural guard: any uncaught exception is a bug/invocation error (2), never a raw
     # traceback exiting 1 (which a learner check would read as "you're wrong").
     try:
+        if len(sys.argv) < 3 or (sys.argv[1], sys.argv[2]) not in VERBS:
+            die(2, f"usage: wizlab {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
         VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
+    except WizlabError as e:
+        sys.exit(_fail(e))
     except Exception as e:
-        die(2, f"internal error: {type(e).__name__}: {e}")
+        sys.exit(_fail(WizlabError(2, f"internal error: {type(e).__name__}: {e}")))
 
 
 if __name__ == "__main__":

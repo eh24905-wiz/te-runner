@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
 
@@ -37,8 +38,13 @@ def _instruqt(query, variables):
         data=json.dumps({"query": query, "variables": variables}).encode(),
         headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        res = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        _die(f"instruqt HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+    except OSError as e:
+        _die(f"instruqt unreachable: {type(e).__name__}: {e}")
     if res.get("errors"):
         _die(f"instruqt: {res['errors']}")
     return res["data"]
