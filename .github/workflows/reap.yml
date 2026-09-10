@@ -1,18 +1,18 @@
 name: reap-orphans
 # Out-of-band reaper: daily, finds stopped tagged lab sessions and reaps their Wiz footprint + Keycloak
 # user (via the baked-in reaper + wizlab).
-# Commit mode has one source per trigger: a manual run deletes iff its `commit` box is ticked, the
-# schedule deletes iff repo variable REAP_COMMIT=true. Neither overrides the other, so an unticked box
-# is always a dry run. Every run is green either way; a dry run reports the backlog and leaves it.
+# Commit mode has one source per trigger: a manual run deletes iff its `commit` box is ticked (it is
+# by default; untick for a dry run), the schedule deletes iff repo variable REAP_COMMIT=true. Neither
+# overrides the other. Every run is green either way; a dry run reports the backlog and leaves it.
 on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       commit:
-        description: "Delete (unchecked = dry-run)"
+        description: "Delete (untick for a dry run)"
         type: boolean
-        default: false
+        default: true
       sessions:
         description: "Manual session ids to reap (comma-separated), bypassing the tag/window filter"
         type: string
