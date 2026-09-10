@@ -94,7 +94,7 @@ class FakeWiz:
         self.tid, self.fields, self.calls, self.docs, self.mints = tid, fields, [], [], 0
 
     def __call__(self, url, data, headers, attempts=3):
-        if url == wz.AUTH_URL:
+        if url == wz.AUTH_URL or url.endswith("/protocol/openid-connect/token"):
             self.mints += 1
             return {"access_token": _jwt(dc="dc", tid=self.tid, exp=int(wz.time.time()) + 3600)}
         m = self._FIELD.match(data["query"])
@@ -110,6 +110,47 @@ class FakeWiz:
 
     def sent(self, field):
         return [v for f, v in self.calls if f == field]
+
+
+class FakeKeycloak:
+    """A realm behind _kc_call. `users` are the admin API's user records; membership lives in each
+    record's "groups". `fail` makes every call answer that status. `calls` holds (method, path)."""
+    ENV: typing.ClassVar = {"LAB_KEYCLOAK_ENDPOINT": "https://kc", "LAB_KEYCLOAK_REALM": "wiz",
+                            "LAB_KEYCLOAK_ADMIN_USER": "admin", "LAB_KEYCLOAK_ADMIN_PWD": "pw"}
+
+    def __init__(self, users=(), groups=("global-contributor",), fail=None):
+        self.users, self.groups, self.fail, self.calls = [dict(u) for u in users], list(groups), fail, []
+
+    def _user(self, uid):
+        return next((u for u in self.users if u["id"] == uid), None)
+
+    def __call__(self, method, url, token, body=None):
+        u = urllib.parse.urlparse(url)
+        parts = u.path.split("/admin/realms/", 1)[1].split("/")[1:]
+        params = dict(urllib.parse.parse_qsl(u.query))
+        self.calls.append((method, "/".join(parts)))
+        if self.fail:
+            return self.fail, b"boom"
+        if parts == ["users"] and method == "GET":
+            hit = [x for x in self.users if params.get("search") in (x["username"], x["email"])]
+            return 200, json.dumps(hit).encode()
+        if parts == ["users"] and method == "POST":
+            self.users.append({"id": f"u{len(self.users) + 1}", "username": body["email"], "email": body["email"]})
+            return 201, b""
+        if parts == ["groups"] and method == "GET":
+            hit = [{"id": f"g-{g}", "name": g} for g in self.groups if g == params.get("search")]
+            return 200, json.dumps(hit).encode()
+        if len(parts) == 2 and method == "DELETE":
+            self.users = [x for x in self.users if x["id"] != parts[1]]
+            return 204, b""
+        if len(parts) == 3 and parts[2] == "reset-password":
+            return 204, b""
+        if len(parts) == 4 and parts[2] == "groups" and method == "PUT":
+            self._user(parts[1]).setdefault("groups", []).append(parts[3][2:])
+            return 204, b""
+        if len(parts) == 3 and parts[2] == "groups" and method == "GET":
+            return 200, json.dumps([{"name": g} for g in self._user(parts[1]).get("groups", [])]).encode()
+        return 404, b"unrouted"
 
 
 def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches):
@@ -232,6 +273,224 @@ class InspectContract(unittest.TestCase):
             for argv in row.get("invalid", []):
                 with self.subTest(verb=verb, argv=argv):
                     self.assertEqual(self._code(verb, argv, row["present"]), 2)
+
+
+def _mutations(wiz):
+    return [f for f, _ in wiz.calls if f.startswith(("create", "update", "delete", "uninstall", "run"))]
+
+
+class EnsureContract(unittest.TestCase):
+    """SPEC.md §What `ensure` promises, one row per noun: absent → created (exit 0); present and matching →
+    exit 0 with the row's own mutations (none, or delete-and-re-mint for a credential); a tenant error → 3
+    with nothing mutated; a missing required flag → 2. What counts as drift is the noun's own class."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+    CONNECTOR: typing.ClassVar = dict(InspectContract.CONNECTOR)
+    SA: typing.ClassVar = {"id": "sa1", "name": "lab-x-sensor", "clientId": "cid", "clientSecret": "sec"}
+    CLI: typing.ClassVar = {"clientSecret": "sec", "deployment": {
+        "id": "dep2", "name": "lab-x-cli", "type": "WIZ_CLI", "object": {"serviceAccount": {"clientId": "cid"}}}}
+    POLICY: typing.ClassVar = {"id": "pol-1", "name": "block-root", "params": {
+        "severityThreshold": "HIGH", "countThreshold": 1, "cloudConfigurationRules": [{"id": "ctl-1"}]}}
+    CTL: typing.ClassVar = {"id": "ctl-1", "name": "Last User Is 'root'", "severity": "HIGH"}
+    OUTPOST: typing.ClassVar = {"id": "o1", "name": "lab-x", "status": "CONNECTED",
+                                "allowedRegions": ["us-east-1"], "config": {"roleARN": "a"}}
+    NOT_WIZ: typing.ClassVar = {("role", "ensure"): "CSP CLIs", ("lease", "ensure"): "Tailscale",
+                                ("user", "ensure"): "Keycloak, KeycloakContract",
+                                ("workflow-run", "ensure"): "fires a test run, converges nothing"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.definition = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)  # noqa: SIM115
+        json.dump({"steps": [], "triggers": []}, cls.definition)
+        cls.definition.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.unlink(cls.definition.name)
+
+    def rows(self):
+        wf = InspectContract.WORKFLOW
+        return {
+            ("connector", "ensure"): {
+                "argv": ["--account-id", "111111111111"],
+                "absent": {"connectors": _conn(), "createConnector": {"connector": self.CONNECTOR}},
+                "present": {"connectors": _conn(self.CONNECTOR)},
+                "creates": ["createConnector"], "invalid": [[]]},
+            ("sensor", "ensure"): {
+                "argv": ["--name", "lab-x-sensor"],
+                "absent": {"serviceAccounts": _conn(), "createServiceAccount": {"serviceAccount": self.SA}},
+                "present": {"serviceAccounts": _conn(self.SA), "createServiceAccount": {"serviceAccount": self.SA}},
+                "creates": ["createServiceAccount"],
+                "present_mutates": ["deleteServiceAccount", "createServiceAccount"]},
+            ("serviceaccount", "ensure"): {
+                "argv": ["--name", "lab-x-cli"],
+                "absent": {"deployments": _conn(), "createCliDeployment": self.CLI},
+                "present": {"deployments": _conn(self.CLI["deployment"]), "createCliDeployment": self.CLI},
+                "creates": ["createCliDeployment"], "present_mutates": ["deleteCliDeployment", "createCliDeployment"]},
+            ("policy", "ensure"): {
+                "argv": ["--name", "block-root"],
+                "absent": {"cicdScanPolicies": _conn(), "cloudConfigurationRules": _conn(self.CTL),
+                           "createCICDScanPolicy": {"scanPolicy": {"id": "pol-1", "name": "block-root"}}},
+                "present": {"cicdScanPolicies": _conn(self.POLICY)},
+                "creates": ["createCICDScanPolicy"], "invalid": [[]]},
+            ("workflow", "ensure"): {
+                "argv": ["--name", "lab-x", "--definition", self.definition.name],
+                "absent": {"automationWorkflows": _conn(), "validateAutomationWorkflow": {"issues": []},
+                           "createAutomationWorkflow": {"workflow": wf}},
+                "present": {"automationWorkflows": _conn(wf), "validateAutomationWorkflow": {"issues": []},
+                            "updateAutomationWorkflow": {"workflow": wf}},
+                "creates": ["createAutomationWorkflow"], "present_mutates": ["updateAutomationWorkflow"],
+                "invalid": [["--name", "lab-x"]]},
+            ("outpost", "ensure"): {
+                "argv": ["--name", "lab-x", "--role-arn", "a"],
+                "absent": {"outposts": _conn(), "createOutpost": {"outpost": self.OUTPOST}},
+                "present": {"outposts": _conn(self.OUTPOST)},
+                "creates": ["createOutpost"], "invalid": [["--name", "lab-x"]]},
+        }
+
+    def _run(self, verb, argv, fields):
+        wiz = FakeWiz(**fields)
+        return exit_code(wz.VERBS[verb], argv, wiz=wiz, env=self.ENV), wiz
+
+    def test_every_ensure_verb_has_a_row(self):
+        self.assertEqual({v for v in wz.VERBS if v[1] == "ensure"}, set(self.rows()) | set(self.NOT_WIZ))
+
+    def test_absent_is_created_and_present_is_converged(self):
+        for verb, row in self.rows().items():
+            with self.subTest(verb=verb):
+                code, wiz = self._run(verb, row["argv"], row["absent"])
+                self.assertEqual((code, _mutations(wiz)), (0, row["creates"]))
+                code, wiz = self._run(verb, row["argv"], row["present"])
+                self.assertEqual((code, _mutations(wiz)), (0, row.get("present_mutates", [])))
+
+    def test_a_tenant_error_mutates_nothing_and_is_3(self):
+        for verb, row in self.rows().items():
+            with self.subTest(verb=verb):
+                field = next(iter(row["absent"]))
+                code, wiz = self._run(verb, row["argv"], {**row["absent"], field: FakeWiz.error("denied")})
+                self.assertEqual((code, _mutations(wiz)), (3, []))
+
+    def test_a_missing_required_flag_is_2_before_any_request(self):
+        for verb, row in self.rows().items():
+            for argv in row.get("invalid", []):
+                with self.subTest(verb=verb, argv=argv):
+                    code, wiz = self._run(verb, argv, row["absent"])
+                    self.assertEqual((code, _mutations(wiz)), (2, []))
+
+
+class DeleteContract(unittest.TestCase):
+    """Every `<noun> delete`: present → the delete mutation, exit 0; absent → exit 0 and no mutation;
+    a tenant error → 3 and no mutation."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+    NOT_WIZ: typing.ClassVar = {("user", "delete"): "Keycloak, KeycloakContract", ("lease", "delete"): "Tailscale"}
+    ROWS: typing.ClassVar = {
+        ("connector", "delete"): {"argv": ["--account-id", "111111111111"], "field": "connectors",
+                                  "node": InspectContract.CONNECTOR, "deletes": ["deleteConnector"]},
+        ("sensor", "delete"): {"argv": ["--name", "lab-x-sensor"], "field": "serviceAccounts",
+                               "node": EnsureContract.SA, "deletes": ["deleteServiceAccount"]},
+        ("serviceaccount", "delete"): {"argv": ["--name", "lab-x-cli"], "field": "deployments",
+                                       "node": EnsureContract.CLI["deployment"], "deletes": ["deleteCliDeployment"]},
+        ("policy", "delete"): {"argv": ["--name", "block-root"], "field": "cicdScanPolicies",
+                               "node": EnsureContract.POLICY, "deletes": ["deleteCICDScanPolicy"]},
+        ("outpost", "delete"): {"argv": ["--name", "lab-x"], "field": "outposts",
+                                "node": dict(EnsureContract.OUTPOST, status="UNINSTALLED"),
+                                "deletes": ["deleteOutpost"]},
+    }
+
+    def _run(self, verb, argv, fields):
+        wiz = FakeWiz(**fields)
+        return exit_code(wz.VERBS[verb], argv, wiz=wiz, env=self.ENV), wiz
+
+    def test_every_delete_verb_has_a_row(self):
+        self.assertEqual({v for v in wz.VERBS if v[1] == "delete"}, set(self.ROWS) | set(self.NOT_WIZ))
+
+    def test_present_is_deleted_absent_is_a_no_op_and_an_error_mutates_nothing(self):
+        for verb, row in self.ROWS.items():
+            with self.subTest(verb=verb):
+                code, wiz = self._run(verb, row["argv"], {row["field"]: _conn(row["node"])})
+                self.assertEqual((code, _mutations(wiz)), (0, row["deletes"]))
+                code, wiz = self._run(verb, row["argv"], {row["field"]: _conn()})
+                self.assertEqual((code, _mutations(wiz)), (0, []))
+                code, wiz = self._run(verb, row["argv"], {row["field"]: FakeWiz.error("denied")})
+                self.assertEqual((code, _mutations(wiz)), (3, []))
+
+
+class KeycloakContract(unittest.TestCase):
+    """The user verbs against a realm: ensure creates or resets and always joins the group and publishes
+    credentials; inspect grades membership; delete is idempotent; any unexpected status is 3."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "s1", **FakeKeycloak.ENV}
+    EMAIL = "lab-s1@titra-labs.ai"
+
+    def _run(self, fn, argv, kc, out=None):
+        return exit_code(fn, argv, wiz=FakeWiz(), env=self.ENV, out=out, _kc_call=kc)
+
+    def test_ensure_creates_then_resets_and_publishes_both_times(self):
+        kc = FakeKeycloak()
+        for expect in ("POST users", "PUT users/u1/reset-password"):
+            out = io.StringIO()
+            self.assertEqual(self._run(wz.cmd_user_ensure, [], kc, out=out), 0)
+            self.assertIn(expect, [f"{m} {p}" for m, p in kc.calls])
+            self.assertIn("WIZ_USER=" + self.EMAIL, out.getvalue())
+            self.assertRegex(out.getvalue(), r"WIZ_PWD=\S{8,}")
+        self.assertEqual(kc.users[0]["groups"], ["global-contributor", "global-contributor"])
+
+    def test_ensure_refuses_to_join_a_group_when_the_created_user_is_not_found(self):
+        # A None re-lookup after a 201 used to PUT to users/None/groups/<gid>.
+        kc = FakeKeycloak()
+        kc.users = None  # a POST that "succeeds" but leaves nothing to find
+
+        def kc_call(method, url, token, body=None):
+            kc.calls.append((method, url))
+            return (201, b"") if method == "POST" else (200, b"[]")
+        self.assertEqual(self._run(wz.cmd_user_ensure, [], kc_call), 3)
+        self.assertEqual([m for m, _ in kc.calls if m != "GET"], ["POST"])
+        self.assertFalse([u for _, u in kc.calls if "/users/None/" in u])
+
+    def test_inspect_grades_membership(self):
+        member = {"id": "u1", "username": self.EMAIL, "email": self.EMAIL, "groups": ["global-contributor"]}
+        for users, want in [([member], 0), ([dict(member, groups=[])], 1), ([], 1)]:
+            with self.subTest(users=users):
+                self.assertEqual(self._run(wz.cmd_user_inspect, [], FakeKeycloak(users)), want)
+
+    def test_delete_is_idempotent(self):
+        kc = FakeKeycloak([{"id": "u1", "username": self.EMAIL, "email": self.EMAIL}])
+        self.assertEqual(self._run(wz.cmd_user_delete, [], kc), 0)
+        self.assertIn(("DELETE", "users/u1"), kc.calls)
+        self.assertEqual(self._run(wz.cmd_user_delete, [], kc), 0)
+        self.assertEqual([c for c in kc.calls if c[0] == "DELETE"], [("DELETE", "users/u1")])
+
+    def test_an_unexpected_status_is_environment_3(self):
+        for fn in (wz.cmd_user_ensure, wz.cmd_user_inspect, wz.cmd_user_delete):
+            with self.subTest(fn=fn.__name__):
+                self.assertEqual(self._run(fn, [], FakeKeycloak(fail=503)), 3)
+
+    def test_a_duplicate_exact_match_is_never_guessed(self):
+        # `search` is a substring match; two exact hits mean the realm is inconsistent, not that the
+        # first one is ours.
+        dup = [{"id": "a", "username": self.EMAIL, "email": self.EMAIL},
+               {"id": "b", "username": self.EMAIL, "email": self.EMAIL}]
+        self.assertEqual(self._run(wz.cmd_user_delete, [], FakeKeycloak(dup)), 3)
+
+
+class AuthorTools(unittest.TestCase):
+    def test_wiz_queries_lists_matching_top_level_fields(self):
+        fields = [{"name": "auditLogEntries", "args": [{"name": "first"}], "type": {"name": "AuditLogEntryConnection"}},
+                  {"name": "connectors", "args": [], "type": {"name": "ConnectorConnection"}}]
+        out = io.StringIO()
+        wiz = FakeWiz(**{"__schema": {"queryType": {"fields": fields}}})
+        self.assertEqual(exit_code(wz.cmd_wiz_queries, ["--match", "audit"], wiz=wiz, out=out), 0)
+        self.assertEqual(out.getvalue().strip(), "auditLogEntries(first) -> AuditLogEntryConnection")
+
+    def test_login_url_is_the_override_or_built_from_the_tenant_or_3(self):
+        out = io.StringIO()
+        self.assertEqual(exit_code(wz.cmd_user_login_url, [], env={"WIZ_LOGIN_URL": "https://pinned"}, out=out), 0)
+        self.assertEqual(out.getvalue().strip(), "https://pinned")
+        out = io.StringIO()
+        self.assertEqual(exit_code(wz.cmd_user_login_url, [], wiz=FakeWiz(tid="t1"), env={}, out=out), 0)
+        self.assertIn("t1-34dq.auth.us-east-1.amazoncognito.com", out.getvalue())
+        self.assertEqual(exit_code(wz.cmd_user_login_url, [], env={"WIZ_TENANT": "NOPE"}), 3)
 
 
 class PureParsing(unittest.TestCase):
@@ -433,15 +692,6 @@ class ExitCodeContract(unittest.TestCase):
             wz.token_and_dc()
         self.assertEqual(wiz.mints, 2)
         wz._TOKENS.clear()
-
-    def test_user_inspect_group_transport_failure_is_environment_3(self):
-        session = wz._KcSession("https://kc", "realm", "tok", "lab-s1@example.com", "lab-s1")
-        with mock.patch.object(wz, "_kc_session", return_value=session), \
-             mock.patch.object(wz, "_kc_user_id", return_value="u1"), \
-             mock.patch.object(wz, "_kc_call", return_value=(503, b"unavailable")), \
-             exits() as cm:
-            wz.cmd_user_inspect(["--session", "s1"])
-        self.assertEqual(cm.code, 3)
 
 
 class RoleInspectGrading(unittest.TestCase):
@@ -744,13 +994,6 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         self.assertIn("Outpost", wz._SWEEP_TYPES)
         self.assertIs(wz._reap_handler("Outpost")["deleter"], wz._reap_outpost)
         self.assertIsNone(wz._reap_handler("Report")["deleter"])
-
-    def test_kc_user_id_refuses_multiple_exact(self):
-        dup = json.dumps([{"id": "1", "username": "lab-s1@titra-labs.ai"},
-                          {"id": "2", "email": "lab-s1@titra-labs.ai"}])
-        with mock.patch.object(wz, "_kc_call", return_value=(200, dup)), exits() as cm:
-            wz._kc_user_id("http://kc", "realm", "tok", "lab-s1@titra-labs.ai")
-        self.assertEqual(cm.code, 3)
 
     def test_kc_session_bundles_setup_in_field_order(self):
         # The three user verbs unpack this positionally, so field ORDER is the contract: a swap of
@@ -1789,26 +2032,6 @@ class ServiceAccountGrading(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(wiz.sent("deleteCliDeployment"), [{"id": hostile}])
         self.assertNotIn(hostile, "".join(wiz.docs))
-
-
-class KeycloakUser(unittest.TestCase):
-    def test_ensure_refuses_to_join_a_group_when_the_created_user_is_not_found(self):
-        # A None re-lookup after a 201 used to PUT to users/None/groups/<gid>.
-        calls = []
-
-        def kc_call(method, url, token, body=None):
-            calls.append((method, url))
-            return 201, b""
-
-        with mock.patch.object(wz, "_kc_session", return_value=("https://kc", "wiz", "tok", "u@x", "U")), \
-             mock.patch.object(wz, "_kc_user_id", return_value=None), \
-             mock.patch.object(wz, "_kc_call", kc_call), \
-             mock.patch.object(wz, "_kc_group_id", return_value="g1"), \
-             exits() as cm:
-            wz.cmd_user_ensure([])
-        self.assertEqual(cm.code, 3)
-        self.assertEqual([m for m, _ in calls], ["POST"])
-        self.assertFalse([u for _, u in calls if "/users/None/" in u])
 
 
 class CodeScanGrading(unittest.TestCase):
