@@ -71,13 +71,23 @@ planes:
       # role already trusted, the connector went INITIAL_SCANNING -> CONNECTED and never touched ERROR.
       # ERROR is what a connector shows when Wiz cannot assume the role (missing/untrusted); role-first
       # skips it. CONNECTED is AWS's healthy status; wizlab `connector inspect --require healthy` asserts it.
-      connected_min: [1.5, 3.0]    # INITIAL_SCANNING at +0 and +1.5m, CONNECTED by +3m. n=2 (second run +2.3m), 60s polls.
+      connected_min: [1.4, 3.0]    # INITIAL_SCANNING at +0, CONNECTED by +1.4m (30s polls), +2.3m and +3m (60s polls). n=3.
       solver_budget_min: 5         # covers the observed ceiling + margin; the connector self-heals, no rescan.
       # verify: after `role ensure`, `connector ensure --account-id <acct>`, then poll
       #   wizlab connector inspect --account-id <acct> --require healthy   # exit 1 until CONNECTED
       arn_patch_connected_min: [5.3, 9]  # REPAIR path only: ARN corrected on an existing ERROR connector →
       # ERROR→INITIAL_SCANNING→CONNECTED. ~2-5x slower than role-first, n=2. A repair-path solver budget
       # must be >= 15 min: solve→re-check completes in 13.5.
+    cloud_resources:
+      # The OLDER cloudResources plane `wizlab instance inspect` queries, on a never-connected sandbox
+      # account with one t3.micro launched 52s after connector create. Slower than gcp and azure on the
+      # VM leg; the 20-minute budget the twins carry holds.
+      vm_after_connected_min: 9.5   # first VIRTUAL_MACHINE 9.5m AFTER CONNECTED. n=1, 30s polls.
+      vm_after_create_min: 10.9     # ...i.e. 10.9m after connector create; 10.1m after the EC2 launch.
+      solver_budget_min: 20
+      # verify: `connector ensure --account-id <acct>`, launch an EC2 in a VPC (the sandbox has no default
+      #   VPC and its SCP denies ssm:GetParameter, so `ec2 describe-images` finds the AMI), then poll
+      #   `instance inspect --account-id <acct> --type VIRTUAL_MACHINE` -- exit 1 until >=1
 
   gcp:
     connector_health:
