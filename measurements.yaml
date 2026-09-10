@@ -208,9 +208,12 @@ planes:
 
   workflow:
     # Automation Workflow labs. Graded planes are `automationWorkflows` (by name prefix) and
-    # `automationWorkflowRuns` (by workflowId, then a step result's outboundEdge). Timings n=1, one live
-    # play. `published` is `enabled`: activeVersion/draftVersion/versions read null/0 on every workflow
+    # `automationWorkflowRuns` (by workflowId, then a step result's outboundEdge). Timings n=2, two live
+    # plays. `published` is `enabled`: activeVersion/draftVersion/versions read null/0 on every workflow
     # in the tenant, so no version field can carry a grade.
+    # A run outlives its workflow: after deleteAutomationWorkflow, automationWorkflowRuns filtered on the
+    # dead workflowId still returns every run with step results. Runs carry no name, so the prefix sweep
+    # cannot see them and they are no learner-visible leak.
     validation:
       # validateAutomationWorkflow checks field NAMES against the trigger payload schema and nothing
       # about null or key safety, so a clean publish does not predict a clean run.
@@ -231,20 +234,36 @@ planes:
       verify: |
         automationWorkflowRuns(filterBy:{status:{equals:[FAILED]}}) { nodes { steps { status outboundEdge error { type message } step { type } } } }
     test_run:
-      fire_to_completed_s: [0.046, 0.082] # runAutomationWorkflowTest EVENT -> status COMPLETED
+      fire_to_completed_s: [0.046, 0.089] # runAutomationWorkflowTest EVENT -> status COMPLETED, n=6
       solver_budget_s: 60                 # `workflow-run ensure --timeout` default; ~700x the observed max
       # Wall clock on the grader for a check that fires one run then inspects, and for a solve that
-      # converges a definition then fires one or two runs. n=1, one play.
+      # converges a definition then fires one run. n=2 plays.
       check_fire_and_inspect_wall_s: [2, 6]
-      solve_ensure_and_fire_wall_s: [8, 10]
+      solve_ensure_and_fire_wall_s: [7, 10]
+      # Verb wall on the grader, each api() minting its own token: one round trip is ~1.5 s.
+      workflow_run_ensure_wall_s: [3.35, 3.37]   # resolve + fire + one 2 s poll
       # Server-side startedAt->completedAt on a synthetic customData payload. Three orders of magnitude
       # under a cloud plane: there is no discovery latency here, only workflow execution. A task timeout
       # in minutes is measuring nothing.
     definition:
-      create_s: 2.0   # createAutomationWorkflow
+      create_s: 2.0   # createAutomationWorkflow, mutation only
       validate_s: 2.0 # validateAutomationWorkflow -- the CEL/edge pre-flight, no mutation
+      # `workflow ensure` verb wall: validate + resolve + create or update, three round trips.
+      ensure_wall_s: [3.55, 3.91]
+      ensure_dry_run_wall_s: [1.48, 1.63]
       # publishAutomationWorkflowVersion is unimplemented ("Workflow versions are currently not
       # supported") and unnecessary: a create carrying enabled:true is already live.
+    blue_agent:
+      # Threat -> aiAnalysis. TBCMP has it enabled: every recent HIGH/CRITICAL THREAT_DETECTION issue reads
+      # COMPLETED. Trigger-to-COMPLETED is unmeasured: triggerThreatAIAnalysis refuses a THIRD_PARTY
+      # service account regardless of scope (admin:all held), so a sample needs an INTEGRATION-type SA
+      # or a portal click.
+      status_enum: [PENDING, IN_PROGRESS, COMPLETED, RATE_LIMITED]
+      verdict_enum_observed: [MALICIOUS, NOT_MALICIOUS, SECURITY_TEST, PLANNED_ACTION]
+      trigger_refusal: "this mutation is only available for users and integration service accounts"  # extensions.code INTERNAL, HTTP 200
+      verify: |
+        mutation($input: TriggerThreatAIAnalysisInput!) { triggerThreatAIAnalysis(input: $input) { systemActivityId } }
+        issuesV2(filterBy:{type:[THREAT_DETECTION], severity:[HIGH,CRITICAL]}) { nodes { threatDetectionDetails { aiAnalysis { status verdict confidenceLevel analyzedAt } } } }
 # ---------------------------------------------------------------------------------------------------
 # Per entity kind. `external_id` is the column that decides whether an equality test can work at all:
 # it is NOT uniform, and a check that assumes one shape misses silently rather than erroring.
