@@ -210,4 +210,4 @@ A change qualifies only if ALL hold:
 Propose → **operator approves** → update this spec → then implement. Default answer is no; the bar is
 general + API-level + fits the grammar. Gates: `ruff` + `xenon` + `test_wizlab.py` (CI); cite
 `measurements.yaml`, never re-derive it. Tests lock the exit-code contract + IAM parsing — a refactor
-that stays green needs no lab re-play.
+that stays green needs no lab re-play; what a test may be is `te-labkit-v2/CLAUDE.md` §Tests.

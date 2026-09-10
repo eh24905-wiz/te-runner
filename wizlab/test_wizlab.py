@@ -2,6 +2,8 @@
 # Stdlib-only harness (no external deps, matching wizlab). Locks the load-bearing invariants so
 # refactors are safe without re-playing a lab: the 0/1/2/3 exit-code contract, IAM-trust parsing
 # breadth, flag edges, and the main() dispatch guard. Run: python wizlab/test_wizlab.py
+# What a new test may be, and where it goes: te-labkit-v2/CLAUDE.md §Tests. Contracts are tables
+# (`InspectContract.ROWS`, the grading tables), driven through `exit_code` and `FakeWiz`.
 import base64
 import contextlib
 import importlib.util
@@ -136,6 +138,102 @@ def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches)
     return ended.code
 
 
+def _conn(*nodes):
+    return {"nodes": list(nodes), "totalCount": len(nodes)}
+
+
+class InspectContract(unittest.TestCase):
+    """What every `<noun> inspect` verb keeps: present → 0, absent → 1, a --require it does not grade → 2,
+    a tenant error → 3, a malformed invocation → 2. One row per noun; a noun shipped without a row fails
+    `test_every_inspect_verb_has_a_row`. Which enum satisfies which --require is the noun's own class."""
+
+    ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
+    SENSOR: typing.ClassVar = {"id": "s1", "name": "lab-x", "status": "ACTIVE", "type": "LINUX_VIRTUAL_MACHINE"}
+    WORKFLOW: typing.ClassVar = {"id": "w1", "name": "lab-x-night-watch", "enabled": True, "project": {"name": "p"},
+                                 "steps": [{"id": "s1", "name": "Route", "type": "SWITCH_CASE"}]}
+    RUN: typing.ClassVar = {"id": "r1", "status": "COMPLETED",
+                            "steps": [{"status": "COMPLETED", "outboundEdge": "x",
+                                       "step": {"name": "Route", "type": "SWITCH_CASE"}}]}
+    DEPLOYMENT: typing.ClassVar = {"id": "dep1", "name": "lab-x-cli", "type": "WIZ_CLI"}
+    SCAN: typing.ClassVar = {"id": "c1", "status": {"state": "DONE", "verdict": "FAILED_BY_POLICY"}}
+    POLICY: typing.ClassVar = {"id": "pol-1", "name": "block-root"}
+    OUTPOST: typing.ClassVar = {"id": "o1", "name": "lab-x", "status": "CONNECTED"}
+    CONNECTOR: typing.ClassVar = {"id": "c1", "name": "lab-x-connector", "enabled": True, "status": "CONNECTED",
+                                  "type": {"id": "aws"},
+                                  "config": {"customerRoleARN": "arn:aws:iam::111111111111:role/WizAccess-Role"}}
+    ROWS: typing.ClassVar = {
+        ("connector", "inspect"): {"argv": ["--account-id", "111111111111"],
+                                   "present": {"connectors": _conn(CONNECTOR)}, "absent": [{"connectors": _conn()}]},
+        ("instance", "inspect"): {"argv": ["--account-id", "111111111111", "--type", "VIRTUAL_MACHINE"],
+                                  "present": {"cloudResources": {"totalCount": 1}},
+                                  "absent": [{"cloudResources": {"totalCount": 0}}]},
+        ("sensor", "inspect"): {"argv": ["--name", "lab-x"],
+                                "present": {"sensors": _conn(SENSOR)}, "absent": [{"sensors": _conn()}]},
+        ("serviceaccount", "inspect"): {"argv": ["--name", "lab-x-cli"],
+                                        "present": {"deployments": _conn(DEPLOYMENT)},
+                                        "absent": [{"deployments": _conn()}]},
+        ("code-scan", "inspect"): {"argv": ["--timeout", "0"],
+                                   "present": {"cicdScans": _conn(SCAN)}, "absent": [{"cicdScans": _conn()}],
+                                   "invalid": [["--tag-value", "bad value!"]]},
+        ("policy", "inspect"): {"argv": ["--name", "block-root"],
+                                "present": {"cicdScanPolicies": _conn(POLICY)},
+                                "absent": [{"cicdScanPolicies": _conn()}], "invalid": [[]]},
+        # The absent sensor with detections present is the scoping case: an unscoped count would grade 0.
+        ("detection", "inspect"): {"argv": ["--name", "lab-x", "--rule-name", "R"],
+                                   "present": {"sensors": _conn(SENSOR), "detections": {"totalCount": 3}},
+                                   "absent": [{"sensors": _conn(SENSOR), "detections": {"totalCount": 0}},
+                                              {"sensors": _conn(), "detections": {"totalCount": 3}}],
+                                   "invalid": [["--name", "lab-x"]]},
+        ("workflow", "inspect"): {"argv": ["--name", "lab-x"],
+                                  "present": {"automationWorkflows": _conn(WORKFLOW)},
+                                  "absent": [{"automationWorkflows": _conn()}]},
+        ("workflow-run", "inspect"): {"argv": ["--name", "lab-x"],
+                                      "present": {"automationWorkflows": _conn(WORKFLOW),
+                                                  "automationWorkflowRuns": _conn(RUN)},
+                                      "absent": [{"automationWorkflows": _conn(WORKFLOW),
+                                                  "automationWorkflowRuns": _conn()},
+                                                 {"automationWorkflows": _conn()}],
+                                      "invalid": [["--name", "lab-x", "--require", "branch"]]},
+        ("outpost", "inspect"): {"argv": ["--name", "lab-x"],
+                                 "present": {"outposts": _conn(OUTPOST)}, "absent": [{"outposts": _conn()}]},
+    }
+    # Graded off another system, each in its own class.
+    NOT_WIZ: typing.ClassVar = {("role", "inspect"): "CSP CLIs", ("user", "inspect"): "Keycloak",
+                                ("lease", "inspect"): "Tailscale"}
+
+    def _code(self, verb, argv, fields):
+        with mock.patch.object(wz.time, "sleep", lambda *_: None):
+            return exit_code(wz.VERBS[verb], argv, wiz=FakeWiz(**fields), env=self.ENV)
+
+    def test_every_inspect_verb_has_a_row(self):
+        self.assertEqual({v for v in wz.VERBS if v[1] == "inspect"}, set(self.ROWS) | set(self.NOT_WIZ))
+
+    def test_present_is_0_and_absent_is_1(self):
+        for verb, row in self.ROWS.items():
+            with self.subTest(verb=verb):
+                self.assertEqual(self._code(verb, row["argv"], row["present"]), 0)
+                for absent in row["absent"]:
+                    self.assertEqual(self._code(verb, row["argv"], absent), 1, absent)
+
+    def test_a_tenant_error_is_environment_3_never_learner_1(self):
+        for verb, row in self.ROWS.items():
+            with self.subTest(verb=verb):
+                field = next(iter(row["present"]))
+                self.assertEqual(self._code(verb, row["argv"], {field: FakeWiz.error("denied")}), 3)
+
+    def test_a_require_the_verb_does_not_grade_is_2(self):
+        for verb, row in self.ROWS.items():
+            if "--require" in wz.FLAGS[verb]:
+                with self.subTest(verb=verb):
+                    self.assertEqual(self._code(verb, [*row["argv"], "--require", "bogus"], row["present"]), 2)
+
+    def test_a_malformed_invocation_is_2(self):
+        for verb, row in self.ROWS.items():
+            for argv in row.get("invalid", []):
+                with self.subTest(verb=verb, argv=argv):
+                    self.assertEqual(self._code(verb, argv, row["present"]), 2)
+
+
 class PureParsing(unittest.TestCase):
     def test_as_list(self):
         self.assertEqual(wz._as_list(None), [])
@@ -191,12 +289,14 @@ class FlagParsing(unittest.TestCase):
 
 
 class CliHelper(unittest.TestCase):
-    def test_missing_binary_is_environment_3(self):
-        # FileNotFoundError must map to exit 3, not bubble as an uncaught exception (which would be 2).
-        with mock.patch.object(wz.subprocess, "run", side_effect=FileNotFoundError), \
-             exits() as cm:
-            wz._cli("no-such-binary", "version")
-        self.assertEqual(cm.code, 3)
+    def test_a_missing_or_hung_binary_is_environment_3(self):
+        # Never 2 (an uncaught exception reads as the learner's fault) and never past the platform's own
+        # check timeout.
+        for fault in (FileNotFoundError(), wz.subprocess.TimeoutExpired("aws", wz._CLI_TIMEOUT_S)):
+            with self.subTest(fault=type(fault).__name__), \
+                 mock.patch.object(wz.subprocess, "run", side_effect=fault), exits() as cm:
+                wz._cli("aws", "version")
+            self.assertEqual(cm.code, 3)
 
     def test_aws_gcp_az_delegate_to_cli(self):
         proc = _proc(0, "ok")
@@ -209,13 +309,6 @@ class CliHelper(unittest.TestCase):
         self.assertEqual(calls[1][0], "gcloud")
         self.assertEqual(calls[2][0], "az")
 
-
-    def test_a_hung_binary_is_environment_3(self):
-        with mock.patch.object(wz.subprocess, "run",
-                               side_effect=wz.subprocess.TimeoutExpired("aws", wz._CLI_TIMEOUT_S)), \
-             exits() as cm:
-            wz._cli("aws", "sts", "get-caller-identity")
-        self.assertEqual(cm.code, 3)
 
 
 class ExitCodeContract(unittest.TestCase):
@@ -556,21 +649,14 @@ class ConnectorAndReaperSafety(unittest.TestCase):
             wz.cmd_reap(["--session", "s1", "--commit"])
         self.assertEqual(cm.code, 3)
 
-    def test_committed_reap_exits_3_when_a_sweep_lookup_fails(self):
-        self.assertEqual(self._reap(None, sweep=wz.Counter({wz.FAILED: 1})), 3)
-
-    def test_committed_reap_exits_0_when_coverage_is_unknown(self):
-        # Residue we cannot act on is not cleanup that failed: exiting 3 here would make the reaper
-        # retain every lab-<sid>@ user it was built to delete.
-        self.assertEqual(self._reap(wz.UNKNOWN), 0)
-        self.assertEqual(self._reap(wz.ABSENT), 0)
-        self.assertEqual(self._reap(wz.REMOVED), 0)
-
-    def test_a_deferred_resource_keeps_the_user_and_the_retry(self):
-        # Exit 3 is the only signal the reaper acts on, and "come back to this" is exactly what a
-        # multi-pass teardown needs — one extra daily cycle, then the record is gone.
-        self.assertEqual(self._reap(wz.DEFERRED), 3)
-        self.assertEqual(self._reap(wz.FAILED), 3)
+    def test_which_outcomes_keep_the_user_and_the_retry(self):
+        # Exit 3 is the only signal the reaper acts on: DEFERRED and FAILED earn one more daily pass.
+        # Residue we cannot act on (UNKNOWN) is not cleanup that failed, or the reaper would retain
+        # every lab-<sid>@ user it was built to delete.
+        for outcome, want in [(wz.REMOVED, 0), (wz.ABSENT, 0), (wz.UNKNOWN, 0), (wz.DEFERRED, 3), (wz.FAILED, 3)]:
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self._reap(outcome), want)
+        self.assertEqual(self._reap(None, sweep=wz.Counter({wz.FAILED: 1})), 3)  # a sweep that did not finish
 
     def test_reap_one_reports_failed_when_delete_does_not_remove_resource(self):
         found = [("id1", 1, None), ("id1", 1, None)]
@@ -1240,58 +1326,20 @@ class GcpRoleInspect(unittest.TestCase):
 
 
 class SensorDetectionGrading(unittest.TestCase):
+    """SensorStatus is ACTIVE/INACTIVE only, and `search` is a server-side substring."""
     ACTIVE: typing.ClassVar = [{"id": "s1", "name": "lab-x", "status": "ACTIVE", "type": "LINUX_VIRTUAL_MACHINE"}]
 
-    def _api(self, sensor_nodes, det_count=0):
-        def side(query, variables):
-            if "sensors(" in query:
-                return {"sensors": {"nodes": sensor_nodes, "totalCount": len(sensor_nodes)}}, "tid"
-            if "detections(" in query:
-                return {"detections": {"totalCount": det_count}}, "tid"
-            return {}, "tid"
-        return side
+    def _exit(self, argv, sensors):
+        return exit_code(wz.cmd_sensor_inspect, argv, wiz=FakeWiz(sensors=_conn(*sensors)))
 
-    def _exit(self, fn, argv, side):
-        return exit_code(fn, argv, api=side)
+    def test_active_is_the_only_status_that_satisfies_active(self):
+        argv = ["--name", "lab-x", "--require", "active"]
+        self.assertEqual(self._exit(argv, self.ACTIVE), 0)
+        self.assertEqual(self._exit(argv, [dict(self.ACTIVE[0], status="INACTIVE")]), 1)
 
-    def test_sensor_inspect_exists(self):
-        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 0)
-
-    def test_sensor_inspect_active_vs_inactive(self):
-        self.assertEqual(
-            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "active"], self._api(self.ACTIVE)), 0)
-        inactive = [{"id": "s1", "name": "lab-x", "status": "INACTIVE", "type": "x"}]
-        self.assertEqual(
-            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "active"], self._api(inactive)), 1)
-
-    def test_sensor_inspect_absent_exit_1(self):
-        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api([])), 1)
-
-    def test_sensor_inspect_bad_require_exit_2(self):
-        self.assertEqual(
-            self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x", "--require", "bogus"], self._api(self.ACTIVE)), 2)
-
-    def test_sensor_name_matches_exactly_not_substring(self):
-        # `search` is substring server-side, so a longer name that merely contains the stem must NOT
-        # match — else a neighbour session's sensor grades this one.
-        other = [{"id": "s2", "name": "lab-xyz", "status": "ACTIVE", "type": "x"}]
-        self.assertEqual(self._exit(wz.cmd_sensor_inspect, ["--name", "lab-x"], self._api(other)), 1)
-
-    def test_detection_hit_exit_0(self):
-        self.assertEqual(
-            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api(self.ACTIVE, 3)), 0)
-
-    def test_detection_none_exit_1(self):
-        self.assertEqual(
-            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api(self.ACTIVE, 0)), 1)
-
-    def test_detection_no_sensor_exit_1(self):
-        self.assertEqual(
-            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x", "--rule-name", "R"], self._api([])), 1)
-
-    def test_detection_missing_rule_exit_2(self):
-        self.assertEqual(
-            self._exit(wz.cmd_detection_inspect, ["--name", "lab-x"], self._api(self.ACTIVE)), 2)
+    def test_name_matches_exactly_not_substring(self):
+        # A longer name that merely contains the stem is a neighbour session's sensor.
+        self.assertEqual(self._exit(["--name", "lab-x"], [dict(self.ACTIVE[0], id="s2", name="lab-xyz")]), 1)
 
 
 class WorkflowGrading(unittest.TestCase):
@@ -1303,66 +1351,54 @@ class WorkflowGrading(unittest.TestCase):
                               "project": {"name": "p"},
                               "steps": [{"id": "s1", "name": "Route", "type": "SWITCH_CASE"}]}]
 
-    def _api(self, wf_nodes, run_nodes=()):
-        def side(query, variables):
-            if "automationWorkflowRuns(" in query:
-                return {"automationWorkflowRuns": {"nodes": list(run_nodes)}}, "tid"
-            if "automationWorkflows(" in query:
-                return {"automationWorkflows": {"nodes": wf_nodes}}, "tid"
-            return {}, "tid"
-        return side
+    def _wiz(self, wf_nodes, run_nodes=(), issues=(), **fields):
+        return FakeWiz(automationWorkflows={"nodes": wf_nodes}, automationWorkflowRuns={"nodes": list(run_nodes)},
+                       validateAutomationWorkflow={"issues": list(issues)},
+                       createAutomationWorkflow={"workflow": dict(self.LIVE[0], id="w1")},
+                       updateAutomationWorkflow={"workflow": {"id": "w1", "name": "lab-x", "enabled": True}}, **fields)
 
     def _run(self, edge, stype="SWITCH_CASE"):
         return {"id": "r1", "status": "COMPLETED",
                 "steps": [{"status": "COMPLETED", "outboundEdge": edge,
                            "step": {"name": "Route", "type": stype}}]}
 
-    def _exit(self, fn, argv, side):
-        return exit_code(fn, argv, api=side)
-
-    def test_inspect_exists_and_absent(self):
-        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api(self.LIVE)), 0)
-        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api([])), 1)
+    def _exit(self, fn, argv, wiz):
+        return exit_code(fn, argv, wiz=wiz)
 
     def test_published_is_enabled_only(self):
         argv = ["--name", "lab-x", "--require", "published"]
-        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._api(self.LIVE)), 0)
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._wiz(self.LIVE)), 0)
         saved = [dict(self.LIVE[0], enabled=False)]
-        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._api(saved)), 1)
-
-    def test_inspect_bad_require_exit_2(self):
-        self.assertEqual(
-            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--require", "branched"],
-                       self._api(self.LIVE)), 2)
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, argv, self._wiz(saved)), 1)
 
     def test_stem_matches_by_prefix_but_exact_name_pins(self):
         # The guide tells a learner to type lab-<sid>-night-watch, so the stem must match a suffixed
         # name. --exact-name is for a caller that knows the whole thing.
-        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._api(self.LIVE)), 0)
+        self.assertEqual(self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x"], self._wiz(self.LIVE)), 0)
         self.assertEqual(
-            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--exact-name"], self._api(self.LIVE)), 1)
+            self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--exact-name"], self._wiz(self.LIVE)), 1)
 
     def test_enabled_outranks_disabled_leftover_on_same_stem(self):
         nodes = [dict(self.LIVE[0], id="old", enabled=False), self.LIVE[0]]
         self.assertEqual(
             self._exit(wz.cmd_workflow_inspect, ["--name", "lab-x", "--require", "published"],
-                       self._api(nodes)), 0)
+                       self._wiz(nodes)), 0)
 
     def test_run_branch_grades_the_edge_taken(self):
         argv = ["--name", "lab-x", "--require", "branch", "--branch", "Malicious"]
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("Malicious")])), 0)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._run("Malicious")])), 0)
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("default")])), 1)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._run("default")])), 1)
 
     def test_run_branch_grades_every_step_type(self):
         # A CONDITION leaves by true/false and an unbranched step by main; a verb that read only
         # SWITCH_CASE edges printed "none" on a run that demonstrably took the false edge.
         argv = ["--name", "lab-x", "--require", "branch", "--branch", "false"]
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("false", "CONDITION")])), 0)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._run("false", "CONDITION")])), 0)
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("true", "CONDITION")])), 1)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._run("true", "CONDITION")])), 1)
 
     def _failed_step_run(self, edge="error", status="FAILED"):
         return {"id": "r2", "status": "COMPLETED",
@@ -1374,60 +1410,32 @@ class WorkflowGrading(unittest.TestCase):
         # runs only, so FAILED-step-in-COMPLETED-run is what proves the edge was followed.
         argv = ["--name", "lab-x", "--require", "error-path"]
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._failed_step_run()])), 0)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._failed_step_run()])), 0)
         self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("main", "ECHO")])), 1)
+            self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [self._run("main", "ECHO")])), 1)
         self.assertEqual(
             self._exit(wz.cmd_workflowrun_inspect, argv,
-                       self._api(self.LIVE, [self._failed_step_run(status="COMPLETED")])), 1)
-        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [])), 1)
+                       self._wiz(self.LIVE, [self._failed_step_run(status="COMPLETED")])), 1)
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._wiz(self.LIVE, [])), 1)
 
     def test_run_wait_dies_on_the_enum_spelling_of_canceled(self):
         # CANCELLED would never match, so a cancelled run would poll to the deadline instead of exiting 3
         # on the first read.
-        side = self._api(self.LIVE, [{"id": "r1", "status": "CANCELED", "steps": []}])
-        with mock.patch.object(wz, "api", side_effect=side), mock.patch.object(wz.time, "sleep") as slept, \
-                exits() as cm:
-            wz._wait_for_run("r1", timeout=60, interval=2)
-        self.assertEqual(cm.code, 3)
+        wiz = self._wiz(self.LIVE, [{"id": "r1", "status": "CANCELED", "steps": []}])
+        with mock.patch.object(wz.time, "sleep") as slept:
+            code = exit_code(lambda argv: wz._wait_for_run("r1", timeout=60, interval=2), [], wiz=wiz)
+        self.assertEqual(code, 3)
         slept.assert_not_called()
 
-    def test_run_completed_and_none(self):
-        argv = ["--name", "lab-x", "--require", "completed"]
-        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [self._run("x")])), 0)
-        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, self._api(self.LIVE, [])), 1)
-
-    def test_run_absent_workflow_exit_1(self):
-        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, ["--name", "lab-x"], self._api([])), 1)
-
-    def test_run_branch_without_branch_flag_exit_2(self):
-        self.assertEqual(
-            self._exit(wz.cmd_workflowrun_inspect, ["--name", "lab-x", "--require", "branch"],
-                       self._api(self.LIVE)), 2)
-
     def test_ensure_needs_a_readable_definition(self):
-        self.assertEqual(self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x"], self._api(self.LIVE)), 2)
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x"], self._wiz(self.LIVE)), 2)
         self.assertEqual(
             self._exit(wz.cmd_workflow_ensure, ["--name", "lab-x", "--definition", "/nope.json"],
-                       self._api(self.LIVE)), 2)
+                       self._wiz(self.LIVE)), 2)
 
     def test_run_ensure_rejects_unknown_initial_step(self):
         argv = ["--name", "lab-x", "--initial-step", "Nope", "--data", "/nope.json"]
-        self.assertEqual(self._exit(wz.cmd_workflowrun_ensure, argv, self._api(self.LIVE)), 2)
-
-    def _api_validate(self, issues, wf_nodes=None):
-        nodes = self.LIVE if wf_nodes is None else wf_nodes
-
-        def side(query, variables):
-            if "validateAutomationWorkflow" in query:
-                return {"validateAutomationWorkflow": {"issues": issues}}, "tid"
-            if "automationWorkflows(" in query:
-                return {"automationWorkflows": {"nodes": nodes}}, "tid"
-            if "createAutomationWorkflow" in query:
-                return {"createAutomationWorkflow": {"workflow": {"id": "w1", "name": "lab-x-night-watch",
-                                                                  "enabled": True}}}, "tid"
-            return {}, "tid"
-        return side
+        self.assertEqual(self._exit(wz.cmd_workflowrun_ensure, argv, self._wiz(self.LIVE)), 2)
 
     def _definition_file(self):
         d = tempfile.mkdtemp()
@@ -1441,79 +1449,63 @@ class WorkflowGrading(unittest.TestCase):
         # never sent — the API's own refusal names neither the step nor the field.
         argv = ["--name", "lab-x", "--definition", self._definition_file()]
         issues = [{"target": {"stepId": "route"}, "message": "field 'name' does not exist in expression"}]
-        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate(issues)), 2)
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._wiz(self.LIVE, issues=issues)), 2)
 
     def test_dry_run_reports_issues_without_mutating(self):
         argv = ["--name", "lab-x", "--definition", self._definition_file(), "--dry-run"]
         issues = [{"target": {"triggerId": "eventThreats"}, "message": "outbound edge references non-existent step"}]
-        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate(issues)), 1)
-        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._api_validate([])), 0)
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._wiz(self.LIVE, issues=issues)), 1)
+        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, self._wiz(self.LIVE)), 0)
 
     def test_issue_line_survives_a_workflow_level_target(self):
         # The workflow member of the target union carries only `_stub`, so nothing names a step.
         self.assertEqual(wz._issue_line({"target": {"_stub": None}, "message": "m"}), "workflow: m")
         self.assertEqual(wz._issue_line({"message": "m"}), "workflow: m")
 
-    def _ensure_queries(self, wf_nodes):
-        seen = []
+    def _ensure(self, wf_nodes, *extra):
+        """The tenant after one `workflow ensure` on a valid definition."""
+        wiz = self._wiz(wf_nodes)
+        exit_code(wz.cmd_workflow_ensure, ["--name", "lab-x", "--definition", self._definition_file(), *extra], wiz=wiz)
+        return wiz
 
-        def side(query, variables):
-            seen.append(query)
-            return self._api_validate([], wf_nodes=wf_nodes)(query, variables)
-        argv = ["--name", "lab-x", "--definition", self._definition_file()]
-        with mock.patch.object(wz, "api", side_effect=side), exits():
-            wz.cmd_workflow_ensure(argv)
-        return seen
+    @staticmethod
+    def _mutations(wiz):
+        return [f for f, _ in wiz.calls if f.startswith(("create", "update", "delete", "publish", "revert"))]
 
     def test_ensure_sends_no_version_bearing_mutation(self):
         # The version refusal (SPEC.md) covers EVERY version-bearing path: the first fix removed the
         # publish call and left updateAutomationWorkflowDraft, so the same defect failed a second play.
         # This asserts the class, not the one call.
         for nodes in ([], self.LIVE):
-            seen = self._ensure_queries(nodes)
+            docs = "\n".join(self._ensure(nodes).docs)
             for banned in ("publishAutomationWorkflowVersion", "updateAutomationWorkflowDraft",
                            "revertAutomationWorkflowToVersion", "automationWorkflowVersion("):
-                self.assertFalse([q for q in seen if banned in q], f"{banned} sent with nodes={bool(nodes)}")
+                self.assertNotIn(banned, docs, f"sent with nodes={bool(nodes)}")
 
     def test_ensure_patches_a_live_workflow_and_keeps_its_id(self):
         # A rebuild drops the test runs earlier activities graded; the patch keeps the workflow id, and
         # the patch type has no projectId key.
-        sent = {}
-
-        def side(query, variables):
-            if "updateAutomationWorkflow(" in query:
-                sent.update(variables["input"])
-                return {"updateAutomationWorkflow": {"workflow": {"id": "w1", "name": "lab-x", "enabled": True}}}, "tid"
-            return self._api_validate([], wf_nodes=self.LIVE)(query, variables)
-        argv = ["--name", "lab-x", "--definition", self._definition_file(), "--project-id", "p1"]
-        self.assertEqual(self._exit(wz.cmd_workflow_ensure, argv, side), 0)
+        wiz = self._ensure(self.LIVE, "--project-id", "p1")
+        sent = wiz.sent("updateAutomationWorkflow")[0]["input"]
         self.assertEqual(sent["id"], "w1")
         self.assertNotIn("projectId", sent["patchStrict"])
         self.assertTrue(sent["patchStrict"]["enabled"])
 
     def test_ensure_creates_when_absent_and_deletes_only_a_duplicate(self):
-        def names(seen):
-            return [q.split("(")[0].split()[-1] for q in seen if "mutation" in q]
-        self.assertEqual(names(self._ensure_queries([])), ["CreateWorkflow"])
-        self.assertEqual(names(self._ensure_queries(self.LIVE)), ["UpdateWorkflow"])
+        self.assertEqual(self._mutations(self._ensure([])), ["createAutomationWorkflow"])
+        self.assertEqual(self._mutations(self._ensure(self.LIVE)), ["updateAutomationWorkflow"])
         dup = [*self.LIVE, {**self.LIVE[0], "id": "w2"}]
-        self.assertEqual(names(self._ensure_queries(dup)), ["DeleteWorkflow", "UpdateWorkflow"])
+        self.assertEqual(self._mutations(self._ensure(dup)), ["deleteAutomationWorkflow", "updateAutomationWorkflow"])
 
     def test_run_inspect_spans_every_workflow_on_the_stem(self):
         # Two attempts on one stem: the edge lives on the second, and grading only the first would fail a
         # learner who got there.
         two = [dict(self.LIVE[0], id="w1", name="lab-x-night-watch"),
                dict(self.LIVE[0], id="w2", name="lab-x-night-watch-2")]
-        captured = {}
-
-        def side(query, variables):
-            if "automationWorkflowRuns(" in query:
-                captured["ids"] = variables["f"]["workflowId"]["equals"]
-                return {"automationWorkflowRuns": {"nodes": [self._run("Malicious")]}}, "tid"
-            return {"automationWorkflows": {"nodes": two}}, "tid"
+        wiz = self._wiz(two, [self._run("Malicious")])
         argv = ["--name", "lab-x", "--require", "branch", "--branch", "Malicious"]
-        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, side), 0)
-        self.assertEqual(sorted(captured["ids"]), ["w1", "w2"])
+        self.assertEqual(self._exit(wz.cmd_workflowrun_inspect, argv, wiz), 0)
+        self.assertEqual(sorted(wiz.sent("automationWorkflowRuns")[0]["f"]["workflowId"]["equals"]), ["w1", "w2"])
 
 
 class OutpostGrading(unittest.TestCase):
@@ -1521,40 +1513,33 @@ class OutpostGrading(unittest.TestCase):
     reorders the reap would silently leave an Outpost record behind, which no lab check would
     catch."""
 
-    def _api(self, status, after=None, scans=None):
+    def _wiz(self, status, after=None, scans=None):
         """after: statuses `outpost(id)` returns on successive polls, for the uninstall wait.
         scans: one (successful, failed) pair per daily bucket the scan-metrics trend reports."""
-        seq, calls = list(after or []), []
+        seq = list(after or [])
+        nodes = [] if status is None else [{"id": "o1", "name": "lab-x", "status": status}]
+        pts = [{"timestamp": f"d{i}", "aggregatedMetrics": {"totalScansCount": s + f, "successfulScansCount": s,
+                                                            "failedScansCount": f}}
+               for i, (s, f) in enumerate(scans or [])]
 
-        def side(query, variables):
-            calls.append((query, variables))
-            if "resourceScanMetricsTrend" in query:
-                pts = [{"timestamp": f"d{i}",
-                        "aggregatedMetrics": {"totalScansCount": s + f, "successfulScansCount": s,
-                                              "failedScansCount": f}}
-                       for i, (s, f) in enumerate(scans or [])]
-                return {"resourceScanMetricsTrend": {"dataPoints": pts}}, "tid"
-            if "outposts(" in query:
-                nodes = [] if status is None else [{"id": "o1", "name": "lab-x", "status": status}]
-                return {"outposts": {"nodes": nodes, "totalCount": len(nodes)}}, "tid"
-            if "outpost(id:" in query:
-                st = seq.pop(0) if seq else status
-                return {"outpost": None if st == "GONE" else {"id": "o1", "status": st}}, "tid"
-            if "createOutpost" in query:
-                return {"createOutpost": {"outpost": {"id": "o1", "name": "lab-x", "status": "INITIALIZING"}}}, "tid"
-            return {}, "tid"
-        return side, calls
+        def by_id(variables):
+            st = seq.pop(0) if seq else status
+            return None if st == "GONE" else {"id": "o1", "status": st}
+        return FakeWiz(outposts={"nodes": nodes, "totalCount": len(nodes)}, outpost=by_id,
+                       resourceScanMetricsTrend={"dataPoints": pts},
+                       createOutpost={"outpost": {"id": "o1", "name": "lab-x", "status": "INITIALIZING"}})
 
-    def _exit(self, fn, argv, side):
+    def _exit(self, fn, argv, wiz):
         # A fake clock, not just a no-op sleep: the uninstall wait is bounded by time.monotonic(), so a
         # patched-out sleep alone would spin on the real clock for the whole --timeout.
         clock = {"t": 1000.0}
-        with mock.patch.object(wz, "api", side_effect=side), \
-                mock.patch.object(wz.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)), \
-                mock.patch.object(wz.time, "monotonic", lambda: clock["t"]), \
-                exits() as cm:
-            fn(argv)
-        return cm.code
+        with mock.patch.object(wz.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s)), \
+             mock.patch.object(wz.time, "monotonic", lambda: clock["t"]):
+            return exit_code(fn, argv, wiz=wiz)
+
+    @staticmethod
+    def _mutations(wiz):
+        return [f for f, _ in wiz.calls if f.startswith(("create", "uninstall", "delete"))]
 
     def test_inspect_grades_the_enum_not_the_ui_word(self):
         for status, require, want in [
@@ -1567,86 +1552,63 @@ class OutpostGrading(unittest.TestCase):
             ("UNINSTALLED", "exists", 0),
             ("ERROR", "connected", 1),
         ]:
-            side, _ = self._api(status)
-            self.assertEqual(
-                self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", require], side), want,
-                f"{status} --require {require}")
-
-    def test_inspect_absent_exit_1(self):
-        side, _ = self._api(None)
-        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], side), 1)
+            with self.subTest(status=status, require=require):
+                argv = ["--name", "lab-x", "--require", require]
+                self.assertEqual(self._exit(wz.cmd_outpost_inspect, argv, self._wiz(status)), want)
 
     def test_scanned_needs_a_successful_scan_not_just_connected(self):
         # A CONNECTED Outpost commonly has scanned nothing, so CONNECTED must not satisfy --require
         # scanned. Failed-only is also not satisfied (it means the node pool cannot snapshot), and
         # the daily buckets are summed across the window.
-        for scans, want in [([], 1), ([(0, 0), (0, 0)], 1), ([(0, 3)], 1), ([(0, 0), (1, 0)], 0),
-                            ([(5, 2)], 0)]:
-            side, _ = self._api("CONNECTED", scans=scans)
-            self.assertEqual(
-                self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"], side),
-                want, f"scans={scans}")
+        for scans, want in [([], 1), ([(0, 0), (0, 0)], 1), ([(0, 3)], 1), ([(0, 0), (1, 0)], 0), ([(5, 2)], 0)]:
+            with self.subTest(scans=scans):
+                self.assertEqual(
+                    self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"],
+                               self._wiz("CONNECTED", scans=scans)), want)
 
     def test_scanned_absent_outpost_never_queries_metrics(self):
-        side, calls = self._api(None, scans=[(9, 0)])
-        self.assertEqual(
-            self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"], side), 1)
-        self.assertFalse([c for c in calls if "resourceScanMetricsTrend" in c[0]])
-
-    def test_inspect_bad_require_exit_2(self):
-        side, _ = self._api("CONNECTED")
-        self.assertEqual(
-            self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "bogus"], side), 2)
+        wiz = self._wiz(None, scans=[(9, 0)])
+        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x", "--require", "scanned"], wiz), 1)
+        self.assertEqual(wiz.sent("resourceScanMetricsTrend"), [])
 
     def test_inspect_name_matches_exactly_not_substring(self):
         # `search` is substring server-side; a neighbour session's longer name must not grade this one.
-        def side(query, variables):
-            return {"outposts": {"nodes": [{"id": "o2", "name": "lab-xyz", "status": "CONNECTED"}]}}, "tid"
-        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], side), 1)
+        wiz = FakeWiz(outposts={"nodes": [{"id": "o2", "name": "lab-xyz", "status": "CONNECTED"}]})
+        self.assertEqual(self._exit(wz.cmd_outpost_inspect, ["--name", "lab-x"], wiz), 1)
 
     def test_ensure_needs_role_arn(self):
-        side, _ = self._api(None)
-        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x"], side), 2)
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x"], self._wiz(None)), 2)
 
     def test_ensure_is_idempotent_by_name_and_never_recreates(self):
-        side, calls = self._api("CONNECTED")
-        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "a"], side), 0)
-        self.assertNotIn("createOutpost", " ".join(q for q, _ in calls))
+        wiz = self._wiz("CONNECTED")
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "a"], wiz), 0)
+        self.assertEqual(self._mutations(wiz), [])
 
     def test_ensure_posts_role_arn_inside_aws_config(self):
-        side, calls = self._api(None)
-        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "arn:r"], side), 0)
-        inp = next(v["input"] for q, v in calls if "createOutpost" in q)
+        wiz = self._wiz(None)
+        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "arn:r"], wiz), 0)
+        inp = wiz.sent("createOutpost")[0]["input"]
         self.assertEqual(inp["awsConfig"]["roleARN"], "arn:r")   # caps, nested — the capture's shape
         self.assertEqual(inp["allowedRegions"], ["us-east-1"])
 
-    def test_delete_uninstalls_first_then_waits_then_deletes(self):
-        side, calls = self._api("INITIALIZED", after=["UNINSTALLING", "UNINSTALLED"])
-        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
-        order = [q.split("(")[0].split()[-1] for q, _ in calls if "mutation" in q]
-        self.assertEqual(order, ["UninstallOutpost", "DeleteOutpost"])
-
-    def test_delete_never_deletes_a_live_outpost_directly(self):
-        # deleteOutpost on a live Outpost is a server-side internal error, so it must not be attempted.
-        side, calls = self._api("CONNECTED", after=["UNINSTALLED"])
-        self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side)
-        first = next(q for q, _ in calls if "mutation" in q)
-        self.assertIn("UninstallOutpost", first)
-
-    def test_delete_skips_uninstall_when_already_uninstalled(self):
-        side, calls = self._api("UNINSTALLED")
-        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
-        self.assertNotIn("uninstallOutpost", " ".join(q for q, _ in calls))
-
-    def test_delete_absent_is_exit_0(self):
-        side, _ = self._api(None)
-        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], side), 0)
+    def test_delete_uninstalls_first_waits_then_deletes(self):
+        # deleteOutpost on a live Outpost is a server-side internal error, so it is never attempted
+        # first; an already-UNINSTALLED record skips the uninstall.
+        both = ["uninstallOutpost", "deleteOutpost"]
+        for status, after, want in [("INITIALIZED", ["UNINSTALLING", "UNINSTALLED"], both),
+                                    ("CONNECTED", ["UNINSTALLED"], both),
+                                    ("UNINSTALLED", [], ["deleteOutpost"]),
+                                    (None, [], [])]:
+            with self.subTest(status=status):
+                wiz = self._wiz(status, after=after)
+                self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x"], wiz), 0)
+                self.assertEqual(self._mutations(wiz), want)
 
     def test_delete_exits_0_when_uninstall_outlives_the_wait(self):
         # Best-effort: the EKS infra dies with the lease, so a stuck record must not fail the reaper.
-        side, calls = self._api("INITIALIZED", after=["UNINSTALLING"] * 40)
-        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x", "--timeout", "60"], side), 0)
-        self.assertNotIn("deleteOutpost", " ".join(q for q, _ in calls))
+        wiz = self._wiz("INITIALIZED", after=["UNINSTALLING"] * 40)
+        self.assertEqual(self._exit(wz.cmd_outpost_delete, ["--name", "lab-x", "--timeout", "60"], wiz), 0)
+        self.assertEqual(self._mutations(wiz), ["uninstallOutpost"])
 
 
 class OutpostConnectorBinding(unittest.TestCase):
@@ -1691,13 +1653,6 @@ class OutpostConnectorBinding(unittest.TestCase):
     def test_no_outpost_at_all_is_exit_1_not_an_error(self):
         # The learner skipped phase 1: a check, so 1 — never 2/3, which a lab would have to remap.
         self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS, self._node(None), None), 1)
-
-    def test_absent_connector_is_exit_1(self):
-        self.assertEqual(self._exit(wz.cmd_connector_inspect, self.ARGS, None, {"id": "o1"}), 1)
-
-    def test_bad_require_is_exit_2(self):
-        self.assertEqual(self._exit(wz.cmd_connector_inspect,
-                                    ["--account-id", "111111111111", "--require", "bogus"]), 2)
 
     def test_outpost_id_without_scanner_role_is_exit_2(self):
         # Bound with no scanner role the connector converges and never scans a disk, so refuse to
@@ -1805,11 +1760,6 @@ class ServiceAccountGrading(unittest.TestCase):
         code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._wiz(existing=False, cid=None))
         self.assertEqual(code, 3)
 
-    def test_inspect_exists_absent_and_bad_require(self):
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._wiz(existing=True))[0], 0)
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, [], self._wiz(existing=False))[0], 1)
-        self.assertEqual(self._run(wz.cmd_serviceaccount_inspect, ["--require", "bogus"], self._wiz(True))[0], 2)
-
     def test_delete_by_name_and_noop_when_absent(self):
         self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._wiz(existing=True))[0], 0)
         self.assertEqual(self._run(wz.cmd_serviceaccount_delete, [], self._wiz(existing=False))[0], 0)
@@ -1846,53 +1796,33 @@ class KeycloakUser(unittest.TestCase):
 
 class CodeScanGrading(unittest.TestCase):
     """code-scan inspect grades the TENANT verdict (WARN_BY_POLICY exits 0 at the CLI, so the exit
-    code can't tell a finding from a pass). Lock published/pass/fail + the bounded poll."""
+    code can't tell a finding from a pass). Lock pass/fail and the bounded poll."""
 
     ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
 
-    def _cicd_api(self, seq):
+    def _wiz(self, seq):
         it = iter(seq)  # one node-or-None per successive cicdScans call
 
-        def side(query, variables):
-            if "cicdScans(" in query:
-                node = next(it)
-                return {"cicdScans": {"nodes": ([node] if node else []), "totalCount": (1 if node else 0)}}, "tid"
-            return {}, "tid"
-        return side
+        def scans(variables):
+            node = next(it)
+            return {"nodes": [node] if node else [], "totalCount": 1 if node else 0}
+        return FakeWiz(cicdScans=scans)
 
     def _node(self, state="DONE", verdict=None):
         return {"id": "c1", "status": {"state": state, "verdict": verdict}}
 
-    def _exit(self, argv, side):
-        with mock.patch.dict(wz.os.environ, self.ENV, clear=True), \
-             mock.patch.object(wz, "api", side_effect=side), \
-             mock.patch.object(wz.time, "sleep", lambda *_: None), \
-             exits() as cm:
-            wz.cmd_codescan_inspect(argv)
-        return cm.code
+    def _exit(self, argv, wiz):
+        with mock.patch.object(wz.time, "sleep", lambda *_: None):
+            return exit_code(wz.cmd_codescan_inspect, argv, wiz=wiz, env=self.ENV)
 
-    def test_published_any_scan_exit_0(self):
-        side = self._cicd_api([self._node(verdict="FAILED_BY_POLICY")])
-        self.assertEqual(self._exit(["--require", "published"], side), 0)
+    def test_pass_grades_the_verdict(self):
+        for verdict, want in [("PASSED_BY_POLICY", 0), ("FAILED_BY_POLICY", 1)]:
+            with self.subTest(verdict=verdict):
+                self.assertEqual(self._exit(["--require", "pass"], self._wiz([self._node(verdict=verdict)])), want)
 
-    def test_published_none_within_timeout_exit_1(self):
-        self.assertEqual(self._exit(["--require", "published", "--timeout", "0"], self._cicd_api([None])), 1)
-
-    def test_pass_passed_exit_0(self):
-        self.assertEqual(self._exit(["--require", "pass"], self._cicd_api([self._node(verdict="PASSED_BY_POLICY")])), 0)
-
-    def test_pass_failed_exits_1_without_waiting(self):
-        self.assertEqual(self._exit(["--require", "pass"], self._cicd_api([self._node(verdict="FAILED_BY_POLICY")])), 1)
-
-    def test_pass_polls_running_then_passed(self):
-        seq = [self._node(state="IN_PROGRESS", verdict=None), self._node(verdict="PASSED_BY_POLICY")]
-        self.assertEqual(self._exit(["--require", "pass", "--interval", "0"], self._cicd_api(seq)), 0)
-
-    def test_bad_require_exit_2(self):
-        self.assertEqual(self._exit(["--require", "bogus"], self._cicd_api([None])), 2)
-
-    def test_unsafe_tag_value_exit_2(self):
-        self.assertEqual(self._exit(["--tag-value", "bad value!"], self._cicd_api([None])), 2)
+    def test_pass_polls_a_running_scan_to_its_verdict(self):
+        seq = [self._node(state="IN_PROGRESS"), self._node(verdict="PASSED_BY_POLICY")]
+        self.assertEqual(self._exit(["--require", "pass", "--interval", "0"], self._wiz(seq)), 0)
 
 
 class PolicyGrading(unittest.TestCase):
@@ -1952,17 +1882,9 @@ class PolicyGrading(unittest.TestCase):
         wiz = self._wiz(existing=False, created_id=None)
         self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "b"], wiz), 3)
 
-    def test_inspect_exists_absent_and_bad_require(self):
-        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "block-root"], self._wiz(existing=True)), 0)
-        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "block-root"], self._wiz(existing=False)), 1)
-        self.assertEqual(self._exit(wz.cmd_policy_inspect, ["--name", "b", "--require", "x"], self._wiz(True)), 2)
-
     def test_delete_found_and_noop_when_absent(self):
         self.assertEqual(self._exit(wz.cmd_policy_delete, ["--name", "block-root"], self._wiz(existing=True)), 0)
         self.assertEqual(self._exit(wz.cmd_policy_delete, ["--name", "block-root"], self._wiz(existing=False)), 0)
-
-    def test_missing_name_is_invocation_error_2(self):
-        self.assertEqual(self._exit(wz.cmd_policy_inspect, [], self._wiz(existing=True)), 2)
 
 
 class LeaseDevAccess(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 Every finding from the code-level and design-level reviews, one row each, ranked by payoff per unit
 of work. Effort: S = under a day, M = days, L = a week or cross-repo. Baseline: `ruff` clean, radon
-average B with 13 functions at C, 246 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
+average B with 13 functions at C, 221 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
 Symbols name `wizlab/wizlab` unless a path is given. The last column is the blast radius: what the fix
 touches, what depends on it (tests, labs, other repos), and where the fixing agent looks next.
 
@@ -18,7 +18,7 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 |---|---|---|---|---|
 | 15 | Hand-rolled `_flag`: `--require` validated nine times, `int(_flag(...) or "N")` ten times | argparse per verb with `FLAGS` as its spec: `choices=` for `--require`, `type=int` | S | 86 `_flag` sites plus six `"--x" in args` switches; every `cmd_*` takes `args` as a list. `FlagParsing` tests call `_flag` directly. Unknown flags already exit 2 through `_check_flags`, so this is shape, not contract. |
 | 16 | One 2,783-line file with no `.py`: SourceFileLoader hacks in three files, explicit ruff paths, no editor tooling. Stdlib-only still holds and stays | package `wizlab/` with `__main__.py`, two-line shim at `/usr/local/bin/wizlab`; no runtime deps added | M | Dockerfile `COPY`, `lint.yml` ruff/xenon/radon paths, both test loaders (#10). The executable path stays: reaper `_wizlab` and every lab call `wizlab` by name. Do after #15 so module boundaries follow the CLI layer. |
-| 20 | Seven handlers have no test: `cmd_connector_delete`, `cmd_instance_inspect`, `cmd_sensor_ensure`, `cmd_sensor_delete`, `cmd_user_delete`, `cmd_user_login_url`, `cmd_wiz_queries`; five `_api` routers still dispatch on query substrings | cover the destructive and credential handlers first, through `exit_code(fn, argv, wiz=FakeWiz(...))`; move the remaining routers onto `FakeWiz` as their classes are touched | M | `ServiceAccountGrading` and `PolicyGrading` are the reference shape: the fake answers by top-level field and records `calls`/`docs`. |
+| 20 | Six handlers have no test: `cmd_connector_delete`, `cmd_sensor_ensure`, `cmd_sensor_delete`, `cmd_user_delete`, `cmd_user_login_url`, `cmd_wiz_queries` | an `EnsureContract` and `DeleteContract` table once #26 fixes the postconditions, shaped like `InspectContract.ROWS`; the Keycloak verbs through a `FakeKeycloak` at `_kc_call` | S | Rule: `te-labkit-v2/CLAUDE.md` §Tests. Every remaining `api` mock is a patch, not a router. |
 
 ## Tier 3 — cross-repo or operator-facing
 
