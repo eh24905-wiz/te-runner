@@ -10,7 +10,6 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 
 | # | Finding | Do | Effort | Blast radius → guidance |
 |---|---|---|---|---|
-| 11 | `te-labkit-v2/tracks/wiz-workflows-201/track-spec.json` promises `wizlab workflow delete`; `SPEC.md` rules it out | fix the track-spec | S | The `cleanup` field of that spec. Replacement: `wizlab user reap`, since `AutomationWorkflow` is in `_SWEEP_TYPES`. Labkit PR, no runner change. |
 | 13 | `_aws`/`_gcp`/`_az` are split by `_wiz_gcp_sa` | group the CLI shims | S | Pure move; nothing resolves at import. #15 removes `_flag`, so do this inside #16's split rather than as its own reorder diff. |
 
 ## Tier 2 — structural, each retires several rows below it
@@ -27,7 +26,6 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 |---|---|---|---|---|
 | 21 | 47 copies of `case $? in 0) exit 0 ;; *) exit 1 ;; esac` across 13 lab repos (44 that form, 2 `0) ;;`, 3 commented out) | `wizlab --check <noun> <verb>` collapses to 0/1 and prints the real code on stderr | S + repins | `main` gains one leading switch. `te-labkit-v2/authoring/architecture.md` documents the wrapper and changes with it. Order: ship the tag, repin, then drop wrappers per repo; a wrapper left in place stays correct. |
 | 22 | `lease` (~320 lines), `wiz queries`, `wiz type`, `audit user` run only on an operator machine, yet each fix is an image tag and a repin in 13 repos; `te-labkit-v2/scripts/dev-access.py` (108 lines) holds the other half of dev access | move them to labkit; image keeps only the entrypoint's `TS_AUTHKEY` path | M | Moves `_ts`, `_iq`, `_scrub`, `_keypair_dir`, `_owned_keys` and the `LeaseDevAccess` tests with them; `_post` and `_submissions` are shared, so the moved code imports or copies them. Labkit docs naming `wizlab lease`: `CLAUDE.md`, `authoring/pipeline.md`, track `research.md` files. The `SPEC.md` lease section moves too. |
-| 23 | `--min-runner` has never fired: pins v0.1.43 (9 repos), v0.1.44 (1), v0.1.45 (3); floors v0.1.27–44, every floor at or below its pin (gcp-connector-101 is equal). Three dev repos carry no floor. The floor is hand-written, so it cannot catch a lab calling a verb newer than its pin | labkit CI check: pin ≥ floor, and verbs used ≤ verbs in the pinned tag | M | Inputs per lab repo: the `te-runner:vX` pin in `sandbox.hcl`, the `--min-runner` in its check, the `wizlab <noun> <verb>` calls. Verb list at a tag: `git show vX:wizlab/wizlab` and read `VERBS`. Nothing in the runner changes. |
 | 26 | `ensure` postconditions differ per noun with no stated rule: `_ensure_sa` exits 0 with no credentials on an existing account; `cmd_serviceaccount_ensure` deletes and re-mints; `cmd_policy_ensure` ignores `--count-threshold` on an existing policy; `cmd_outpost_ensure` does not reconcile; `cmd_lease_inspect` passes with no local private key | write the per-noun postcondition in `SPEC.md`, then make each verb meet it | M | `cmd_connector_ensure` is the one verb that reconciles; use its shape. Tests pin today's behaviour: `ServiceAccountGrading` and `PolicyGrading` assert exit 0 with no mutation on `existing=True`. Lab impact: a solve re-run through `_ensure_sa` emits no `WIZ_API_CLIENT_SECRET`, so the sensor install line downstream gets an empty value. Change `SPEC.md` first (operator approves), then code and tests together. |
 
 ## Tier 4 — measure before deciding
@@ -45,6 +43,6 @@ Every measurement carrying its reproducer. One pinned image per lab.
 ## Next actions
 
 1. #15 then #16, in that order; each makes the next smaller. One constraint: #15's unknown-flag exit 2
-   turns a misspelled flag in any of the 47 lab wrappers into a learner failure, so #23's labkit check
-   runs against every wrapper before that tag ships.
+   turns a misspelled flag in any of the 47 lab wrappers into a learner failure, so `te-labkit-v2/scripts/runner-floor.py`
+   runs against every lab repo before that tag ships (all ten pass at their current pins).
 2. #21 and #22 need a labkit PR and a repin round; batch them with the next verb release.
