@@ -2,7 +2,7 @@
 
 Every finding from the code-level and design-level reviews, one row each, ranked by payoff per unit
 of work. Effort: S = under a day, M = days, L = a week or cross-repo. Baseline: `ruff` clean, radon
-average B with 13 functions at C, 233 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
+average B with 13 functions at C, 235 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
 Symbols name `wizlab/wizlab` unless a path is given. The last column is the blast radius: what the fix
 touches, what depends on it (tests, labs, other repos), and where the fixing agent looks next.
 
@@ -22,7 +22,7 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 | 15 | Hand-rolled `_flag`: fixed twice in the log, unknown flags silently ignored (`SPEC.md` records it), `--require` validated nine times, `int(_flag(...) or "N")` ten times | argparse subparsers: `choices=` for `--require`, `type=int`, unknown flag exits 2 | M | 84 `_flag` sites plus six `"--x" in args` switches (`--all`, `--commit`, `--dry-run`, `--exact-name`, `--match-only`, `--no-self`); every `cmd_*` takes `args` as a list. `FlagParsing` tests call `_flag` directly. Cross-repo: unknown-flag exit 2 turns a misspelled flag in any of the 47 lab wrappers from a silent pass into a learner failure, so grep every wrapper's flags against the parser before the tag ships. `--min-runner` must parse before any other validation. After #14. |
 | 16 | One 2,783-line file with no `.py`: SourceFileLoader hacks in three files, explicit ruff paths, no editor tooling. Stdlib-only still holds and stays | package `wizlab/` with `__main__.py`, two-line shim at `/usr/local/bin/wizlab`; no runtime deps added | M | Dockerfile `COPY`, `lint.yml` ruff/xenon/radon paths, both test loaders (#10). The executable path stays: reaper `_wizlab` and every lab call `wizlab` by name. Do after #14 and #15 so module boundaries follow the new error and CLI layers. |
 | 17 | Repetition: `.get("nodes") or []` ×18; exact-name `next(...)` ×5; `EXEC_OUTPUT` append ×4; `_norm_account(_flag(...) or die(...))` ×4; `_flag("--name") or _lab_stem(_session_id())` ×5; `_kc_call` status-then-die ×6; status-first sort ×2; `WIZ_<TENANT>_X or WIZ_X` ×2 | `_nodes`, `_exact`, `_emit`, `_account_id`, `_named(args, suffix)`, `_kc_call(ok=)`, `_prefer`, `_tenant_env` | M | Pure refactor; tests route on query text and exit codes, not on these expressions. Re-run `radon`: the 14 C-rated functions include `find_connector`, `_verify_csp`, `_inspect_aws_trust`, `_reap_enumerate`, and these helpers are what lowers them. |
-| 20 | Tests mock `api` per handler: seven `_exit` and seven `_api` routers dispatch on query substrings (32 sites) and re-implement the server; payload shapes are never checked | one module-level `exit_code(fn, argv, **patches)`; one fake at `_post` fed by recorded captures | M | Eight handlers have no test: `cmd_connector_delete`, `cmd_instance_inspect`, `cmd_sensor_ensure`, `cmd_sensor_delete`, `cmd_user_ensure`, `cmd_user_delete`, `cmd_user_login_url`, `cmd_wiz_queries`. Cover the destructive and credential handlers first. Coordinate with #14 (error type) and #29 (return vs exit). `Pagination._pages` is the shape of a fake fed by variables rather than query text. |
+| 20 | Seven handlers have no test: `cmd_connector_delete`, `cmd_instance_inspect`, `cmd_sensor_ensure`, `cmd_sensor_delete`, `cmd_user_delete`, `cmd_user_login_url`, `cmd_wiz_queries`; five `_api` routers still dispatch on query substrings | cover the destructive and credential handlers first, through `exit_code(fn, argv, wiz=FakeWiz(...))`; move the remaining routers onto `FakeWiz` as their classes are touched | M | `exits()` owns the error type and `exit_code` the drive, so #14 and #29 change one function each. `ServiceAccountGrading` and `PolicyGrading` are the reference shape: the fake answers by top-level field and records `calls`/`docs`. |
 
 ## Tier 3 — cross-repo or operator-facing
 
@@ -49,8 +49,7 @@ Every measurement carrying its reproducer. One pinned image per lab.
 
 ## Next actions
 
-1. #14 then #15 then #16, in that order; each makes the next smaller. Two constraints: tests call handlers
-   directly and catch `SystemExit` 54 times, so #14 and #29 break the suite unless #20's `exit_code` helper
-   lands with them; and #15's unknown-flag exit 2 turns a misspelled flag in any of the 47 lab wrappers into
-   a learner failure, so grep every wrapper's flags against the parser before that tag ships.
+1. #14 then #15 then #16, in that order; each makes the next smaller. One constraint: #15's unknown-flag
+   exit 2 turns a misspelled flag in any of the 47 lab wrappers into a learner failure, so grep every
+   wrapper's flags against the parser before that tag ships.
 2. #21 and #22 need a labkit PR and a repin round; batch them with the next verb release.
