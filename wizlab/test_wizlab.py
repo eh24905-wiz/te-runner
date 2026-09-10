@@ -11,6 +11,7 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 import tempfile
 import types
 import typing
@@ -279,6 +280,41 @@ class ExitCodeContract(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertEqual(err.getvalue().count("wizlab:"), 1)
         self.assertIn("--name", err.getvalue())
+
+    def test_a_flag_the_verb_does_not_read_is_invocation_error_2(self):
+        # A misspelled flag was ignored, so a check graded on the default it meant to override.
+        err = io.StringIO()
+        with mock.patch.object(wz.sys, "argv", ["wizlab", "sensor", "inspect", "--requier", "active"]), \
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            wz.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--requier", err.getvalue())
+        self.assertIn("--require", err.getvalue())
+
+    def test_every_verb_declares_its_flags_and_every_flag_read_is_declared(self):
+        self.assertEqual(set(wz.FLAGS), set(wz.VERBS))
+        src = pathlib.Path(wz.__file__).read_text()
+        read = {a or b for a, b in re.findall(r'_flag\(args, "(--[a-z-]+)"\)|"(--[a-z-]+)" in args', src)}
+        declared = set().union(*wz.FLAGS.values())
+        self.assertEqual(read - declared, set())
+
+    def test_check_collapses_every_failure_to_1_and_names_the_real_code(self):
+        err = io.StringIO()
+        with mock.patch.dict(wz.VERBS, {("session", "verify"): lambda argv: wz.die(3, "no tenant")}), \
+             mock.patch.object(wz.sys, "argv", ["wizlab", "--check", "session", "verify"]), \
+             contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            wz.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("no tenant", err.getvalue())
+        self.assertIn("exit 3", err.getvalue())
+        with mock.patch.dict(wz.VERBS, {("session", "verify"): lambda argv: sys.exit(1)}), \
+             mock.patch.object(wz.sys, "argv", ["wizlab", "--check", "session", "verify"]), \
+             self.assertRaises(SystemExit) as cm:
+            wz.main()
+        self.assertEqual(cm.exception.code, 1)
+        with mock.patch.dict(wz.VERBS, {("session", "verify"): lambda argv: None}), \
+             mock.patch.object(wz.sys, "argv", ["wizlab", "--check", "session", "verify"]):
+            self.assertIsNone(wz.main())
 
     def test_main_exits_0_when_the_handler_returns(self):
         with mock.patch.dict(wz.VERBS, {("session", "verify"): lambda argv: None}), \

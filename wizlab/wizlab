@@ -2815,17 +2815,92 @@ VERBS = {
 }
 
 
-def main():
-    # One structural guard: any uncaught exception is a bug/invocation error (2), never a raw
-    # traceback exiting 1 (which a learner check would read as "you're wrong").
+# Every flag a verb reads, itself or through a helper. main() refuses anything else with exit 2: a
+# misspelled flag used to be ignored, so a check graded on the default it meant to override.
+_S = {"--session"}
+_U = _S | {"--domain"}
+FLAGS = {
+    ("session", "verify"): {"--account-id", "--cloud", "--min-runner"},
+    ("connector", "inspect"): _S | {"--account-id", "--cloud", "--outpost-id", "--outpost-name", "--require"},
+    ("connector", "ensure"): _S | {"--account-id", "--cloud", "--outpost-id", "--outpost-name", "--role-arn",
+                                   "--scanner-role-arn", "--tenant-id"},
+    ("connector", "delete"): _S | {"--account-id", "--cloud"},
+    ("instance", "inspect"): {"--account-id", "--type"},
+    ("sensor", "ensure"): _S | {"--name"},
+    ("sensor", "inspect"): _S | {"--name", "--require"},
+    ("sensor", "delete"): _S | {"--id", "--name"},
+    ("serviceaccount", "ensure"): _S | {"--name"},
+    ("serviceaccount", "inspect"): _S | {"--name", "--require"},
+    ("serviceaccount", "delete"): _S | {"--id", "--name"},
+    ("code-scan", "inspect"): _S | {"--interval", "--require", "--tag-key", "--tag-value", "--timeout"},
+    ("policy", "ensure"): {"--control-search", "--count-threshold", "--name", "--rule-id", "--severity"},
+    ("policy", "inspect"): {"--name", "--require"},
+    ("policy", "delete"): {"--name"},
+    ("detection", "inspect"): _S | {"--match-only", "--name", "--rule-name", "--since-minutes"},
+    ("workflow", "inspect"): _S | {"--exact-name", "--name", "--require"},
+    ("workflow", "ensure"): _S | {"--definition", "--dry-run", "--exact-name", "--name", "--project-id"},
+    ("workflow-run", "inspect"): _S | {"--branch", "--exact-name", "--name", "--require", "--run-type"},
+    ("workflow-run", "ensure"): _S | {"--data", "--exact-name", "--initial-step", "--interval", "--name",
+                                      "--timeout", "--trigger-type"},
+    ("outpost", "inspect"): _S | {"--lookback-days", "--name", "--require"},
+    ("outpost", "ensure"): _S | {"--name", "--region", "--role-arn"},
+    ("outpost", "delete"): _S | {"--id", "--name", "--timeout"},
+    ("role", "inspect"): {"--account-id", "--cloud", "--role-name"},
+    ("role", "ensure"): {"--cloud", "--external-id", "--role-name"},
+    ("user", "ensure"): _U | {"--group"},
+    ("user", "inspect"): _U | {"--group"},
+    ("user", "delete"): _U,
+    ("user", "login-url"): set(),
+    ("wiz", "tenant"): set(),
+    ("wiz", "queries"): {"--match"},
+    ("wiz", "type"): {"--name"},
+    ("audit", "user"): _U | {"--all", "--email", "--last-min", "--match"},
+    ("user", "reap"): _U | {"--commit", "--email", "--last-min"},
+    ("lease", "verify"): set(),
+    ("lease", "ensure"): {"--lab", "--timelimit-seconds"},
+    ("lease", "inspect"): _S | {"--hostname", "--lab", "--require"},
+    ("lease", "delete"): {"--key-id", "--lab"},
+}
+
+
+def _check_flags(verb, argv):
+    unknown = [a for a in argv if a.startswith("--") and a not in FLAGS[verb]]
+    if unknown:
+        die(2, f"unknown flag {unknown[0]} for `wizlab {' '.join(verb)}`; "
+               f"known: {' '.join(sorted(FLAGS[verb])) or '(none)'}")
+
+
+def _run(argv):
+    """Exit code for one invocation. One structural guard: any uncaught exception is a bug/invocation
+    error (2), never a raw traceback exiting 1 (which a learner check would read as "you're wrong")."""
     try:
-        if len(sys.argv) < 3 or (sys.argv[1], sys.argv[2]) not in VERBS:
-            die(2, f"usage: wizlab {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
-        VERBS[(sys.argv[1], sys.argv[2])](sys.argv[3:])
+        if len(argv) < 2 or (argv[0], argv[1]) not in VERBS:
+            die(2, f"usage: wizlab [--check] {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
+        verb = (argv[0], argv[1])
+        _check_flags(verb, argv[2:])
+        VERBS[verb](argv[2:])
     except WizlabError as e:
-        sys.exit(_fail(e))
+        return _fail(e)
+    except SystemExit as e:
+        return e.code or 0
     except Exception as e:
-        sys.exit(_fail(WizlabError(2, f"internal error: {type(e).__name__}: {e}")))
+        return _fail(WizlabError(2, f"internal error: {type(e).__name__}: {e}"))
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:1] == ["--check"]:
+        # The learner-check wrapper: anything but 0 is 1 (an out-of-list code puts the session in a
+        # terminal `validating_error`), with the real code on stderr for the setup log.
+        code = _run(argv[1:])
+        if code:
+            print(f"wizlab: exit {code}", file=sys.stderr)
+            sys.exit(1)
+        return
+    code = _run(argv)
+    if code:
+        sys.exit(code)
 
 
 if __name__ == "__main__":

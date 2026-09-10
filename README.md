@@ -40,7 +40,8 @@ while IFS= read -r -d '' kv; do export "$kv"; done < /proc/1/environ
 
 `wizlab` exit codes: 0 satisfied · 1 not satisfied · 2 invocation · 3
 environment. In learner checks, remap 2/3 to 1 (an out-of-list code puts the
-session in a terminal `validating_error`); consume them raw in CI.
+session in a terminal `validating_error`) with `wizlab --check <noun> <verb> …`,
+which prints the real code on stderr; consume them raw in CI.
 
 Review backlog, ranked by return on effort: `research/review.md`.
 

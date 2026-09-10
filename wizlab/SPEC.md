@@ -15,7 +15,9 @@ wrappers (one `wizlab` call + an exit-code remap). Change it only within this co
 | reap | audit + prefix cleanup of a session's footprint |
 | tenant | (`wiz`) emit live tenant connector facts as `KEY=value` (+ `$EXEC_OUTPUT`) for a script/terraform; grow by adding keys, never removing |
 
-Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1.
+Exit codes: 0 satisfied · 1 not · 2 invocation error · 3 environment error. Learner checks remap 2/3→1:
+`wizlab --check <noun> <verb> …` does the remap and prints the real code on stderr. A flag the verb does
+not read is invocation error 2 (`FLAGS`), never ignored.
 
 ### What `user reap` exit 0 promises
 One outcome per resource: `removed`, `absent`, `deferred`, `unknown`, `failed`. Exit 3 is `failed` or

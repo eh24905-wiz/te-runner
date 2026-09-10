@@ -2,7 +2,7 @@
 
 Every finding from the code-level and design-level reviews, one row each, ranked by payoff per unit
 of work. Effort: S = under a day, M = days, L = a week or cross-repo. Baseline: `ruff` clean, radon
-average B with 13 functions at C, 243 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
+average B with 13 functions at C, 246 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
 Symbols name `wizlab/wizlab` unless a path is given. The last column is the blast radius: what the fix
 touches, what depends on it (tests, labs, other repos), and where the fixing agent looks next.
 
@@ -16,7 +16,7 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 
 | # | Finding | Do | Effort | Blast radius → guidance |
 |---|---|---|---|---|
-| 15 | Hand-rolled `_flag`: fixed twice in the log, unknown flags silently ignored (`SPEC.md` records it), `--require` validated nine times, `int(_flag(...) or "N")` ten times | argparse subparsers: `choices=` for `--require`, `type=int`, unknown flag exits 2 | M | 84 `_flag` sites plus six `"--x" in args` switches (`--all`, `--commit`, `--dry-run`, `--exact-name`, `--match-only`, `--no-self`); every `cmd_*` takes `args` as a list. `FlagParsing` tests call `_flag` directly. Cross-repo: unknown-flag exit 2 turns a misspelled flag in any of the 47 lab wrappers from a silent pass into a learner failure, so grep every wrapper's flags against the parser before the tag ships. `--min-runner` must parse before any other validation. |
+| 15 | Hand-rolled `_flag`: `--require` validated nine times, `int(_flag(...) or "N")` ten times | argparse per verb with `FLAGS` as its spec: `choices=` for `--require`, `type=int` | S | 86 `_flag` sites plus six `"--x" in args` switches; every `cmd_*` takes `args` as a list. `FlagParsing` tests call `_flag` directly. Unknown flags already exit 2 through `_check_flags`, so this is shape, not contract. |
 | 16 | One 2,783-line file with no `.py`: SourceFileLoader hacks in three files, explicit ruff paths, no editor tooling. Stdlib-only still holds and stays | package `wizlab/` with `__main__.py`, two-line shim at `/usr/local/bin/wizlab`; no runtime deps added | M | Dockerfile `COPY`, `lint.yml` ruff/xenon/radon paths, both test loaders (#10). The executable path stays: reaper `_wizlab` and every lab call `wizlab` by name. Do after #15 so module boundaries follow the CLI layer. |
 | 20 | Seven handlers have no test: `cmd_connector_delete`, `cmd_instance_inspect`, `cmd_sensor_ensure`, `cmd_sensor_delete`, `cmd_user_delete`, `cmd_user_login_url`, `cmd_wiz_queries`; five `_api` routers still dispatch on query substrings | cover the destructive and credential handlers first, through `exit_code(fn, argv, wiz=FakeWiz(...))`; move the remaining routers onto `FakeWiz` as their classes are touched | M | `ServiceAccountGrading` and `PolicyGrading` are the reference shape: the fake answers by top-level field and records `calls`/`docs`. |
 
@@ -24,7 +24,7 @@ touches, what depends on it (tests, labs, other repos), and where the fixing age
 
 | # | Finding | Do | Effort | Blast radius → guidance |
 |---|---|---|---|---|
-| 21 | 47 copies of `case $? in 0) exit 0 ;; *) exit 1 ;; esac` across 13 lab repos (44 that form, 2 `0) ;;`, 3 commented out) | `wizlab --check <noun> <verb>` collapses to 0/1 and prints the real code on stderr | S + repins | `main` gains one leading switch. `te-labkit-v2/authoring/architecture.md` documents the wrapper and changes with it. Order: ship the tag, repin, then drop wrappers per repo; a wrapper left in place stays correct. |
+| 21 | 47 copies of `case $? in 0) exit 0 ;; *) exit 1 ;; esac` across 13 lab repos | repin to the tag carrying `wizlab --check`, then replace each wrapper line per repo | S + repins | `te-labkit-v2/authoring/architecture.md` already shows the `--check` form. A wrapper left in place stays correct. |
 | 22 | `lease` (~320 lines), `wiz queries`, `wiz type`, `audit user` run only on an operator machine, yet each fix is an image tag and a repin in 13 repos; `te-labkit-v2/scripts/dev-access.py` (108 lines) holds the other half of dev access | move them to labkit; image keeps only the entrypoint's `TS_AUTHKEY` path | M | Moves `_ts`, `_iq`, `_scrub`, `_keypair_dir`, `_owned_keys` and the `LeaseDevAccess` tests with them; `_post` and `_submissions` are shared, so the moved code imports or copies them. Labkit docs naming `wizlab lease`: `CLAUDE.md`, `authoring/pipeline.md`, track `research.md` files. The `SPEC.md` lease section moves too. |
 | 26 | `ensure` postconditions differ per noun with no stated rule: `_ensure_sa` exits 0 with no credentials on an existing account; `cmd_serviceaccount_ensure` deletes and re-mints; `cmd_policy_ensure` ignores `--count-threshold` on an existing policy; `cmd_outpost_ensure` does not reconcile; `cmd_lease_inspect` passes with no local private key | write the per-noun postcondition in `SPEC.md`, then make each verb meet it | M | `cmd_connector_ensure` is the one verb that reconciles; use its shape. Tests pin today's behaviour: `ServiceAccountGrading` and `PolicyGrading` assert exit 0 with no mutation on `existing=True`. Lab impact: a solve re-run through `_ensure_sa` emits no `WIZ_API_CLIENT_SECRET`, so the sensor install line downstream gets an empty value. Change `SPEC.md` first (operator approves), then code and tests together. |
 
@@ -42,7 +42,6 @@ Every measurement carrying its reproducer. One pinned image per lab.
 
 ## Next actions
 
-1. #15 then #16, in that order; each makes the next smaller. One constraint: #15's unknown-flag exit 2
-   turns a misspelled flag in any of the 47 lab wrappers into a learner failure, so `te-labkit-v2/scripts/runner-floor.py`
-   runs against every lab repo before that tag ships (all ten pass at their current pins).
+1. Tag: `FLAGS` and `--check` are in main; every lab passes `te-labkit-v2/scripts/runner-floor.py --at HEAD`.
+   Then #16, then #15's argparse shape inside the package split.
 2. #21 and #22 need a labkit PR and a repin round; batch them with the next verb release.
