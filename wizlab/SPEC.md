@@ -64,7 +64,10 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   not imply it scanned anything** (4 of 7 live ones had scanned nothing), and a direct delete fails.
   All measured — grade and reap off `measurements.yaml outpost_lifecycle.aws`, never off the status
   name's plain meaning.
-- `connector ensure|inspect|delete` — a Cloud Connector. AWS `ensure` sets
+- `connector ensure|inspect|delete` — a Cloud Connector. `ensure` converges only on AWS: it creates
+  the connector if absent, else corrects a drifted `authParams.customerRoleARN` (the repair path).
+  GCP and Azure `ensure` are create-if-absent — the connector carries no ARN to drift, so an existing
+  one is left as found and exits 0. AWS `ensure` sets
   `authParams.customerRoleARN`; `--outpost-id`, or `--outpost-name` (default: the session stem, the name
   the console dropdown shows), with `--scanner-role-arn` also sets `authParams.outpostId` and
   `authParams.diskAnalyzer.scanner.roleARN` — the second phase of an Outpost deploy, without which Wiz
