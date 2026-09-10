@@ -265,11 +265,16 @@ planes:
       # supported") and unnecessary: a create carrying enabled:true is already live.
     blue_agent:
       # Threat -> aiAnalysis. TBCMP has it enabled: every recent HIGH/CRITICAL THREAT_DETECTION issue reads
-      # COMPLETED. Trigger-to-COMPLETED is unmeasured: triggerThreatAIAnalysis refuses a THIRD_PARTY
-      # service account regardless of scope (admin:all held). Integration SAs are minted by adding an
-      # integration on the Connect page, never from New Service Account; portal manual runs are capped
-      # at 5/day/tenant and are not reachable from a workflow.
+      # COMPLETED. Trigger-to-COMPLETED is not measurable from a grader: triggerThreatAIAnalysis refuses
+      # a THIRD_PARTY service account regardless of scope (admin:all held), and the only INTEGRATION-type
+      # account holding write:trigger_threat_ai_analysis is Wiz's own WIZ_SYSTEM one, which no operator
+      # can mint or read a secret for. CORTEX_XSOAR_V2 and AXONIUS integration accounts carry threat
+      # write scopes but not the trigger. Portal manual runs are capped at 5/day/tenant and are not
+      # reachable from a workflow, so a lab grading a verdict picks a Threat already analyzed.
       manual_runs_per_day: 5
+      trigger_scope_holders: [WIZ_SYSTEM]   # integration.type of every INTEGRATION SA with the scope
+      verify_scope_holders: |
+        serviceAccounts(first: 100) { nodes { type scopes integration { type } } }   # page on endCursor
       status_enum: [PENDING, IN_PROGRESS, COMPLETED, RATE_LIMITED]
       verdict_enum_observed: [MALICIOUS, NOT_MALICIOUS, SECURITY_TEST, PLANNED_ACTION]
       trigger_refusal: "this mutation is only available for users and integration service accounts"  # extensions.code INTERNAL, HTTP 200
