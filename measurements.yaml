@@ -266,8 +266,10 @@ planes:
     blue_agent:
       # Threat -> aiAnalysis. TBCMP has it enabled: every recent HIGH/CRITICAL THREAT_DETECTION issue reads
       # COMPLETED. Trigger-to-COMPLETED is unmeasured: triggerThreatAIAnalysis refuses a THIRD_PARTY
-      # service account regardless of scope (admin:all held), so a sample needs an INTEGRATION-type SA
-      # or a portal click.
+      # service account regardless of scope (admin:all held). Integration SAs are minted by adding an
+      # integration on the Connect page, never from New Service Account; portal manual runs are capped
+      # at 5/day/tenant and are not reachable from a workflow.
+      manual_runs_per_day: 5
       status_enum: [PENDING, IN_PROGRESS, COMPLETED, RATE_LIMITED]
       verdict_enum_observed: [MALICIOUS, NOT_MALICIOUS, SECURITY_TEST, PLANNED_ACTION]
       trigger_refusal: "this mutation is only available for users and integration service accounts"  # extensions.code INTERNAL, HTTP 200
