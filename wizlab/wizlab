@@ -156,7 +156,10 @@ DETECTIONS_Q = """query Dets($f: DetectionFilters) {
 # returns a null serviceAccount. ---
 OUTPOSTS_Q = """query Outposts($s: String, $after: String) {
   outposts(first: 50, after: $after, filterBy: { search: $s, serviceType: [AWS] }) {
-    nodes { id name status inAccountOutpostType serviceType allowedRegions config { ... on OutpostAWSConfig { roleARN } } }
+    nodes {
+      id name status inAccountOutpostType serviceType allowedRegions
+      config { ... on OutpostAWSConfig { roleARN } }
+    }
     totalCount pageInfo { hasNextPage endCursor }
   }
 }"""
@@ -1161,7 +1164,10 @@ def cmd_codescan_inspect(args):
 # that names it is gated. ---
 CICD_POLICIES_Q = """query CicdPolicies($f: CICDScanPolicyFilters, $after: String) {
   cicdScanPolicies(first: 50, after: $after, filterBy: $f) {
-    nodes { id name params { ... on CICDScanPolicyParamsIAC { severityThreshold countThreshold cloudConfigurationRules { id } } } }
+    nodes {
+      id name
+      params { ... on CICDScanPolicyParamsIAC { severityThreshold countThreshold cloudConfigurationRules { id } } }
+    }
     pageInfo { hasNextPage endCursor }
   }
 }"""
@@ -1627,7 +1633,7 @@ def cmd_outpost_ensure(args):
         # A role change is a knowing delete-and-recreate, never a silent "nothing to do".
         _drift(f"outpost {name} ({existing['id']})", [
             ("roleARN", (existing.get("config") or {}).get("roleARN"), role_arn),
-            ("allowedRegions", existing.get("allowedRegions"), [_flag(args, "--region")] if _flag(args, "--region") else None),
+            ("allowedRegions", existing.get("allowedRegions"), [region] if _flag(args, "--region") else None),
         ])
         print(f"outpost {name} already exists ({existing['id']}) status={existing['status']}; nothing to do")
         return

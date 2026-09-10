@@ -4,6 +4,8 @@
 # contract, not an oversight.
 target-version = "py312"
 line-length = 120
+# The CLI has no .py extension; without this `ruff check .` skips it and only CI's explicit path saw it.
+extend-include = ["wizlab/wizlab"]
 
 [lint]
 select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
