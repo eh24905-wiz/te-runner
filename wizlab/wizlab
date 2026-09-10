@@ -218,6 +218,27 @@ def _fail(e):
     return e.code
 
 
+def _exact(nodes, name):
+    """The node named exactly `name`: every list filter is a substring match, so == is the caller's."""
+    return next((n for n in nodes if n.get("name") == name), None)
+
+
+def _prefer(nodes, status):
+    """The node in `status` if there is one, else the first: a healthy record outranks a stale one left
+    on a recycled name."""
+    return sorted(nodes, key=lambda n: n.get("status") != status)[0] if nodes else None
+
+
+def _emit(lines):
+    """KEY=value lines to stdout and, under an Instruqt `exec` resource, to $EXEC_OUTPUT, where a note
+    reads them back as resource.exec.<name>.output.<KEY>."""
+    sys.stdout.write(lines)
+    out = os.getenv("EXEC_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(lines)
+
+
 def _runner_id():
     """This image's own identity — `(tag, rev)`, baked at build from the git tag and sha it was built
     from. Read per call, not once at import, so a test can set it. Empty on an image built before
@@ -302,18 +323,29 @@ def _post(url, data, headers, attempts=3):
     die(3, f"after {attempts} attempts: {last}")
 
 
+_DEFAULT_TENANT = "TBCMP"
+
+
+def _tenant():
+    return os.getenv("WIZ_TENANT", _DEFAULT_TENANT)
+
+
+def _tenant_env(name):
+    """WIZ_<TENANT>_<name>, else the tenant-less WIZ_<name> a single-tenant env still sets."""
+    return os.getenv(f"WIZ_{_tenant()}_{name}") or os.getenv(f"WIZ_{name}")
+
+
 _TOKENS = {}
 
 
 def token_and_dc():
     """(token, dc, tid) for the tenant, minted once and reused until a minute before its `exp`: one
     verdict used to cost up to six mints, each a round trip to the auth server."""
-    tenant = os.getenv("WIZ_TENANT", "TBCMP")
+    tenant = _tenant()
     hit = _TOKENS.get(tenant)
     if hit and hit[3] - time.time() > 60:
         return hit[:3]
-    cid = os.getenv(f"WIZ_{tenant}_CLIENT_ID") or os.getenv("WIZ_CLIENT_ID")
-    sec = os.getenv(f"WIZ_{tenant}_CLIENT_SECRET") or os.getenv("WIZ_CLIENT_SECRET")
+    cid, sec = _tenant_env("CLIENT_ID"), _tenant_env("CLIENT_SECRET")
     if not cid or not sec:
         die(3, f"WIZ_{tenant}_CLIENT_ID / _CLIENT_SECRET not in environment")
     payload = urllib.parse.urlencode(
@@ -578,12 +610,7 @@ def cmd_wiz_tenant(args):
     # requires — emitting a key is this verb's job, needing it is the script's.
     if not any(facts.values()):
         die(3, "managedIdentityParameters returned no usable tenant facts (no aws roleArn, no gcp SA, no tid)")
-    lines = "".join(f"{k}={v}\n" for k, v in facts.items() if v)
-    sys.stdout.write(lines)
-    out = os.getenv("EXEC_OUTPUT")
-    if out:
-        with open(out, "a") as f:
-            f.write(lines)
+    _emit("".join(f"{k}={v}\n" for k, v in facts.items() if v))
 
 
 def cmd_wiz_queries(args):
@@ -650,6 +677,16 @@ def cmd_audit_user(args):
         die(3, f"{alert}; the list above is incomplete")
 
 
+def _account_id(args, verb):
+    return _norm_account(_flag(args, "--account-id") or die(2, f"{verb} needs --account-id"))
+
+
+def _named(args, suffix=""):
+    """--name, else the session stem plus `suffix`: the reaper sweeps the stem, so a default name is
+    always within its reach; --name is for a manual or dev run."""
+    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}{suffix}"
+
+
 def _cloud(args):
     # Defaults to aws so every pre-GCP lab keeps working unchanged. The default is also the trap it
     # replaced: find_connector(cloud="aws") silently returned nothing for a live CONNECTED GCP
@@ -670,7 +707,7 @@ def _stem_opt(args):
 
 def cmd_connector_inspect(args):
     cloud = _cloud(args)
-    account = _norm_account(_flag(args, "--account-id") or die(2, "connector inspect needs --account-id"))
+    account = _account_id(args, "connector inspect")
     require = _flag(args, "--require") or "exists"
     if require not in ("exists", "healthy", "outpost-bound"):
         die(2, f"--require must be exists|healthy|outpost-bound, got {require}")
@@ -826,7 +863,7 @@ def cmd_connector_ensure(args):
     """Idempotent converge: create the connector if absent, else correct its customerRoleARN if it
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
     cloud = _cloud(args)
-    account = _norm_account(_flag(args, "--account-id") or die(2, "connector ensure needs --account-id"))
+    account = _account_id(args, "connector ensure")
     # gcp/azure are create-if-absent (no ARN to drift); only aws falls through to the repair path.
     if cloud == "gcp":
         return _ensure_gcp(args, account)
@@ -857,7 +894,7 @@ def cmd_connector_ensure(args):
 
 def cmd_connector_delete(args):
     cloud = _cloud(args)
-    account = _norm_account(_flag(args, "--account-id") or die(2, "connector delete needs --account-id"))
+    account = _account_id(args, "connector delete")
     matches = find_connector(account, cloud, _stem_opt(args))
     if not matches:
         print(f"no connector targets {account}; nothing to delete")
@@ -870,7 +907,7 @@ def cmd_connector_delete(args):
 def cmd_instance_inspect(args):
     """Assert a scanned cloud resource of --type (default VIRTUAL_MACHINE) exists in Wiz for the
     account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check."""
-    account = _norm_account(_flag(args, "--account-id") or die(2, "instance inspect needs --account-id"))
+    account = _account_id(args, "instance inspect")
     rtype = _flag(args, "--type") or "VIRTUAL_MACHINE"
     data, _ = api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
     n = (data.get("cloudResources") or {}).get("totalCount") or 0
@@ -879,24 +916,22 @@ def cmd_instance_inspect(args):
 
 
 def _sensor_name(args):
-    # The installed sensor's name == the host name, which a lab pins to the session stem. So the stem
-    # is the sensor's scoping key; --name overrides for a manual/dev run.
-    return _flag(args, "--name") or _lab_stem(_session_id(args))
+    # The installed sensor's name == the host name, which a lab pins to the session stem.
+    return _named(args)
 
 
 def _sa_name(args):
-    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}-sensor"
+    return _named(args, "-sensor")
 
 
 def _resolve_sensor(name):
     """The sensor whose name exactly matches, ACTIVE-first (search is substring, so filter to ==)."""
-    nodes = [n for n in _all_nodes(SENSORS_Q, {"s": name}, "sensors") if n.get("name") == name]
-    return sorted(nodes, key=lambda n: n.get("status") != "ACTIVE")[0] if nodes else None
+    return _prefer([n for n in _all_nodes(SENSORS_Q, {"s": name}, "sensors") if n.get("name") == name], "ACTIVE")
 
 
 def _find_sa(name):
     """The service account whose name matches exactly (the filter is substring, so filter to ==)."""
-    return next((n for n in _all_nodes(SA_FIND, {"n": name}, "serviceAccounts") if n.get("name") == name), None)
+    return _exact(_all_nodes(SA_FIND, {"n": name}, "serviceAccounts"), name)
 
 
 def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
@@ -916,12 +951,7 @@ def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
     cid, sec = sa.get("clientId"), sa.get("clientSecret")
     if not cid or not sec:
         die(3, "createServiceAccount returned no client credentials")
-    lines = f"{id_var}={cid}\n{secret_var}={sec}\n"
-    sys.stdout.write(lines)
-    out = os.getenv("EXEC_OUTPUT")
-    if out:
-        with open(out, "a") as f:
-            f.write(lines)
+    _emit(f"{id_var}={cid}\n{secret_var}={sec}\n")
     print(f"created {label} service account {name} ({sa['id']})", file=sys.stderr)
 
 
@@ -1008,13 +1038,12 @@ CREATE_CLI_DEPLOYMENT = """mutation CreateCliDeployment($input: CreateCliDeploym
 
 
 def _cli_dep_name(args):
-    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}-cli"
+    return _named(args, "-cli")
 
 
 def _find_cli_deployment(name):
     """The WIZ_CLI deployment whose name matches exactly (search is substring, so filter to ==)."""
-    nodes = _all_nodes(CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": name}}, "deployments")
-    return next((n for n in nodes if n.get("name") == name), None)
+    return _exact(_all_nodes(CLI_DEPLOYMENTS_Q, {"f": {"type": ["WIZ_CLI"], "search": name}}, "deployments"), name)
 
 
 def _delete_cli_deployment(dep_id):
@@ -1037,12 +1066,7 @@ def cmd_serviceaccount_ensure(args):
     cid, sec = sa.get("clientId"), payload.get("clientSecret")
     if not cid or not sec:
         die(3, "createCliDeployment returned no client credentials")
-    lines = f"WIZ_CLIENT_ID={cid}\nWIZ_CLIENT_SECRET={sec}\n"
-    sys.stdout.write(lines)
-    out = os.getenv("EXEC_OUTPUT")
-    if out:
-        with open(out, "a") as f:
-            f.write(lines)
+    _emit(f"WIZ_CLIENT_ID={cid}\nWIZ_CLIENT_SECRET={sec}\n")
     print(f"created wiz cli deployment {name} ({dep.get('id')})", file=sys.stderr)
 
 
@@ -1155,8 +1179,7 @@ def _policy_name(args):
 
 def _find_policy(name):
     """The IaC CI/CD scan policy whose name matches exactly (names filter is a contains, so ==)."""
-    nodes = _all_nodes(CICD_POLICIES_Q, {"f": {"type": ["IAC"], "names": [name]}}, "cicdScanPolicies")
-    return next((n for n in nodes if n.get("name") == name), None)
+    return _exact(_all_nodes(CICD_POLICIES_Q, {"f": {"type": ["IAC"], "names": [name]}}, "cicdScanPolicies"), name)
 
 
 def _resolve_dockerfile_control(search):
@@ -1287,7 +1310,7 @@ RUN_WORKFLOW_TEST = """mutation RunWorkflowTest($input: RunAutomationWorkflowTes
 
 
 def _workflow_stem(args):
-    return _flag(args, "--name") or _lab_stem(_session_id(args))
+    return _named(args)
 
 
 def _resolve_workflows(name, exact=False):
@@ -1510,16 +1533,14 @@ def cmd_workflowrun_ensure(args):
 
 
 def _outpost_name(args):
-    # The Outpost's Wiz name, pinned to the session stem so the reaper's `search` finds it and
-    # concurrent leases never collide. --name overrides for a manual/dev run.
-    return _flag(args, "--name") or _lab_stem(_session_id(args))
+    # Pinned to the session stem so the reaper's `search` finds it and concurrent leases never collide.
+    return _named(args)
 
 
 def _resolve_outpost(name):
     """The AWS Outpost whose name exactly matches (search is substring, so filter to ==),
     CONNECTED-first so a healthy one outranks a stale UNINSTALLED record on a recycled name."""
-    nodes = [n for n in _all_nodes(OUTPOSTS_Q, {"s": name}, "outposts") if n.get("name") == name]
-    return sorted(nodes, key=lambda n: n.get("status") != "CONNECTED")[0] if nodes else None
+    return _prefer([n for n in _all_nodes(OUTPOSTS_Q, {"s": name}, "outposts") if n.get("name") == name], "CONNECTED")
 
 
 _OUTPOST_REQUIRE = {"exists", "initialized", "connected", "scanned"}
@@ -1764,11 +1785,8 @@ def _wiz_azure_object_id():
     exposes only the Application id) and unreadable from the lease (the lookup is Microsoft Graph,
     which Instruqt's Entra policy denies), so it is an operator secret — tenant-keyed exactly like
     the client id/secret in token_and_dc()."""
-    tenant = os.getenv("WIZ_TENANT", "TBCMP")
-    oid = os.getenv(f"WIZ_{tenant}_AZURE_APP_OBJECT_ID") or os.getenv("WIZ_AZURE_APP_OBJECT_ID")
-    if not oid:
-        die(3, f"WIZ_{tenant}_AZURE_APP_OBJECT_ID not in environment (operator secret; not wired?)")
-    return oid
+    return _tenant_env("AZURE_APP_OBJECT_ID") or die(
+        3, f"WIZ_{_tenant()}_AZURE_APP_OBJECT_ID not in environment (operator secret; not wired?)")
 
 
 def _role_inspect_azure(args):
@@ -1987,14 +2005,20 @@ def _kc_call(method, url, token, body=None):
         die(3, f"Keycloak transport failure to {url}: {type(e).__name__}: {e}")
 
 
+def _kc(method, url, token, payload=None, ok=(200,), what="Keycloak"):
+    """_kc_call whose status outside `ok` is an environment failure named by `what`; returns the body."""
+    status, body = _kc_call(method, url, token, payload)
+    if status not in ok:
+        die(3, f"{what} HTTP {status}: {body[:300]!r}")
+    return body
+
+
 def _kc_user_id(endpoint, realm, token, email):
     # `search` is a substring match: a prefix collision (bob@x vs bob@x.io) would return the wrong
     # learner and a group-join/DELETE would hit them, so filter to an exact username/email and refuse
     # to guess on >1.
     q = urllib.parse.urlencode({"exact": "true", "briefRepresentation": "true", "search": email})
-    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users?{q}", token)
-    if status != 200:
-        die(3, f"Keycloak user lookup HTTP {status}")
+    body = _kc("GET", f"{endpoint}/admin/realms/{realm}/users?{q}", token, what="Keycloak user lookup")
     exact = [u for u in json.loads(body or b"[]") if email in (u.get("username"), u.get("email"))]
     if len(exact) > 1:
         die(3, f"{len(exact)} Keycloak users exactly match {email}; refusing to guess")
@@ -2003,9 +2027,7 @@ def _kc_user_id(endpoint, realm, token, email):
 
 def _kc_group_id(endpoint, realm, token, group):
     q = urllib.parse.urlencode({"search": group, "exact": "true"})
-    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/groups?{q}", token)
-    if status != 200:
-        die(3, f"Keycloak group lookup HTTP {status}")
+    body = _kc("GET", f"{endpoint}/admin/realms/{realm}/groups?{q}", token, what="Keycloak group lookup")
     groups = json.loads(body or b"[]")
     if not groups:
         die(3, f"Keycloak group '{group}' not found in realm '{realm}'")
@@ -2049,11 +2071,10 @@ def _wiz_login_url():
     fails against, and the learner blames their creds. Only this IdP-init URL routes them straight
     to the lab's Keycloak. Full-URL env overrides win so a track can pin it.
     """
-    tenant = os.getenv("WIZ_TENANT", "TBCMP")
-    override = os.getenv("WIZ_LOGIN_URL") or os.getenv(f"WIZ_{tenant}_LOGIN_URL")
+    override = _tenant_env("LOGIN_URL")
     if override:
         return override
-    sso = _TENANT_SSO.get(tenant)
+    sso = _TENANT_SSO.get(_tenant())
     if not sso:
         return None
     _tok, _dc, tid = token_and_dc()
@@ -2092,41 +2113,26 @@ def cmd_user_ensure(args):
     pwd = _gen_password()
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
-        status, body = _kc_call(
-            "POST",
-            f"{endpoint}/admin/realms/{realm}/users",
-            token,
-            {
-                "email": email,
-                "username": email,
-                "firstName": name,
-                "lastName": "Student",
-                "emailVerified": True,
-                "enabled": True,
-                "requiredActions": [],
-                "credentials": [{"type": "password", "value": pwd, "temporary": False}],
-            },
-        )
-        if status != 201:
-            die(3, f"create user HTTP {status}: {body[:300]!r}")
+        _kc("POST", f"{endpoint}/admin/realms/{realm}/users", token, {
+            "email": email,
+            "username": email,
+            "firstName": name,
+            "lastName": "Student",
+            "emailVerified": True,
+            "enabled": True,
+            "requiredActions": [],
+            "credentials": [{"type": "password", "value": pwd, "temporary": False}],
+        }, ok=(201,), what="create user")
         uid = _kc_user_id(endpoint, realm, token, email)
         if uid is None:
             die(3, f"created {email} but Keycloak does not return it on re-lookup")
         action = "created"
     else:
-        status, body = _kc_call(
-            "PUT",
-            f"{endpoint}/admin/realms/{realm}/users/{uid}/reset-password",
-            token,
-            {"type": "password", "value": pwd, "temporary": False},
-        )
-        if status not in (200, 204):
-            die(3, f"reset-password HTTP {status}: {body[:300]!r}")
+        _kc("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/reset-password", token,
+            {"type": "password", "value": pwd, "temporary": False}, ok=(200, 204), what="reset-password")
         action = "reset"
     gid = _kc_group_id(endpoint, realm, token, group)
-    status, body = _kc_call("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups/{gid}", token)
-    if status not in (200, 204):
-        die(3, f"group-join HTTP {status}: {body[:300]!r}")
+    _kc("PUT", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups/{gid}", token, ok=(200, 204), what="group-join")
     _publish_user(email, pwd)
     print(f"user {action}: {email} (group {group})")
 
@@ -2138,10 +2144,7 @@ def cmd_user_inspect(args):
     if uid is None:
         print(f"no Keycloak user {email}")
         sys.exit(1)
-    status, body = _kc_call("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token)
-    if status != 200:
-        die(3, f"Keycloak group lookup for {email} HTTP {status}: "
-               f"{body.decode(errors='replace')[:300]}")
+    body = _kc("GET", f"{endpoint}/admin/realms/{realm}/users/{uid}/groups", token, what=f"Keycloak groups of {email}")
     groups = [g.get("name") for g in json.loads(body or b"[]")]
     if group not in groups:
         print(f"user {email} exists but is not in group {group}; groups={groups}")
@@ -2224,7 +2227,7 @@ def _reap_service_account(tok, dc, h, rid, name):
     if errs:
         return FAILED, f"deployment lookup failed ({errs[0].get('message', '?')})"
     nodes = ((data.get("deployments") or {}).get("nodes") or [])
-    owner = next((n for n in nodes if n.get("name") == dep), None)
+    owner = _exact(nodes, dep)
     if not owner:
         # Nothing left that can delete this record, so blocking would retain the user forever with no
         # pass able to clear it. UNKNOWN reports the residue without holding the handle.

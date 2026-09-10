@@ -381,6 +381,17 @@ class Naming(unittest.TestCase):
             wz._session_id([])
         self.assertEqual(cm.code, 2)
 
+    def test_tenant_keyed_env_wins_over_the_tenant_less_name(self):
+        env = {"WIZ_TENANT": "T2", "WIZ_T2_CLIENT_ID": "keyed", "WIZ_CLIENT_ID": "plain"}
+        with mock.patch.dict(wz.os.environ, env, clear=True):
+            self.assertEqual(wz._tenant_env("CLIENT_ID"), "keyed")
+        with mock.patch.dict(wz.os.environ, {"WIZ_CLIENT_ID": "plain"}, clear=True):
+            self.assertEqual((wz._tenant(), wz._tenant_env("CLIENT_ID")), (wz._DEFAULT_TENANT, "plain"))
+
+    def test_default_names_hang_off_the_session_stem(self):
+        self.assertEqual(wz._named(["--session", "s1"], "-cli"), "lab-s1-cli")
+        self.assertEqual(wz._named(["--session", "s1", "--name", "mine"], "-cli"), "mine")
+
     def test_user_email_keyed_on_session(self):
         self.assertEqual(wz._lab_user_email(["--session", "s1"])[0], "lab-s1@titra-labs.ai")
 
