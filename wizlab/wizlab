@@ -935,14 +935,15 @@ def _find_sa(name):
 
 
 def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
-    """Create a service account named on the session stem so the reaper sweeps it, parameterized over
-    type + scopes (SENSOR takes none; a CLI account takes create:security_scans etc.). Idempotent by
-    name: the client secret is shown once and is not re-fetchable, so a re-run reports the existing
-    account rather than minting a duplicate. Emits <id_var>/<secret_var> to stdout and $EXEC_OUTPUT.
+    """Converge to ONE fresh service account named on the session stem, parameterized over type +
+    scopes (SENSOR takes none; a CLI account takes create:security_scans etc.). The client secret is
+    shown once and not re-fetchable, so an existing account is deleted and re-minted: every run emits
+    <id_var>/<secret_var> to stdout and $EXEC_OUTPUT (postconditions: SPEC.md §What `ensure` promises).
     Solve/setup only — never a learner check (it prints a secret)."""
-    if _find_sa(name):
-        print(f"service account {name} already exists; secret not re-fetchable", file=sys.stderr)
-        return
+    existing = _find_sa(name)
+    if existing:
+        api(_delete_doc("deleteServiceAccount"), {"id": existing["id"]})
+        print(f"deleted {label} service account {name} ({existing['id']}); re-minting", file=sys.stderr)
     inp = {"name": name, "type": sa_type}
     if scopes:
         inp["scopes"] = scopes
@@ -2722,8 +2723,11 @@ def cmd_lease_inspect(args):
         die(3, f"{len(live)} nodes match {match!r}: {', '.join(h for _, _, h in live)}; narrow --hostname")
     age, addr, host = live[0]
     priv = _keypair_dir(args) / "id_ed25519"
+    if not priv.exists():
+        # `reachable` promises usable ssh, not node freshness: without the key the next step fails anyway.
+        die(3, f"{host} is up but {priv} is missing; `lease ensure --lab` mints it before the play")
     print(f"GRADER_IP={addr}")
-    print(f"LEASE_SSH_KEY={priv if priv.exists() else ''}")
+    print(f"LEASE_SSH_KEY={priv}")
     print(f"{host} seen {int(age)}s ago", file=sys.stderr)
 
 

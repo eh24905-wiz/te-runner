@@ -28,6 +28,20 @@ NOT promise the session created nothing else; that residue is counted as `unknow
 `unknown` is rejected — handler coverage is partial by construction, so it would fail every reap and
 retain every user. Operator decision, 2026-09-05.
 
+### What `ensure` promises
+Exit 0 means the object matches every flag the call named, and what changed is printed. Where the
+verb cannot make that true it exits 3 naming the difference and mutates nothing. Operator decision,
+2026-09-10, forced by a solve re-run handing the sensor install an empty secret.
+
+| noun | object exists | rule |
+|---|---|---|
+| sensor, serviceaccount | any | delete, re-mint, emit credentials: the secret is shown once and not re-fetchable |
+| connector (aws), workflow, user, lease | drifted | patch / reset / rotate to the requested state |
+| connector (gcp, azure) | any | left as found, exit 0: nothing in it can drift |
+| policy | flags differ from the live params | exit 3, no mutation: a shared tenant fixture other labs grade against changes deliberately |
+| outpost | `--role-arn`/`--region` differ | exit 3, no mutation: a role change is a knowing delete-and-recreate |
+| lease inspect `--require reachable` | node fresh, local key missing | exit 3: reachable promises usable ssh, not freshness |
+
 ### Runner identity, and the floor `session verify` enforces
 The image carries its own `TE_RUNNER_TAG` + `TE_RUNNER_REV`, baked from the git tag and sha CI built
 (`Dockerfile` ARG→ENV, plus OCI `image.version`/`image.revision` labels). A play pins HCL at import, so
@@ -75,7 +89,7 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   `authParams.diskAnalyzer.scanner.roleARN` — the second phase of an Outpost deploy, without which Wiz
   builds no scan cluster. `inspect --require exists|healthy|outpost-bound`.
 - `sensor ensure|delete|inspect` — a `type:SENSOR` service account is the sensor's credential
-  (`ensure` mints it named on the session stem, emits `WIZ_API_CLIENT_ID/SECRET`; `delete` removes it;
+  (`ensure` re-mints it named on the session stem, emits `WIZ_API_CLIENT_ID/SECRET`; `delete` removes it;
   the reaper's ServiceAccount sweep also covers it). `inspect --require active` asserts the sensor
   named for the session reports `ACTIVE`. Scoping key: the installed sensor's name == the host name,
   which a lab pins to the session stem (neither `SensorFilters` nor `DetectionFilters` has a
@@ -175,7 +189,7 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   reverse strands a live key. Between plays the team store holds no dev credential at all, so a lab
   shipped with the dev block live references names that do not exist.
 - `policy ensure|inspect|delete --name N` — the BLOCK CI/CD IaC scan policy a code-scan gate needs.
-  `ensure` is idempotent by name; absent, it creates a `type:IAC` policy with `enforcementMethod
+  `ensure` is idempotent by name (§What `ensure` promises); absent, it creates a `type:IAC` policy with `enforcementMethod
   BLOCK` on `deploymentLifecycle CLI`, scoped (`iacParams.cloudConfigurationRules`) to the builtin
   Dockerfile control 'Last User Is root' (resolved live via `cloudConfigurationRules`, never
   hard-coded; `--rule-id`/`--severity`/`--count-threshold` override), `default:false` so only a

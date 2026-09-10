@@ -1750,11 +1750,21 @@ class ServiceAccountGrading(unittest.TestCase):
         self.assertIn("WIZ_CLIENT_SECRET=secX", out)
 
     def test_ensure_deletes_existing_before_minting(self):
+        # Both credential verbs: the secret is shown once, so an existing account is replaced and every
+        # run emits credentials (SPEC.md §What `ensure` promises).
         wiz = self._wiz(existing=True)
         code, _ = self._run(wz.cmd_serviceaccount_ensure, [], wiz)
         self.assertEqual(code, 0)
         mutations = [f for f, _ in wiz.calls if f.startswith(("delete", "create"))]
         self.assertEqual(mutations, ["deleteCliDeployment", "createCliDeployment"])
+        sa = {"id": "sa1", "name": "lab-x-sensor", "clientId": "cidS", "clientSecret": "secS"}
+        wiz = FakeWiz(serviceAccounts={"nodes": [sa]}, createServiceAccount={"serviceAccount": sa})
+        code, out = self._run(wz.cmd_sensor_ensure, [], wiz)
+        self.assertEqual(code, 0)
+        self.assertEqual([f for f, _ in wiz.calls if f.startswith(("delete", "create"))],
+                         ["deleteServiceAccount", "createServiceAccount"])
+        self.assertEqual(wiz.sent("deleteServiceAccount"), [{"id": "sa1"}])
+        self.assertIn("WIZ_API_CLIENT_SECRET=secS", out)
 
     def test_ensure_missing_creds_is_environment_3(self):
         code, _ = self._run(wz.cmd_serviceaccount_ensure, [], self._wiz(existing=False, cid=None))
@@ -1913,15 +1923,23 @@ class LeaseDevAccess(unittest.TestCase):
         with mock.patch.object(wz, "_fresh_nodes", return_value=[]):
             self.assertEqual(self._exit(wz.cmd_lease_inspect, ["--lab", "te-dev-aws", "--session", "s1"]), 1)
 
-    def test_inspect_emits_grader_ip_and_the_key_that_opens_it(self):
+    def test_reachable_means_usable_ssh_not_a_fresh_node(self):
+        # An IP with no key is not access: the validator's next step fails anyway, so say it here (3).
+        priv = pathlib.Path(os.environ["WIZLAB_LEASE_DIR"]) / "te-dev-aws" / "id_ed25519"
+        priv.parent.mkdir(parents=True, exist_ok=True)
+        priv.unlink(missing_ok=True)
+        node = [(5.0, "100.64.0.7", "grader-aws-s1")]
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--lab", "te-dev-aws", "--session", "s1"]
+        self.assertEqual(exit_code(wz.cmd_lease_inspect, argv, out=out, err=err, _fresh_nodes=node), 3)
+        self.assertNotIn("GRADER_IP", out.getvalue())
+        self.assertIn(str(priv), err.getvalue())
+        priv.write_text("PRIVATE")
         out = io.StringIO()
-        with mock.patch.object(wz, "_fresh_nodes", return_value=[(5.0, "100.64.0.7", "grader-aws-s1")]), \
-             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
-             exits() as cm:
-            wz.cmd_lease_inspect(["--lab", "te-dev-aws", "--session", "s1"])
-        self.assertEqual(cm.code, 0)
+        self.assertEqual(exit_code(wz.cmd_lease_inspect, argv, out=out, _fresh_nodes=node), 0)
         self.assertIn("GRADER_IP=100.64.0.7", out.getvalue())
-        self.assertIn("LEASE_SSH_KEY=", out.getvalue())  # an IP with no key is not access
+        self.assertIn(f"LEASE_SSH_KEY={priv}", out.getvalue())
+        priv.unlink()
 
     def test_inspect_refuses_an_ambiguous_match(self):
         # Two live graders on one substring: the freshest is another play's node as often as ours.
