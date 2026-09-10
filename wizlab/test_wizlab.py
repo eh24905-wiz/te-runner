@@ -1652,6 +1652,18 @@ class LeaseDevAccess(unittest.TestCase):
         self.assertIn("GRADER_IP=100.64.0.7", out.getvalue())
         self.assertIn("LEASE_SSH_KEY=", out.getvalue())  # an IP with no key is not access
 
+    def test_inspect_refuses_an_ambiguous_match(self):
+        # Two live graders on one substring: the freshest is another play's node as often as ours.
+        two = [(5.0, "100.64.0.7", "awsconn101-aaa"), (9.0, "100.64.0.8", "awsconn101-bbb")]
+        err = io.StringIO()
+        with mock.patch.object(wz, "_fresh_nodes", return_value=two), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+             self.assertRaises(SystemExit) as cm:
+            wz.cmd_lease_inspect(["--lab", "te-dev-aws", "--hostname", "awsconn101-"])
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("awsconn101-aaa", err.getvalue())
+        self.assertIn("awsconn101-bbb", err.getvalue())
+
     def test_stale_node_is_not_reachable(self):
         # lastSeen freshness is the ONLY liveness signal: an ephemeral node lingers ~30 min after its
         # play, so an age-blind lookup hands the validator a dead grader.

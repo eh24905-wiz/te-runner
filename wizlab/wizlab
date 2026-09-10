@@ -2664,7 +2664,9 @@ def cmd_lease_ensure(args):
 
 def cmd_lease_inspect(args):
     """Resolve this session's grader over the tailnet (--require reachable), emitting GRADER_IP and
-    the private key that opens it. Exit 1 = not up yet, which is a wait, not a failure."""
+    the private key that opens it. Exit 1 = not up yet, which is a wait, not a failure. Two fresh nodes
+    on one substring is exit 3 naming both: the freshest is a guess, and a guess hands the validator
+    another play's grader with this play's key, which reads as every check broken."""
     require = _flag(args, "--require") or "reachable"
     if require != "reachable":
         die(2, f"--require must be reachable, got {require}")
@@ -2675,6 +2677,8 @@ def cmd_lease_inspect(args):
     if not live:
         print(f"no node matching {match!r} seen in the last {_NODE_FRESH_S}s")
         sys.exit(1)
+    if len(live) > 1:
+        die(3, f"{len(live)} nodes match {match!r}: {', '.join(h for _, _, h in live)}; narrow --hostname")
     age, addr, host = live[0]
     priv = _keypair_dir(args) / "id_ed25519"
     print(f"GRADER_IP={addr}")

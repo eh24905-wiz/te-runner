@@ -167,7 +167,8 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   (`PermitRootLogin prohibit-password`), so the pubkey is the only thing keeping a learner terminal
   off the container holding every operator secret. `inspect --require reachable` resolves the
   session's node by `lastSeen` freshness — the devices API exposes no `online` field and an ephemeral
-  node lingers ~30 min past its play — and emits `GRADER_IP` + `LEASE_SSH_KEY`. `delete` revokes by
+  node lingers ~30 min past its play — and emits `GRADER_IP` + `LEASE_SSH_KEY`; two fresh matches is
+  exit 3 naming both, never the freshest. `delete` revokes by
   key id, THEN drops both secrets and the private key: a crash that order strands a dead string, the
   reverse strands a live key. Between plays the team store holds no dev credential at all, so a lab
   shipped with the dev block live references names that do not exist.
