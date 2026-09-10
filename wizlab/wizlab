@@ -156,7 +156,7 @@ DETECTIONS_Q = """query Dets($f: DetectionFilters) {
 # returns a null serviceAccount. ---
 OUTPOSTS_Q = """query Outposts($s: String, $after: String) {
   outposts(first: 50, after: $after, filterBy: { search: $s, serviceType: [AWS] }) {
-    nodes { id name status inAccountOutpostType serviceType }
+    nodes { id name status inAccountOutpostType serviceType allowedRegions config { ... on OutpostAWSConfig { roleARN } } }
     totalCount pageInfo { hasNextPage endCursor }
   }
 }"""
@@ -1160,7 +1160,10 @@ def cmd_codescan_inspect(args):
 # one builtin Dockerfile control so it never blocks unrelated scans, and default:false so only a scan
 # that names it is gated. ---
 CICD_POLICIES_Q = """query CicdPolicies($f: CICDScanPolicyFilters, $after: String) {
-  cicdScanPolicies(first: 50, after: $after, filterBy: $f) { nodes { id name } pageInfo { hasNextPage endCursor } }
+  cicdScanPolicies(first: 50, after: $after, filterBy: $f) {
+    nodes { id name params { ... on CICDScanPolicyParamsIAC { severityThreshold countThreshold cloudConfigurationRules { id } } } }
+    pageInfo { hasNextPage endCursor }
+  }
 }"""
 
 CREATE_CICD_POLICY = """mutation CreateCicdPolicy($input: CreateCICDScanPolicyInput!) {
@@ -1197,6 +1200,14 @@ def _resolve_dockerfile_control(search):
     return exact[0] if exact else None
 
 
+def _drift(label, pairs):
+    """Exit 3 naming every (field, live, wanted) that differs; nothing when none does. The rule an
+    `ensure` follows when it will not mutate an existing object (SPEC.md §What `ensure` promises)."""
+    diffs = [f"{k} {live!r} -> {want!r}" for k, live, want in pairs if want is not None and live != want]
+    if diffs:
+        die(3, f"{label} exists and differs from the flags given: {', '.join(diffs)}; not mutated")
+
+
 def cmd_policy_ensure(args):
     """Ensure the BLOCK CI/CD IaC scan policy named --name exists (idempotent by name). Scoped to the
     builtin Dockerfile control 'Last User Is root' so `wizcli scan dir --policies <name>` FAILS
@@ -1206,6 +1217,16 @@ def cmd_policy_ensure(args):
     name = _policy_name(args)
     existing = _find_policy(name)
     if existing:
+        # Only a flag the caller named can differ: the defaults never argue with a live fixture.
+        live = existing.get("params") or {}
+        count = _flag(args, "--count-threshold")
+        rule_id = _flag(args, "--rule-id")
+        _drift(f"cicd scan policy {name} ({existing['id']})", [
+            ("severityThreshold", live.get("severityThreshold"), _flag(args, "--severity")),
+            ("countThreshold", live.get("countThreshold"), int(count) if count else None),
+            ("cloudConfigurationRules", sorted(r["id"] for r in live.get("cloudConfigurationRules") or []),
+             [rule_id] if rule_id else None),
+        ])
         print(f"cicd scan policy {name} exists ({existing['id']})")
         return
     rule_id = _flag(args, "--rule-id")
@@ -1603,6 +1624,11 @@ def cmd_outpost_ensure(args):
     region = _flag(args, "--region") or "us-east-1"
     existing = _resolve_outpost(name)
     if existing:
+        # A role change is a knowing delete-and-recreate, never a silent "nothing to do".
+        _drift(f"outpost {name} ({existing['id']})", [
+            ("roleARN", (existing.get("config") or {}).get("roleARN"), role_arn),
+            ("allowedRegions", existing.get("allowedRegions"), [_flag(args, "--region")] if _flag(args, "--region") else None),
+        ])
         print(f"outpost {name} already exists ({existing['id']}) status={existing['status']}; nothing to do")
         return
     # allowedRegions pins the scan cluster to the workload region (the EC2's). The capture used []

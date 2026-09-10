@@ -1517,7 +1517,8 @@ class OutpostGrading(unittest.TestCase):
         """after: statuses `outpost(id)` returns on successive polls, for the uninstall wait.
         scans: one (successful, failed) pair per daily bucket the scan-metrics trend reports."""
         seq = list(after or [])
-        nodes = [] if status is None else [{"id": "o1", "name": "lab-x", "status": status}]
+        nodes = [] if status is None else [{"id": "o1", "name": "lab-x", "status": status,
+                                             "allowedRegions": ["us-east-1"], "config": {"roleARN": "a"}}]
         pts = [{"timestamp": f"d{i}", "aggregatedMetrics": {"totalScansCount": s + f, "successfulScansCount": s,
                                                             "failedScansCount": f}}
                for i, (s, f) in enumerate(scans or [])]
@@ -1579,10 +1580,16 @@ class OutpostGrading(unittest.TestCase):
     def test_ensure_needs_role_arn(self):
         self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x"], self._wiz(None)), 2)
 
-    def test_ensure_is_idempotent_by_name_and_never_recreates(self):
-        wiz = self._wiz("CONNECTED")
-        self.assertEqual(self._exit(wz.cmd_outpost_ensure, ["--name", "lab-x", "--role-arn", "a"], wiz), 0)
-        self.assertEqual(self._mutations(wiz), [])
+    def test_ensure_never_recreates_and_refuses_a_role_or_region_change(self):
+        # A role change is a knowing delete-and-recreate: 3 naming the difference, no mutation.
+        for argv, want in [(["--name", "lab-x", "--role-arn", "a"], 0),
+                           (["--name", "lab-x", "--role-arn", "a", "--region", "us-east-1"], 0),
+                           (["--name", "lab-x", "--role-arn", "other"], 3),
+                           (["--name", "lab-x", "--role-arn", "a", "--region", "eu-west-1"], 3)]:
+            with self.subTest(argv=argv):
+                wiz = self._wiz("CONNECTED")
+                self.assertEqual(self._exit(wz.cmd_outpost_ensure, argv, wiz), want)
+                self.assertEqual(self._mutations(wiz), [])
 
     def test_ensure_posts_role_arn_inside_aws_config(self):
         wiz = self._wiz(None)
@@ -1841,11 +1848,14 @@ class PolicyGrading(unittest.TestCase):
 
     ENV: typing.ClassVar = {"INSTRUQT_SESSION_ID": "x"}
     CTL: typing.ClassVar = [{"id": "ctl-1", "name": "Last User Is 'root'", "severity": "HIGH"}]
+    LIVE: typing.ClassVar = {"id": "pol-1", "name": "block-root",
+                             "params": {"severityThreshold": "HIGH", "countThreshold": 1,
+                                        "cloudConfigurationRules": [{"id": "ctl-1"}]}}
 
     def _wiz(self, existing=False, control=None, created_id="pol-1"):
         control = self.CTL if control is None else control
         return FakeWiz(
-            cicdScanPolicies={"nodes": [{"id": "pol-1", "name": "block-root"}] if existing else []},
+            cicdScanPolicies={"nodes": [self.LIVE] if existing else []},
             cloudConfigurationRules={"nodes": control},
             createCICDScanPolicy={"scanPolicy": {"id": created_id, "name": "block-root"} if created_id else {}},
             deleteCICDScanPolicy={"id": "pol-1"})
@@ -1853,8 +1863,19 @@ class PolicyGrading(unittest.TestCase):
     def _exit(self, fn, argv, wiz):
         return exit_code(fn, argv, wiz=wiz, env=self.ENV)
 
-    def test_ensure_idempotent_when_present(self):
-        self.assertEqual(self._exit(wz.cmd_policy_ensure, ["--name", "block-root"], self._wiz(existing=True)), 0)
+    def test_ensure_leaves_a_matching_fixture_and_refuses_a_differing_one(self):
+        # A shared tenant fixture other labs grade against changes deliberately, never under a solve:
+        # flags that match or were not named exit 0 with no mutation; a differing flag is 3, no mutation.
+        for argv, want in [(["--name", "block-root"], 0),
+                           (["--name", "block-root", "--severity", "HIGH", "--count-threshold", "1",
+                             "--rule-id", "ctl-1"], 0),
+                           (["--name", "block-root", "--count-threshold", "2"], 3),
+                           (["--name", "block-root", "--severity", "CRITICAL"], 3),
+                           (["--name", "block-root", "--rule-id", "ctl-9"], 3)]:
+            with self.subTest(argv=argv):
+                wiz = self._wiz(existing=True)
+                self.assertEqual(self._exit(wz.cmd_policy_ensure, argv, wiz), want)
+                self.assertEqual([f for f, _ in wiz.calls if f.startswith(("create", "update", "delete"))], [])
 
     def test_ensure_creates_scoped_block_cli_policy(self):
         wiz = self._wiz(existing=False)
