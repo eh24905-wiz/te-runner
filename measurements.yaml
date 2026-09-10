@@ -84,7 +84,7 @@ planes:
       # Measured IDENTITY-FIRST (vendor TF module binds the 5 fetcher roles to Wiz's managed SA, THEN
       # the connector is created) -- the gcp-connector-101 flow. GCP grants Wiz's OWN service account,
       # so there is no role to assume and no ERROR-on-missing-trust state to pass through.
-      connected_min: [3.6, 4.2]    # last INITIAL_SCANNING at +3.6m, CONNECTED by +4.2m. n=1, 30s polls.
+      connected_min: [3.6, 5.5]    # last INITIAL_SCANNING at +3.6m, CONNECTED by +4.2m; second run +5.5m. n=2.
       vendor_module_terraform_floor: "1.12"
       # Build 2696 pulls its cloud-events submodule from an unpinned zip whose `reingestion_mode` validation
       # reads `x == null || contains(list, x)`; operators short-circuit only from Terraform 1.12, and the
@@ -97,8 +97,8 @@ planes:
       # The OLDER cloudResources plane -- the one `wizlab instance inspect` actually queries, which was
       # unmeasured on every cloud until this run. Distinct from cloud_resources_v2 below: do not reuse
       # that block's budget for an `instance inspect` check.
-      vm_after_connected_min: [5.5, 6.6]   # first VIRTUAL_MACHINE 5.5-6.6m AFTER the connector hit CONNECTED
-      vm_after_create_min: [9.7, 10.7]     # ...i.e. 9.7-10.7m after connector create. n=1, 60s polls.
+      vm_after_connected_min: [5.5, 9.3]   # first VIRTUAL_MACHINE 5.5-9.3m AFTER the connector hit CONNECTED
+      vm_after_create_min: [9.7, 14.9]     # ...i.e. 9.7-14.9m after connector create. n=2, 60s polls.
       solver_budget_min: 20                # ceiling + margin; 28 (crv2) is the conservative fallback
       # verify: `instance inspect --account-id <project id> --type VIRTUAL_MACHINE` -- exit 1 until >=1
     graph_search:
