@@ -267,37 +267,27 @@ def _csp_json(r, cmd):
 
 
 def _account_id(args, verb):
-    return _norm_account(_flag(args, "--account-id") or die(2, f"{verb} needs --account-id"))
+    return _norm_account(args.account_id or die(2, f"{verb} needs --account-id"))
 
 
 def _named(args, suffix=""):
     """--name, else the session stem plus `suffix`: the reaper sweeps the stem, so a default name is
     always within its reach; --name is for a manual or dev run."""
-    return _flag(args, "--name") or f"{_lab_stem(_session_id(args))}{suffix}"
-
-
-def _cloud(args):
-    # Defaults to aws so every pre-GCP lab keeps working unchanged. The default is also the trap it
-    # replaced: find_connector(cloud="aws") silently returned nothing for a live CONNECTED GCP
-    # project, i.e. a check that graded "learner did nothing" when the learner was done.
-    cloud = _flag(args, "--cloud") or "aws"
-    if cloud not in CLOUDS:
-        die(2, f"--cloud must be {'|'.join(CLOUDS)}, got {cloud}")
-    return cloud
+    return args.name or f"{_lab_stem(_session_id(args))}{suffix}"
 
 
 def _stem_opt(args):
     """The session stem when it is knowable, else None. Unlike _session_id this never dies: a check
     run by hand has no INSTRUQT_SESSION_ID, and the name-search layer is an optimisation, not a
     requirement."""
-    sid = _flag(args, "--session") or os.getenv("INSTRUQT_SESSION_ID")
+    sid = args.session or os.getenv("INSTRUQT_SESSION_ID")
     return _lab_stem(sid) if sid else None
 
 
 def _session_id(args):
     # The lab session id: unique per play, injected as INSTRUQT_SESSION_ID, and the id labPlayReports
     # returns — so the out-of-band reaper joins a stopped session straight to its objects by name.
-    sid = _flag(args, "--session") or os.getenv("INSTRUQT_SESSION_ID")
+    sid = args.session or os.getenv("INSTRUQT_SESSION_ID")
     if not sid:
         die(2, "need --session or INSTRUQT_SESSION_ID (the lab session id = naming + reap key)")
     return sid
@@ -318,8 +308,9 @@ def _drift(label, pairs):
         die(3, f"{label} exists and differs from the flags given: {', '.join(diffs)}; not mutated")
 
 
-def _read_json_flag(args, flag):
-    path = _flag(args, flag) or die(2, f"needs {flag} <path to json>")
+def _read_json(path, flag):
+    if not path:
+        die(2, f"needs {flag} <path to json>")
     try:
         with open(path) as fh:
             return json.load(fh)
@@ -356,7 +347,7 @@ def _az(*a): return _cli("az", *a)
 def _lab_user_email(args):
     # Deterministic from the session id so `ensure` is idempotent and `delete`/reap need no stored
     # state — and the email carries the reaper's join key (lab-<session_id>@).
-    domain = _flag(args, "--domain") or "titra-labs.ai"
+    domain = args.domain
     stem = _lab_stem(_session_id(args))
     return f"{stem}@{domain}", stem
 
@@ -364,17 +355,3 @@ def _lab_user_email(args):
 def _gql(tok, dc, query, variables=None):
     # The reaper's view of the transport: errors come back so one unresolvable type alerts, not aborts.
     return _graphql(tok, dc, query, variables)
-
-
-def _flag(args, name):
-    if name not in args:
-        return None
-    i = args.index(name)
-    if i + 1 >= len(args):
-        die(2, f"missing value for flag {name}")
-    val = args[i + 1]
-    # The next flag is never the value: `--session --commit` otherwise yields a session id of
-    # "--commit" AND drops the commit switch, turning a destructive run into a silent dry run.
-    if val.startswith("--"):
-        die(2, f"missing value for flag {name} (next argument is {val})")
-    return val

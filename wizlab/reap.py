@@ -227,10 +227,10 @@ def cmd_reap(args):
     else — that residue is counted as unknown. Exit 3 (failed or deferred) is the reaper's signal to
     keep the user and come back."""
     sid = core._session_id(args)
-    email = core._flag(args, "--email") or core._lab_user_email(args)[0]
+    email = args.email or core._lab_user_email(args)[0]
     stem = core._lab_stem(sid)
-    minutes = int(core._flag(args, "--last-min") or "1440")
-    commit = "--commit" in args
+    minutes = args.last_min
+    commit = args.commit
     tok, dc, _ = core.token_and_dc()
     tally = Counter()
     actions, enumeration_alert = _reap_enumerate(tok, dc, email, minutes)

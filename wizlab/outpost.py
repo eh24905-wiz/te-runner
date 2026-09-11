@@ -67,9 +67,6 @@ def _resolve_outpost(name):
     return core._prefer([n for n in nodes if n.get("name") == name], "CONNECTED")
 
 
-_OUTPOST_REQUIRE = {"exists", "initialized", "connected", "scanned"}
-
-
 def cmd_outpost_inspect(args):
     """Assert the session's Outpost is known to Wiz (--require exists), has reached INITIALIZED (the
     object is registered — NOT that the orchestrator role works; see the note above the queries), is
@@ -78,9 +75,7 @@ def cmd_outpost_inspect(args):
     CONNECTED alone does not imply it). The UI word 'Active' maps to CONNECTED, so grade the enum,
     not the label."""
     name = _outpost_name(args)
-    require = core._flag(args, "--require") or "exists"
-    if require not in _OUTPOST_REQUIRE:
-        core.die(2, f"--require must be {'|'.join(sorted(_OUTPOST_REQUIRE))}, got {require}")
+    require = args.require
     node = _resolve_outpost(name)
     if not node:
         print(f"no outpost named {name}")
@@ -92,7 +87,7 @@ def cmd_outpost_inspect(args):
     if require == "connected":
         sys.exit(0 if st == "CONNECTED" else 1)
     if require == "scanned":
-        sys.exit(_scan_counts(node["id"], int(core._flag(args, "--lookback-days") or 2)))
+        sys.exit(_scan_counts(node["id"], args.lookback_days))
     # initialized: CONNECTED is a strict superset (a connected outpost passed through INITIALIZED),
     # so accept both — a check demanding exactly INITIALIZED would flip back to failure the moment
     # the scan cluster comes up.
@@ -121,15 +116,15 @@ def cmd_outpost_ensure(args):
     to build the EKS scan cluster + network in the leased account. useWizServiceAccount so no
     per-outpost SA is minted. Solve/setup only."""
     name = _outpost_name(args)
-    role_arn = core._flag(args, "--role-arn") or core.die(
+    role_arn = args.role_arn or core.die(
         2, "outpost ensure needs --role-arn (the orchestrator role ARN from the TF module)")
-    region = core._flag(args, "--region") or "us-east-1"
+    region = args.region or "us-east-1"
     existing = _resolve_outpost(name)
     if existing:
         # A role change is a knowing delete-and-recreate, never a silent "nothing to do".
         core._drift(f"outpost {name} ({existing['id']})", [
             ("roleARN", (existing.get("config") or {}).get("roleARN"), role_arn),
-            ("allowedRegions", existing.get("allowedRegions"), [region] if core._flag(args, "--region") else None),
+            ("allowedRegions", existing.get("allowedRegions"), [region] if args.region else None),
         ])
         print(f"outpost {name} already exists ({existing['id']}) status={existing['status']}; nothing to do")
         return
@@ -165,7 +160,7 @@ def cmd_outpost_delete(args):
     teardown is longer, hence --timeout). Exits 0 even when the object outlives the wait: the EKS
     infra dies with the lease, so a lingering UNINSTALLED record is cosmetic and the out-of-band
     daily reaper sweeps it. Resolve by --id or the session-stem name."""
-    oid, name = core._flag(args, "--id"), None
+    oid, name = args.id, None
     if not oid:
         name = _outpost_name(args)
         node = _resolve_outpost(name)
@@ -179,7 +174,7 @@ def cmd_outpost_delete(args):
         if status != "UNINSTALLING":
             core.api(UNINSTALL_OUTPOST, {"input": {"id": oid}})
             print(f"uninstalling outpost {oid} (was {status})")
-        status = _await_uninstalled(oid, int(core._flag(args, "--timeout") or 600))
+        status = _await_uninstalled(oid, args.timeout)
         if status == "GONE":
             print(f"outpost {oid} no longer exists; nothing left to delete")
             return

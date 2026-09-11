@@ -78,7 +78,7 @@ def _ensure_sa(name, sa_type, scopes, id_var, secret_var, label):
 def _delete_sa(args, name):
     """Delete a service account by --id or (default) the given session-stem name. The reaper's prefix
     sweep already covers ServiceAccount, so this is for a solve/explicit teardown."""
-    sid = core._flag(args, "--id")
+    sid = args.id
     if not sid:
         node = _find_sa(name)
         if not node:
@@ -105,9 +105,7 @@ def cmd_sensor_inspect(args):
     """Assert the session's sensor is known to Wiz (--require exists) or reports Active (--require
     active). SensorStatus is ACTIVE/INACTIVE only; a pre-Active sensor reads INACTIVE or is absent."""
     name = _sensor_name(args)
-    require = core._flag(args, "--require") or "exists"
-    if require not in ("exists", "active"):
-        core.die(2, f"--require must be exists|active, got {require}")
+    require = args.require
     node = _resolve_sensor(name)
     if not node:
         print(f"no sensor named {name}")
@@ -124,9 +122,9 @@ def cmd_detection_inspect(args):
     matchedRuleName + type + the resolved sensorId — never a rule id (tenant-specific) and never an
     Issue/Threat object (tenant-wide anti-burst cap)."""
     name = _sensor_name(args)
-    rule = core._flag(args, "--rule-name") or core.die(2, "detection inspect needs --rule-name")
-    dtype = "MATCH_ONLY" if "--match-only" in args else "GENERATED_THREAT"
-    minutes = int(core._flag(args, "--since-minutes") or "120")
+    rule = args.rule_name or core.die(2, "detection inspect needs --rule-name")
+    dtype = "MATCH_ONLY" if args.match_only else "GENERATED_THREAT"
+    minutes = args.since_minutes
     node = _resolve_sensor(name)
     if not node:
         print(f"no sensor named {name}; cannot scope detections")

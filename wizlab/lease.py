@@ -88,7 +88,7 @@ def _lease_stem(args):
     """The suffix both team-store names carry. Per lab, not per run: 2.0's `startLab` takes no
     `runtimeParameters`, so nothing can rebind a declared secret at start — the name is pinned in HCL
     at import and only its VALUE can rotate."""
-    lab = core._flag(args, "--lab") or core.die(2, "lease: --lab <lab-name> is required")
+    lab = args.lab or core.die(2, "lease: --lab <lab-name> is required")
     stem = re.sub(r"[^A-Za-z0-9]+", "_", lab).upper().strip("_")
     return re.sub(r"^TE_", "", stem)
 
@@ -101,7 +101,7 @@ def _secret_names(args):
 
 
 def _keypair_dir(args):
-    lab = re.sub(r"[^A-Za-z0-9._-]+", "_", core._flag(args, "--lab") or "")
+    lab = re.sub(r"[^A-Za-z0-9._-]+", "_", args.lab or "")
     return pathlib.Path(os.getenv("WIZLAB_LEASE_DIR") or
                         pathlib.Path.home() / ".cache" / "wizlab" / "lease") / lab
 
@@ -120,7 +120,7 @@ def _mint_keypair(args):
         stale.unlink(missing_ok=True)
     try:
         r = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
-                            f"wizlab-lease-{core._flag(args, '--lab')}", "-f", str(priv)],
+                            f"wizlab-lease-{args.lab}", "-f", str(priv)],
                            capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError) as e:
         core.die(3, f"cannot run ssh-keygen: {type(e).__name__}: {e}")
@@ -165,7 +165,7 @@ def _lease_keys():
 
 def _lease_desc(args):
     """The description every key this lab mints carries, ahead of its per-key tag."""
-    return f"{_LEASE_KEY_PREFIX}{(core._flag(args, '--lab') or '').lower()}-"
+    return f"{_LEASE_KEY_PREFIX}{(args.lab or '').lower()}-"
 
 
 def _owned_keys(lab_desc):
@@ -254,7 +254,7 @@ def cmd_lease_verify(args):
     # fails at mint, which is a burnt play. This is the only place that failure is cheap.
     _ts("GET", f"/tailnet/{_TS_TAILNET}/keys")
     _iq("query($t: String!) { teamSecrets(teamSlug: $t) { name } }", {"t": IQ_TEAM})
-    if "--no-self" not in args:
+    if not args.no_self:
         _self_on_tailnet()
     print(f"ok: dev path ready (tailnet + instruqt team {IQ_TEAM})")
 
@@ -282,7 +282,7 @@ def cmd_lease_ensure(args):
     throwaway ssh keypair. Either alone is useless — the entrypoint gates the tailnet on the key and
     sshd on the pubkey — so a partial push rolls back rather than burning a play."""
     ts_name, pub_name = _secret_names(args)
-    ttl = int(core._flag(args, "--timelimit-seconds") or 0) + 3600
+    ttl = args.timelimit_seconds + 3600
     lab_desc = _lease_desc(args)
     priv, pub = _mint_keypair(args)
     key_id, key, desc = _mint_authkey(args, lab_desc, ttl)
@@ -309,11 +309,8 @@ def cmd_lease_inspect(args):
     the private key that opens it. Exit 1 = not up yet, which is a wait, not a failure. Two fresh nodes
     on one substring is exit 3 naming both: the freshest is a guess, and a guess hands the validator
     another play's grader with this play's key, which reads as every check broken."""
-    require = core._flag(args, "--require") or "reachable"
-    if require != "reachable":
-        core.die(2, f"--require must be reachable, got {require}")
     _lease_stem(args)  # --lab is what locates the keypair, so it is required here too
-    match = core._flag(args, "--hostname") or core._flag(args, "--session") or core.die(
+    match = args.hostname or args.session or core.die(
         2, "lease inspect: --hostname <substring> or --session <id> is required")
     live = _fresh_nodes(match)
     if not live:
@@ -339,7 +336,7 @@ def cmd_lease_delete(args):
     `Running` (reproducer: `wizlab lease delete --lab L; tailscale status --json` → `BackendState:
     Running`). The ephemeral flag, not the revoke, is what reaps the grader's node."""
     ts_name, pub_name = _secret_names(args)
-    key_id = core._flag(args, "--key-id")
+    key_id = args.key_id
     # Every key this lab owns, not the last one a prefix happened to match: teardown that leaves one
     # live key behind leaves a usable way onto the tailnet.
     key_ids = [key_id] if key_id else [k["id"] for k in _owned_keys(_lease_desc(args))]

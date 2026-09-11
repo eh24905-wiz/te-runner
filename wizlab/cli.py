@@ -1,4 +1,5 @@
 """The command line: verbs, the flags each reads, the exit-code contract, `--check`."""
+import argparse
 import sys
 
 from . import (
@@ -59,63 +60,102 @@ VERBS = {
 }
 
 
-# Every flag a verb reads, itself or through a helper. main() refuses anything else with exit 2: a
-# misspelled flag used to be ignored, so a check graded on the default it meant to override.
-_S = {"--session"}
+# Every flag a verb reads, as the spec of its parser: bare `{}` is a string defaulting to None; the
+# rest carry the constraint the handler used to re-check by hand. main() refuses anything else with
+# exit 2: a misspelled flag used to be ignored, so a check graded on the default it meant to override.
+def _one_of(*choices):
+    """A value from a fixed set; the first is the default."""
+    return {"choices": choices, "default": choices[0]}
 
 
-_U = _S | {"--domain"}
+def _int(default=None):
+    return {"type": int, "default": default}
+
+
+_SWITCH = {"action": "store_true"}
+
+
+_S = {"--session": {}}
+
+
+_U = {**_S, "--domain": {"default": "titra-labs.ai"}}
+
+
+# aws first so every pre-GCP lab keeps working unchanged. The default is also the trap it replaced:
+# find_connector(cloud="aws") silently returned nothing for a live CONNECTED GCP project, i.e. a check
+# that graded "learner did nothing" when the learner was done.
+_CLOUD = {"--cloud": _one_of(*core.CLOUDS)}
 
 
 FLAGS = {
-    ("session", "verify"): {"--account-id", "--cloud", "--min-runner"},
-    ("connector", "inspect"): _S | {"--account-id", "--cloud", "--outpost-id", "--outpost-name", "--require"},
-    ("connector", "ensure"): _S | {"--account-id", "--cloud", "--outpost-id", "--outpost-name", "--role-arn",
-                                   "--scanner-role-arn", "--tenant-id"},
-    ("connector", "delete"): _S | {"--account-id", "--cloud"},
-    ("instance", "inspect"): {"--account-id", "--type"},
-    ("sensor", "ensure"): _S | {"--name"},
-    ("sensor", "inspect"): _S | {"--name", "--require"},
-    ("sensor", "delete"): _S | {"--id", "--name"},
-    ("serviceaccount", "ensure"): _S | {"--name"},
-    ("serviceaccount", "inspect"): _S | {"--name", "--require"},
-    ("serviceaccount", "delete"): _S | {"--id", "--name"},
-    ("code-scan", "inspect"): _S | {"--interval", "--require", "--tag-key", "--tag-value", "--timeout"},
-    ("policy", "ensure"): {"--control-search", "--count-threshold", "--name", "--rule-id", "--severity"},
-    ("policy", "inspect"): {"--name", "--require"},
-    ("policy", "delete"): {"--name"},
-    ("detection", "inspect"): _S | {"--match-only", "--name", "--rule-name", "--since-minutes"},
-    ("workflow", "inspect"): _S | {"--exact-name", "--name", "--require"},
-    ("workflow", "ensure"): _S | {"--definition", "--dry-run", "--exact-name", "--name", "--project-id"},
-    ("workflow-run", "inspect"): _S | {"--branch", "--exact-name", "--name", "--require", "--run-type"},
-    ("workflow-run", "ensure"): _S | {"--data", "--exact-name", "--initial-step", "--interval", "--name",
-                                      "--timeout", "--trigger-type"},
-    ("outpost", "inspect"): _S | {"--lookback-days", "--name", "--require"},
-    ("outpost", "ensure"): _S | {"--name", "--region", "--role-arn"},
-    ("outpost", "delete"): _S | {"--id", "--name", "--timeout"},
-    ("role", "inspect"): {"--account-id", "--cloud", "--role-name"},
-    ("role", "ensure"): {"--cloud", "--external-id", "--role-name"},
-    ("user", "ensure"): _U | {"--group"},
-    ("user", "inspect"): _U | {"--group"},
+    ("session", "verify"): {"--account-id": {}, "--cloud": {"choices": core.CLOUDS}, "--min-runner": {}},
+    ("connector", "inspect"): {**_S, **_CLOUD, "--account-id": {}, "--outpost-id": {}, "--outpost-name": {},
+                               "--require": _one_of("exists", "healthy", "outpost-bound")},
+    ("connector", "ensure"): {**_S, **_CLOUD, "--account-id": {}, "--outpost-id": {}, "--outpost-name": {},
+                              "--role-arn": {}, "--scanner-role-arn": {}, "--tenant-id": {}},
+    ("connector", "delete"): {**_S, **_CLOUD, "--account-id": {}},
+    ("instance", "inspect"): {"--account-id": {}, "--type": {"default": "VIRTUAL_MACHINE"}},
+    ("sensor", "ensure"): {**_S, "--name": {}},
+    ("sensor", "inspect"): {**_S, "--name": {}, "--require": _one_of("exists", "active")},
+    ("sensor", "delete"): {**_S, "--id": {}, "--name": {}},
+    ("serviceaccount", "ensure"): {**_S, "--name": {}},
+    ("serviceaccount", "inspect"): {**_S, "--name": {}, "--require": _one_of("exists")},
+    ("serviceaccount", "delete"): {**_S, "--id": {}, "--name": {}},
+    ("code-scan", "inspect"): {**_S, "--interval": _int(10), "--require": _one_of("published", "pass"),
+                               "--tag-key": {"default": "session"}, "--tag-value": {}, "--timeout": _int(180)},
+    ("policy", "ensure"): {"--control-search": {"default": "Last User Is"}, "--count-threshold": _int(),
+                           "--name": {}, "--rule-id": {}, "--severity": {}},
+    ("policy", "inspect"): {"--name": {}, "--require": _one_of("exists")},
+    ("policy", "delete"): {"--name": {}},
+    ("detection", "inspect"): {**_S, "--match-only": _SWITCH, "--name": {}, "--rule-name": {},
+                               "--since-minutes": _int(120)},
+    ("workflow", "inspect"): {**_S, "--exact-name": _SWITCH, "--name": {}, "--require": _one_of("exists", "published")},
+    ("workflow", "ensure"): {**_S, "--definition": {}, "--dry-run": _SWITCH, "--exact-name": _SWITCH, "--name": {},
+                             "--project-id": {}},
+    ("workflow-run", "inspect"): {**_S, "--branch": {}, "--exact-name": _SWITCH, "--name": {},
+                                  "--require": _one_of("completed", "branch", "error-path"),
+                                  "--run-type": {"default": "TEST"}},
+    ("workflow-run", "ensure"): {**_S, "--data": {}, "--exact-name": _SWITCH, "--initial-step": {},
+                                 "--interval": {"type": float, "default": 2.0}, "--name": {}, "--timeout": _int(60),
+                                 "--trigger-type": {"default": "EVENT"}},
+    ("outpost", "inspect"): {**_S, "--lookback-days": _int(2), "--name": {},
+                             "--require": _one_of("exists", "initialized", "connected", "scanned")},
+    ("outpost", "ensure"): {**_S, "--name": {}, "--region": {}, "--role-arn": {}},
+    ("outpost", "delete"): {**_S, "--id": {}, "--name": {}, "--timeout": _int(600)},
+    ("role", "inspect"): {**_CLOUD, "--account-id": {}, "--role-name": {}},
+    ("role", "ensure"): {**_CLOUD, "--external-id": {}, "--role-name": {}},
+    ("user", "ensure"): {**_U, "--group": {"default": "global-contributor"}},
+    ("user", "inspect"): {**_U, "--group": {"default": "global-contributor"}},
     ("user", "delete"): _U,
-    ("user", "login-url"): set(),
-    ("wiz", "tenant"): set(),
-    ("wiz", "queries"): {"--match"},
-    ("wiz", "type"): {"--name"},
-    ("audit", "user"): _U | {"--all", "--email", "--last-min", "--match"},
-    ("user", "reap"): _U | {"--commit", "--email", "--last-min"},
-    ("lease", "verify"): set(),
-    ("lease", "ensure"): {"--lab", "--timelimit-seconds"},
-    ("lease", "inspect"): _S | {"--hostname", "--lab", "--require"},
-    ("lease", "delete"): {"--key-id", "--lab"},
+    ("user", "login-url"): {},
+    ("wiz", "tenant"): {},
+    ("wiz", "queries"): {"--match": {"default": "audit,activity,event,log,entit,delete"}},
+    ("wiz", "type"): {"--name": {}},
+    ("audit", "user"): {**_U, "--all": _SWITCH, "--email": {}, "--last-min": _int(120), "--match": {}},
+    ("user", "reap"): {**_U, "--commit": _SWITCH, "--email": {}, "--last-min": _int(1440)},
+    ("lease", "verify"): {"--no-self": _SWITCH},
+    ("lease", "ensure"): {"--lab": {}, "--timelimit-seconds": _int(0)},
+    ("lease", "inspect"): {**_S, "--hostname": {}, "--lab": {}, "--require": _one_of("reachable")},
+    ("lease", "delete"): {"--key-id": {}, "--lab": {}},
 }
 
 
-def _check_flags(verb, argv):
-    unknown = [a for a in argv if a.startswith("--") and a not in FLAGS[verb]]
-    if unknown:
-        core.die(2, f"unknown flag {unknown[0]} for `wizlab {' '.join(verb)}`; "
-               f"known: {' '.join(sorted(FLAGS[verb])) or '(none)'}")
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, verb):
+        super().__init__(prog=f"wizlab {' '.join(verb)}", add_help=False, allow_abbrev=False)
+        self.verb = verb
+        for flag, spec in FLAGS[verb].items():
+            self.add_argument(flag, **spec)
+
+    def error(self, message):
+        # argparse would print its own usage and exit; the contract is one `wizlab:` line, exit 2.
+        core.die(2, f"{message} for `{self.prog}`; known: {' '.join(sorted(FLAGS[self.verb])) or '(none)'}")
+
+
+def parse(verb, argv):
+    """The verb's flags as attributes: `--tag-key` reads as `args.tag_key`, a switch as True/False. An
+    undeclared flag, a missing value or one outside its set is invocation error 2, never ignored."""
+    return _Parser(verb).parse_args(argv)
 
 
 def _run(argv):
@@ -125,8 +165,7 @@ def _run(argv):
         if len(argv) < 2 or (argv[0], argv[1]) not in VERBS:
             core.die(2, f"usage: wizlab [--check] {{{' | '.join(' '.join(k) for k in VERBS)}}} [flags]")
         verb = (argv[0], argv[1])
-        _check_flags(verb, argv[2:])
-        VERBS[verb](argv[2:])
+        VERBS[verb](parse(verb, argv[2:]))
     except core.WizlabError as e:
         return core._fail(e)
     except SystemExit as e:

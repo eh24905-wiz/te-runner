@@ -169,7 +169,7 @@ def cmd_user_ensure(args):
     group, and publish WIZ_USER/WIZ_PWD. Reset on an existing user: Keycloak never returns the old
     password and the learner needs a working value."""
     endpoint, realm, token, email, name = _kc_session(args)
-    group = core._flag(args, "--group") or "global-contributor"
+    group = args.group
     pwd = _gen_password()
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
@@ -199,7 +199,7 @@ def cmd_user_ensure(args):
 
 def cmd_user_inspect(args):
     endpoint, realm, token, email, _ = _kc_session(args)
-    group = core._flag(args, "--group") or "global-contributor"
+    group = args.group
     uid = _kc_user_id(endpoint, realm, token, email)
     if uid is None:
         print(f"no Keycloak user {email}")

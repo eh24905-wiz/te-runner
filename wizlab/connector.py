@@ -115,11 +115,9 @@ def find_connector(account_id, cloud="aws", stem=None):
 
 
 def cmd_connector_inspect(args):
-    cloud = core._cloud(args)
+    cloud = args.cloud
     account = core._account_id(args, "connector inspect")
-    require = core._flag(args, "--require") or "exists"
-    if require not in ("exists", "healthy", "outpost-bound"):
-        core.die(2, f"--require must be exists|healthy|outpost-bound, got {require}")
+    require = args.require
     matches = find_connector(account, cloud, core._stem_opt(args))
     if not matches:
         print(f"no connector targets {account}")
@@ -174,7 +172,7 @@ def _ensure_azure(args, account):
     only at subscription scope. The authParams/extraConfig BOUNDARY is inferred by analogy to
     aws+gcp: testConnectorConfig answers success:true even for a bogus key, so it cannot prove the
     split."""
-    tenant_id = core._flag(args, "--tenant-id") or os.getenv("ARM_TENANT_ID")
+    tenant_id = args.tenant_id or os.getenv("ARM_TENANT_ID")
     if not tenant_id:
         core.die(2, "connector ensure --cloud azure needs --tenant-id (or ARM_TENANT_ID): the connector "
                "stores the directory the subscription belongs to")
@@ -200,10 +198,10 @@ def _outpost_target(args):
     the session stem) is the name the console's Outpost dropdown shows, so it is how a learner picks one
     and how a solve mirrors them; `--outpost-id` skips the lookup. id is None when no such Outpost
     exists."""
-    oid = core._flag(args, "--outpost-id")
+    oid = args.outpost_id
     if oid:
         return oid, oid
-    name = core._flag(args, "--outpost-name") or core._lab_stem(core._session_id(args))
+    name = args.outpost_name or core._lab_stem(core._session_id(args))
     return (outpost._resolve_outpost(name) or {}).get("id"), name
 
 
@@ -234,9 +232,9 @@ def _aws_auth_params(args, account):
     binding field — there is no extraConfig key for it. The scanner role is what the node pool assumes
     to read a volume, so a connector bound without it reaches CONNECTED and still scans nothing, which
     is why the two flags are required together."""
-    auth = {"customerRoleARN": core._flag(args, "--role-arn") or f"arn:aws:iam::{account}:role/{role.ROLE_NAME}"}
-    scanner_arn = core._flag(args, "--scanner-role-arn")
-    bind = core._flag(args, "--outpost-id") or core._flag(args, "--outpost-name")
+    auth = {"customerRoleARN": args.role_arn or f"arn:aws:iam::{account}:role/{role.ROLE_NAME}"}
+    scanner_arn = args.scanner_role_arn
+    bind = args.outpost_id or args.outpost_name
     if bind and not scanner_arn:
         core.die(2, "binding an outpost needs --scanner-role-arn: an outpost-bound connector with no "
                "diskAnalyzer scanner role connects but never scans a disk")
@@ -255,7 +253,7 @@ def _aws_auth_params(args, account):
 def cmd_connector_ensure(args):
     """Idempotent converge: create the connector if absent, else correct its customerRoleARN if it
     drifted (this is also the repair path — a lab seeds a wrong ARN, `ensure` fixes it)."""
-    cloud = core._cloud(args)
+    cloud = args.cloud
     account = core._account_id(args, "connector ensure")
     # gcp/azure are create-if-absent (no ARN to drift); only aws falls through to the repair path.
     if cloud == "gcp":
@@ -286,7 +284,7 @@ def cmd_connector_ensure(args):
 
 
 def cmd_connector_delete(args):
-    cloud = core._cloud(args)
+    cloud = args.cloud
     account = core._account_id(args, "connector delete")
     matches = find_connector(account, cloud, core._stem_opt(args))
     if not matches:
@@ -301,7 +299,7 @@ def cmd_instance_inspect(args):
     """Assert a scanned cloud resource of --type (default VIRTUAL_MACHINE) exists in Wiz for the
     account. Exit 0 if >=1 present, 1 if none — the 'is the EC2 scanned yet' check."""
     account = core._account_id(args, "instance inspect")
-    rtype = core._flag(args, "--type") or "VIRTUAL_MACHINE"
+    rtype = args.type
     data, _ = core.api(INSTANCES, {"f": {"subscriptionExternalId": [account], "type": [rtype]}})
     n = (data.get("cloudResources") or {}).get("totalCount") or 0
     print(f"instance inspect: {n} {rtype} scanned in account {account}")

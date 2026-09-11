@@ -55,7 +55,7 @@ def cmd_wiz_tenant(args):
 def cmd_wiz_queries(args):
     """List top-level Wiz queries whose name matches any --match term (default: audit-relevant), with
     return type. Finds the audit-log/activity query a reaper could use to enumerate what a user made."""
-    terms = (core._flag(args, "--match") or "audit,activity,event,log,entit,delete").lower().split(",")
+    terms = args.match.lower().split(",")
     data, _ = core.api(INTROSPECT_QUERIES, {})
     fields = ((data.get("__schema") or {}).get("queryType") or {}).get("fields") or []
     hits = [f for f in fields if any(t in f["name"].lower() for t in terms)]
@@ -67,7 +67,7 @@ def cmd_wiz_queries(args):
 
 def cmd_wiz_type(args):
     """Print a Wiz type's fields / inputFields / enumValues (drill into a `wiz queries` return type)."""
-    name = core._flag(args, "--name") or core.die(2, "wiz type needs --name <TypeName>")
+    name = args.name or core.die(2, "wiz type needs --name <TypeName>")
     if not name.isidentifier():
         core.die(2, "type name must be alphanumeric")
     data, _ = core.api(INTROSPECT_TYPE % name, {})
@@ -98,11 +98,11 @@ def cmd_audit_user(args):
     """Catch/backstop: list Wiz audit actions by the ephemeral lab user in a recent window. Enumerates
     everything a learner did (GUI creates included) — the reaper's detection layer. Default shows only
     MUTATION (state-changing); --all includes queries. Match by --email/--account, override --match."""
-    match = core._flag(args, "--match")
-    email = core._flag(args, "--email") or (None if match else core._lab_user_email(args)[0])
+    match = args.match
+    email = args.email or (None if match else core._lab_user_email(args)[0])
     needle = (match or email).lower()
-    minutes = int(core._flag(args, "--last-min") or "120")
-    include_all = "--all" in args
+    minutes = args.last_min
+    include_all = args.all
     entries, alert = _audit_entries(core._api_send, minutes, mutations_only=not include_all)
     hits = 0
     for n in entries:

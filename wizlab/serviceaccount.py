@@ -54,9 +54,6 @@ def cmd_serviceaccount_ensure(args):
 
 def cmd_serviceaccount_inspect(args):
     """Assert the session's Wiz CLI deployment exists (--require exists)."""
-    require = core._flag(args, "--require") or "exists"
-    if require != "exists":
-        core.die(2, f"--require must be exists, got {require}")
     name = _cli_dep_name(args)
     node = _find_cli_deployment(name)
     if not node:
@@ -68,7 +65,7 @@ def cmd_serviceaccount_inspect(args):
 def cmd_serviceaccount_delete(args):
     """Delete the session's Wiz CLI deployment, by --id or (default) the session-stem name. Deleting the
     deployment is also the only path to the SA it created — see _reap_service_account."""
-    dep_id = core._flag(args, "--id")
+    dep_id = args.id
     if not dep_id:
         name = _cli_dep_name(args)
         node = _find_cli_deployment(name)

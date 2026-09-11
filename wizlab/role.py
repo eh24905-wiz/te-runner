@@ -116,10 +116,10 @@ def _role_inspect_azure(args):
     """The Azure twin of the GCP IAM-policy assertion: does the subscription actually grant Wiz's
     service principal the ARM roles it needs? Wiz owns the App Registration in its own tenant, so
     there is nothing for a learner to create in Entra — only role assignments to make."""
-    sub = core._norm_account(core._flag(args, "--account-id") or os.getenv("ARM_SUBSCRIPTION_ID"))
+    sub = core._norm_account(args.account_id or os.getenv("ARM_SUBSCRIPTION_ID"))
     if not sub:
         core.die(2, "role inspect --cloud azure needs --account-id <subscription id> (or ARM_SUBSCRIPTION_ID)")
-    custom = core._flag(args, "--role-name")
+    custom = args.role_name
     if not custom:
         # No safe default: every lab uses a session-scoped name (lab-<session_id>-WizCustomRole).
         # A fallback to any fixed string silently grades as 1 for every correctly-configured learner.
@@ -148,7 +148,7 @@ def _role_inspect_gcp(args):
     """The GCP twin of the AWS trust-policy assertion: does this project's IAM policy actually grant
     Wiz's managed SA the roles it needs to read the project? A project that grants nothing is exactly
     the state a learner reaches by opening the wizard and stopping."""
-    project = core._flag(args, "--account-id") or os.getenv("GOOGLE_PROJECT")
+    project = args.account_id or os.getenv("GOOGLE_PROJECT")
     if not project:
         core.die(2, "role inspect --cloud gcp needs --account-id <project id> (or GOOGLE_PROJECT)")
     sa = _wiz_gcp_sa()
@@ -221,10 +221,10 @@ def cmd_role_inspect(args):
     verify the trust policy too. Delegator+tid resolved live for an EXACT match — another data
     center's delegator looks almost identical and does not work."""
     handlers = {"gcp": _role_inspect_gcp, "azure": _role_inspect_azure}
-    cloud = core._cloud(args)
+    cloud = args.cloud
     if cloud in handlers:
         return handlers[cloud](args)
-    role = core._flag(args, "--role-name") or ROLE_NAME
+    role = args.role_name or ROLE_NAME
     return _inspect_aws_trust(role, _aws_role(role))
 
 
@@ -232,17 +232,17 @@ def cmd_role_ensure(args):
     """Deploy WizAccess-Role's trust so Wiz can assume it. Trust-only by design: task 2's check
     verifies only the trust policy. Scan permissions (SecurityAudit / ViewOnlyAccess / inline) are
     task 3's need and unverified against TBCMP health — added when there's a live health signal."""
-    if core._cloud(args) != "aws":
+    if args.cloud != "aws":
         # No GCP twin by design: GCP's grant is custom-role creation + setIamPolicy, i.e. CSP
         # provisioning, which stays in Terraform. Fail loudly rather than no-op.
         core.die(2, "role ensure is aws-only; on GCP the vendor Terraform module binds the roles")
-    role = core._flag(args, "--role-name") or ROLE_NAME
+    role = args.role_name or ROLE_NAME
     delegator, tid = _wiz_delegator()
     if not delegator:
         core.die(3, "managedIdentityParameters.aws.roleArn is empty; cannot build a trust policy")
     # --external-id overrides the correct tid: setup uses it to SEED a broken trust (repair labs);
     # the learner's fix / solve runs `role ensure` with no override and writes the correct tid.
-    ext = core._flag(args, "--external-id") or tid
+    ext = args.external_id or tid
     if not ext:
         core.die(3, "no tenant id (tid) in token and no --external-id; cannot set sts:ExternalId")
     trust = json.dumps(

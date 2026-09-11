@@ -156,11 +156,22 @@ class FakeKeycloak:
         return 404, b"unrouted"
 
 
+def parsed(fn, argv):
+    """`argv` as the handler receives it from main(): its verb's parsed flags. A callable that is not a
+    verb (a stand-in) gets the list itself."""
+    verb = next((v for v, f in wz.VERBS.items() if f is fn), None)
+    return wz.parse(verb, list(argv)) if verb else list(argv)
+
+
+def call(fn, argv):
+    return fn(parsed(fn, argv))
+
+
 def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches):
-    """Drive one handler as main() would and return its exit code. Output is captured into `out`/`err`
-    or dropped. `env` replaces the environment. `patches` name wz attributes: a Mock replaces the
-    attribute, another callable is its side_effect, anything else its return_value. `wiz` is a FakeWiz
-    behind _post, with the credentials token_and_dc reads."""
+    """Drive one handler as main() would and return its exit code: flags parsed, then the call. Output
+    is captured into `out`/`err` or dropped. `env` replaces the environment. `patches` name wz
+    attributes: a Mock replaces the attribute, another callable is its side_effect, anything else its
+    return_value. `wiz` is a FakeWiz behind _post, with the credentials token_and_dc reads."""
     wz._TOKENS.clear()
     with contextlib.ExitStack() as st:
         if wiz is not None:
@@ -178,7 +189,7 @@ def exit_code(fn, argv=(), *, wiz=None, env=None, out=None, err=None, **patches)
         st.enter_context(contextlib.redirect_stdout(io.StringIO() if out is None else out))
         st.enter_context(contextlib.redirect_stderr(io.StringIO() if err is None else err))
         with exits() as ended:
-            fn(list(argv))
+            call(fn, argv)
     return ended.code
 
 
@@ -534,19 +545,29 @@ class PureParsing(unittest.TestCase):
 
 
 class FlagParsing(unittest.TestCase):
-    def test_present_and_absent(self):
-        self.assertEqual(wz._flag(["--account-id", "123"], "--account-id"), "123")
-        self.assertIsNone(wz._flag(["--other", "v"], "--account-id"))
+    """`parse` is the one reader of argv: a flag's default, set and type live in FLAGS, not in handlers."""
 
-    def test_missing_value_is_invocation_error(self):
-        with exits() as cm:
-            wz._flag(["role", "inspect", "--role-name"], "--role-name")
-        self.assertEqual(cm.code, 2)
+    def test_present_absent_and_the_table_default(self):
+        args = wz.parse(("code-scan", "inspect"), ["--tag-value", "v", "--timeout", "5"])
+        self.assertEqual((args.tag_value, args.timeout, args.interval, args.require, args.session),
+                         ("v", 5, 10, "published", None))
+
+    def test_a_switch_is_a_bool(self):
+        self.assertTrue(wz.parse(("user", "reap"), ["--session", "s1", "--commit"]).commit)
+        self.assertFalse(wz.parse(("user", "reap"), ["--session", "s1"]).commit)
+
+    def test_a_missing_value_a_bad_type_or_a_stray_word_is_invocation_error(self):
+        for verb, argv in ((("role", "inspect"), ["--role-name"]),
+                           (("code-scan", "inspect"), ["--timeout", "soon"]),
+                           (("sensor", "inspect"), ["lab-x"])):
+            with self.subTest(argv=argv), exits() as cm:
+                wz.parse(verb, argv)
+            self.assertEqual(cm.code, 2)
 
     def test_the_next_flag_is_never_the_value(self):
         # `reap --session --commit` must not reap a session named "--commit" with commit silently off.
         with exits() as cm:
-            wz._flag(["--session", "--commit"], "--session")
+            wz.parse(("user", "reap"), ["--session", "--commit"])
         self.assertEqual(cm.code, 2)
 
 
@@ -649,7 +670,7 @@ class ExitCodeContract(unittest.TestCase):
     def test_every_verb_declares_its_flags_and_every_flag_read_is_declared(self):
         self.assertEqual(set(wz.FLAGS), set(wz.VERBS))
         src = "".join(pathlib.Path(m.__file__).read_text() for m in wz.MODULES)
-        read = {a or b for a, b in re.findall(r'_flag\(args, "(--[a-z-]+)"\)|"(--[a-z-]+)" in args', src)}
+        read = {"--" + a.replace("_", "-") for a in re.findall(r"\bargs\.([a-z_]+)", src)}
         declared = set().union(*wz.FLAGS.values())
         self.assertEqual(read - declared, set())
 
@@ -706,7 +727,7 @@ class RoleInspectGrading(unittest.TestCase):
         with mock.patch.object(_owner("_aws"), "_aws", return_value=aws_proc), \
              mock.patch.object(_owner("_wiz_delegator"), "_wiz_delegator", return_value=(delegator, tid)), \
              exits() as cm:
-            wz.cmd_role_inspect([])
+            call(wz.cmd_role_inspect, [])
         return cm.code
 
     def test_valid_trust_exit_0(self):
@@ -755,13 +776,13 @@ class Naming(unittest.TestCase):
         self.assertEqual(wz._lab_stem("abc123"), "lab-abc123")
 
     def test_session_id_from_flag_then_env(self):
-        self.assertEqual(wz._session_id(["--session", "flagid"]), "flagid")
+        self.assertEqual(wz._session_id(wz.parse(("user", "inspect"), ["--session", "flagid"])), "flagid")
         with mock.patch.dict(wz.os.environ, {"INSTRUQT_SESSION_ID": "envid"}, clear=False):
-            self.assertEqual(wz._session_id([]), "envid")
+            self.assertEqual(wz._session_id(wz.parse(("user", "inspect"), [])), "envid")
 
     def test_session_id_missing_is_invocation_error(self):
         with mock.patch.dict(wz.os.environ, {}, clear=True), exits() as cm:
-            wz._session_id([])
+            wz._session_id(wz.parse(("user", "inspect"), []))
         self.assertEqual(cm.code, 2)
 
     def test_tenant_keyed_env_wins_over_the_tenant_less_name(self):
@@ -772,11 +793,12 @@ class Naming(unittest.TestCase):
             self.assertEqual((wz._tenant(), wz._tenant_env("CLIENT_ID")), (wz._DEFAULT_TENANT, "plain"))
 
     def test_default_names_hang_off_the_session_stem(self):
-        self.assertEqual(wz._named(["--session", "s1"], "-cli"), "lab-s1-cli")
-        self.assertEqual(wz._named(["--session", "s1", "--name", "mine"], "-cli"), "mine")
+        for argv, want in ((["--session", "s1"], "lab-s1-cli"), (["--session", "s1", "--name", "mine"], "mine")):
+            self.assertEqual(wz._named(wz.parse(("sensor", "delete"), argv), "-cli"), want)
 
     def test_user_email_keyed_on_session(self):
-        self.assertEqual(wz._lab_user_email(["--session", "s1"])[0], "lab-s1@titra-labs.ai")
+        args = wz.parse(("user", "inspect"), ["--session", "s1"])
+        self.assertEqual(wz._lab_user_email(args)[0], "lab-s1@titra-labs.ai")
 
 
 class ConnectorAndReaperSafety(unittest.TestCase):
@@ -892,7 +914,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
              mock.patch.object(_owner("_reap_sweep_type"), "_reap_sweep_type", return_value=sweep or wz.Counter()), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
-            wz.cmd_reap(["--session", "s1", "--commit"])
+            call(wz.cmd_reap, ["--session", "s1", "--commit"])
         return cm.code
 
     def test_committed_reap_exits_3_when_enumeration_is_incomplete(self):
@@ -901,7 +923,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
              mock.patch.object(_owner("_reap_sweep_type"), "_reap_sweep_type", return_value=wz.Counter()), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
-            wz.cmd_reap(["--session", "s1", "--commit"])
+            call(wz.cmd_reap, ["--session", "s1", "--commit"])
         self.assertEqual(cm.code, 3)
 
     def test_which_outcomes_keep_the_user_and_the_retry(self):
@@ -950,7 +972,7 @@ class ConnectorAndReaperSafety(unittest.TestCase):
                                return_value=wz.Counter({wz.REMOVED: 1})), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
              exits() as cm:
-            wz.cmd_reap(["--session", "s1", "--commit"])
+            call(wz.cmd_reap, ["--session", "s1", "--commit"])
         self.assertEqual(cm.code, 0)
         swept = len(wz._SWEEP_TYPES)
         self.assertIn(f"# {2 + swept} removed (1 audit-only), 1 absent", err.getvalue())
@@ -1006,14 +1028,14 @@ class ConnectorAndReaperSafety(unittest.TestCase):
         # token/email would silently send the token as the lookup key.
         with mock.patch.object(_owner("_kc_env"), "_kc_env", return_value=("http://kc", "realm", "admin", "pw")), \
              mock.patch.object(_owner("_kc_token"), "_kc_token", return_value="tok"):
-            s = wz._kc_session(["--session", "s1"])
+            s = wz._kc_session(wz.parse(("user", "inspect"), ["--session", "s1"]))
         self.assertEqual((s.endpoint, s.realm, s.token), ("http://kc", "realm", "tok"))
         self.assertEqual((s.email, s.name), ("lab-s1@titra-labs.ai", "lab-s1"))
         self.assertEqual(tuple(s), ("http://kc", "realm", "tok", "lab-s1@titra-labs.ai", "lab-s1"))
 
     def test_wiz_type_rejects_non_identifier(self):
         with exits() as cm:
-            wz.cmd_wiz_type(["--name", "Type; DROP"])
+            call(wz.cmd_wiz_type, ["--name", "Type; DROP"])
         self.assertEqual(cm.code, 2)
 
 
@@ -1139,7 +1161,7 @@ class Pagination(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(_owner("api"), "api", side_effect=side), contextlib.redirect_stdout(out), \
              contextlib.redirect_stderr(err), exits() as cm:
-            wz.cmd_audit_user(["--match", "lab-s1"])
+            call(wz.cmd_audit_user, ["--match", "lab-s1"])
         self.assertEqual(cm.code, 3)
         self.assertEqual(calls, [None, "same"])
         self.assertIn("CreateReport", out.getvalue())
@@ -1154,10 +1176,10 @@ class CloudSelection(unittest.TestCase):
                                  "config": {"projectId": "wiz-lab-42"}}
 
     def test_default_is_aws_and_bad_value_is_invocation_error(self):
-        self.assertEqual(wz._cloud([]), "aws")
-        self.assertEqual(wz._cloud(["--cloud", "gcp"]), "gcp")
+        self.assertEqual(wz.parse(("connector", "inspect"), []).cloud, "aws")
+        self.assertEqual(wz.parse(("connector", "inspect"), ["--cloud", "gcp"]).cloud, "gcp")
         with exits() as cm:
-            wz._cloud(["--cloud", "oracle"])
+            wz.parse(("connector", "inspect"), ["--cloud", "oracle"])
         self.assertEqual(cm.code, 2)
 
     def test_gcp_connector_found_only_when_cloud_is_gcp(self):
@@ -1168,14 +1190,14 @@ class CloudSelection(unittest.TestCase):
     def test_gcp_inspect_healthy_exit_0(self):
         with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[self.GCP_NODE]), \
              exits() as cm:
-            wz.cmd_connector_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--require", "healthy"])
+            call(wz.cmd_connector_inspect, ["--cloud", "gcp", "--account-id", "wiz-lab-42", "--require", "healthy"])
         self.assertEqual(cm.code, 0)
 
     def test_gcp_ensure_is_create_if_absent_never_patch(self):
         # No customerRoleARN equivalent to drift, so an existing connector is a no-op, not an update.
         with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[self.GCP_NODE]), \
              mock.patch.object(_owner("api"), "api") as api, exits() as cm:
-            wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
+            call(wz.cmd_connector_ensure, ["--cloud", "gcp", "--account-id", "wiz-lab-42"])
         self.assertEqual(cm.code, 0)
         api.assert_not_called()
 
@@ -1184,7 +1206,7 @@ class CloudSelection(unittest.TestCase):
         with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[]), \
              mock.patch.object(_owner("api"), "api", return_value=(created, "tid")) as api, \
              exits() as cm:
-            wz.cmd_connector_ensure(["--cloud", "gcp", "--account-id", "wiz-lab-42", "--session", "s1"])
+            call(wz.cmd_connector_ensure, ["--cloud", "gcp", "--account-id", "wiz-lab-42", "--session", "s1"])
         self.assertEqual(cm.code, 0)
         payload = api.call_args[0][1]["input"]
         self.assertEqual(payload["type"], "gcp")
@@ -1194,10 +1216,10 @@ class CloudSelection(unittest.TestCase):
 
     def test_unsupported_paths_refuse_rather_than_guess(self):
         with exits() as cm:
-            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", "sub-1"])
+            call(wz.cmd_connector_ensure, ["--cloud", "azure", "--account-id", "sub-1"])
         self.assertEqual(cm.code, 2)
         with exits() as cm:  # provisioning belongs to terraform, not wizlab
-            wz.cmd_role_ensure(["--cloud", "gcp"])
+            call(wz.cmd_role_ensure, ["--cloud", "gcp"])
         self.assertEqual(cm.code, 2)
 
 
@@ -1355,8 +1377,8 @@ class ConnectorLookupLayers(unittest.TestCase):
 
     def test_stem_is_optional_and_never_dies(self):
         with mock.patch.dict(wz.os.environ, {}, clear=True):
-            self.assertIsNone(wz._stem_opt([]))
-        self.assertEqual(wz._stem_opt(["--session", "s1"]), "lab-s1")
+            self.assertIsNone(wz._stem_opt(wz.parse(("connector", "inspect"), [])))
+        self.assertEqual(wz._stem_opt(wz.parse(("connector", "inspect"), ["--session", "s1"])), "lab-s1")
 
 
 class AzureConnector(unittest.TestCase):
@@ -1371,7 +1393,7 @@ class AzureConnector(unittest.TestCase):
 
     def test_ensure_needs_a_tenant_id(self):
         with mock.patch.dict(wz.os.environ, {}, clear=True), exits() as cm:
-            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", self.SUB])
+            call(wz.cmd_connector_ensure, ["--cloud", "azure", "--account-id", self.SUB])
         self.assertEqual(cm.code, 2)
 
     def test_ensure_payload_is_managed_identity_with_subscription_and_tenant(self):
@@ -1379,7 +1401,7 @@ class AzureConnector(unittest.TestCase):
         with mock.patch.object(_owner("find_connector"), "find_connector", return_value=[]), \
              mock.patch.object(_owner("api"), "api", return_value=(created, "tid")) as api, \
              exits() as cm:
-            wz.cmd_connector_ensure(["--cloud", "azure", "--account-id", self.SUB,
+            call(wz.cmd_connector_ensure, ["--cloud", "azure", "--account-id", self.SUB,
                                      "--tenant-id", "dir-1", "--session", "s1"])
         self.assertEqual(cm.code, 0)
         payload = api.call_args[0][1]["input"]
@@ -1401,7 +1423,7 @@ class AzureRoleInspect(unittest.TestCase):
         with mock.patch.object(_owner("_az"), "_az", return_value=proc) as az, \
              mock.patch.dict(wz.os.environ, env, clear=True), \
              exits() as cm:
-            wz.cmd_role_inspect(argv if argv is not None else self.DEFAULT_ARGV)
+            call(wz.cmd_role_inspect, argv if argv is not None else self.DEFAULT_ARGV)
         return cm.code, az
 
     def test_both_roles_assigned_exit_0(self):
@@ -1415,7 +1437,7 @@ class AzureRoleInspect(unittest.TestCase):
     def test_missing_role_name_flag_is_invocation_error(self):
         with mock.patch.dict(wz.os.environ, {"WIZ_TBCMP_AZURE_APP_OBJECT_ID": self.OID}, clear=True), \
              exits() as cm:
-            wz.cmd_role_inspect(["--cloud", "azure", "--account-id", self.SUB])
+            call(wz.cmd_role_inspect, ["--cloud", "azure", "--account-id", self.SUB])
         self.assertEqual(cm.code, 2)
 
     def test_missing_role_exit_1(self):
@@ -1439,7 +1461,7 @@ class WizTenantFacts(unittest.TestCase):
              mock.patch.dict(wz.os.environ, {}, clear=True), \
              mock.patch.object(wz.sys, "stdout", io.StringIO()) as out, \
              exits() as cm:
-            wz.cmd_wiz_tenant([])
+            call(wz.cmd_wiz_tenant, [])
         return cm.code, out.getvalue()
 
     def test_emits_gcp_service_account(self):
@@ -1469,20 +1491,20 @@ class SessionVerifyCsp(unittest.TestCase):
         with self._mock_wiz(), self._mock_api(), \
              mock.patch.object(_owner("_aws"), "_aws") as csp, \
              exits() as cm:
-            wz.cmd_session_verify([])
+            call(wz.cmd_session_verify, [])
         self.assertEqual(cm.code, 0)
         csp.assert_not_called()
 
     def test_unknown_cloud_is_invocation_error(self):
         with self._mock_wiz(), self._mock_api(), exits() as cm:
-            wz.cmd_session_verify(["--cloud", "oracle"])
+            call(wz.cmd_session_verify, ["--cloud", "oracle"])
         self.assertEqual(cm.code, 2)
 
     def test_missing_csp_vars_exit_3(self):
         with self._mock_wiz(), self._mock_api(), \
              mock.patch.dict(wz.os.environ, {}, clear=True), \
              exits() as cm:
-            wz.cmd_session_verify(["--cloud", "aws"])
+            call(wz.cmd_session_verify, ["--cloud", "aws"])
         self.assertEqual(cm.code, 3)
 
     def test_csp_probe_failure_exit_3(self):
@@ -1491,7 +1513,7 @@ class SessionVerifyCsp(unittest.TestCase):
              mock.patch.dict(wz.os.environ, env, clear=True), \
              mock.patch.object(_owner("_aws"), "_aws", return_value=_proc(1, "", "ExpiredToken")), \
              exits() as cm:
-            wz.cmd_session_verify(["--cloud", "aws"])
+            call(wz.cmd_session_verify, ["--cloud", "aws"])
         self.assertEqual(cm.code, 3)
 
     def test_csp_probe_success_exit_0(self):
@@ -1500,7 +1522,7 @@ class SessionVerifyCsp(unittest.TestCase):
              mock.patch.dict(wz.os.environ, env, clear=True), \
              mock.patch.object(_owner("_aws"), "_aws", return_value=_proc(0, '{"Account": "123456789012"}')), \
              exits() as cm:
-            wz.cmd_session_verify(["--cloud", "aws"])
+            call(wz.cmd_session_verify, ["--cloud", "aws"])
         self.assertEqual(cm.code, 0)
 
     def _verify(self, cloud, env, proc, args=()):
@@ -1509,7 +1531,7 @@ class SessionVerifyCsp(unittest.TestCase):
              mock.patch.dict(wz.os.environ, env, clear=True), \
              mock.patch.object(_owner(binary), binary, return_value=proc), \
              contextlib.redirect_stdout(io.StringIO()), exits() as cm:
-            wz.cmd_session_verify(["--cloud", cloud, *args])
+            call(wz.cmd_session_verify, ["--cloud", cloud, *args])
         return cm.code
 
     GCP_ENV: typing.ClassVar = {"GOOGLE_CREDENTIALS": "{}", "GOOGLE_PROJECT": "wiz-lab-42"}
@@ -1553,7 +1575,7 @@ class GcpRoleInspect(unittest.TestCase):
         with mock.patch.object(_owner("_gcp"), "_gcp", return_value=proc), \
              mock.patch.object(_owner("_wiz_gcp_sa"), "_wiz_gcp_sa", return_value=sa), \
              exits() as cm:
-            wz.cmd_role_inspect(["--cloud", "gcp", "--account-id", "wiz-lab-42"])
+            call(wz.cmd_role_inspect, ["--cloud", "gcp", "--account-id", "wiz-lab-42"])
         return cm.code
 
     def test_all_five_bound_exit_0(self):
@@ -1962,7 +1984,7 @@ class OutpostConnectorBinding(unittest.TestCase):
         with mock.patch.object(_owner("find_connector"), "find_connector",
                                return_value=[self._node({"id": "o1", "name": "lab-x"})]), \
              mock.patch.object(_owner("api"), "api") as api, exits() as cm:
-            wz.cmd_connector_ensure(["--account-id", "111111111111", "--outpost-id", "o1",
+            call(wz.cmd_connector_ensure, ["--account-id", "111111111111", "--outpost-id", "o1",
                                      "--scanner-role-arn", "arn:s", "--role-arn",
                                      "arn:aws:iam::111111111111:role/WizAccess-Role"])
         self.assertEqual(cm.code, 0)
@@ -2157,9 +2179,9 @@ class LeaseDevAccess(unittest.TestCase):
         return exit_code(fn, args)
 
     def test_secret_names_are_per_lab_and_drop_the_te_prefix(self):
-        self.assertEqual(wz._secret_names(["--lab", "te-wiz-code-201"]),
+        self.assertEqual(wz._secret_names(wz.parse(("lease", "ensure"), ["--lab", "te-wiz-code-201"])),
                          ("TS_AUTHKEY_WIZ_CODE_201", "TE_DEV_SSH_PUBKEY_WIZ_CODE_201"))
-        self.assertEqual(wz._secret_names(["--lab", "te-dev-aws"]),
+        self.assertEqual(wz._secret_names(wz.parse(("lease", "ensure"), ["--lab", "te-dev-aws"])),
                          ("TS_AUTHKEY_DEV_AWS", "TE_DEV_SSH_PUBKEY_DEV_AWS"))
 
     def test_missing_lab_is_invocation_error_2(self):
@@ -2198,7 +2220,7 @@ class LeaseDevAccess(unittest.TestCase):
         with mock.patch.object(_owner("_fresh_nodes"), "_fresh_nodes", return_value=two), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
              exits() as cm:
-            wz.cmd_lease_inspect(["--lab", "te-dev-aws", "--hostname", "awsconn101-"])
+            call(wz.cmd_lease_inspect, ["--lab", "te-dev-aws", "--hostname", "awsconn101-"])
         self.assertEqual(cm.code, 3)
         self.assertIn("awsconn101-aaa", err.getvalue())
         self.assertIn("awsconn101-bbb", err.getvalue())
@@ -2232,7 +2254,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.object(_owner("_self_join"), "_self_join", return_value=joined), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
              exits() as cm:
-            wz.cmd_lease_ensure(args)
+            call(wz.cmd_lease_ensure, args)
         return cm.code, out.getvalue() + err.getvalue()
 
     def test_ensure_publishes_both_halves_and_logs_no_key_material(self):
@@ -2261,7 +2283,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: sent.append(v) or {}), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits():
-            wz.cmd_lease_ensure(["--lab", "te-dev-aws"])
+            call(wz.cmd_lease_ensure, ["--lab", "te-dev-aws"])
         for s in sent:
             self.assertNotIn("PRIVATE KEY", base64.b64decode(s["s"]).decode())
 
@@ -2370,7 +2392,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False), \
              mock.patch.object(_owner("_backend_state"), "_backend_state", return_value=state), \
              mock.patch.object(wz.subprocess, "run", return_value=proc) as run:
-            msg = wz._self_join(["--lab", "te-dev-aws"], key)
+            msg = wz._self_join(wz.parse(("lease", "ensure"), ["--lab", "te-dev-aws"]), key)
             argv = run.call_args[0][0] if run.call_args else []
             leftover = sorted(p.name for p in (pathlib.Path(d) / "te-dev-aws").glob("*"))
         return msg, argv, leftover
@@ -2411,12 +2433,12 @@ class LeaseDevAccess(unittest.TestCase):
     def test_minted_keypair_is_a_real_ed25519_pair_the_private_half_locked_down(self):
         with tempfile.TemporaryDirectory() as d, \
              mock.patch.dict(wz.os.environ, {"WIZLAB_LEASE_DIR": d}, clear=False):
-            priv, pub = wz._mint_keypair(["--lab", "te-dev-aws"])
+            priv, pub = wz._mint_keypair(wz.parse(("lease", "ensure"), ["--lab", "te-dev-aws"]))
             self.assertTrue(pub.startswith("ssh-ed25519 "))
             self.assertEqual(priv.stat().st_mode & 0o777, 0o600)
             first = pub
             # Fresh per play: a second ensure must not reuse the key the last play's grader trusted.
-            self.assertNotEqual(wz._mint_keypair(["--lab", "te-dev-aws"])[1], first)
+            self.assertNotEqual(wz._mint_keypair(wz.parse(("lease", "ensure"), ["--lab", "te-dev-aws"]))[1], first)
 
     def test_verify_spends_the_tailscale_token_not_just_reads_the_env(self):
         # A revoked-but-present token passes every local check and then fails at mint, burning a play.
@@ -2426,7 +2448,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.object(_owner("_iq"), "_iq", lambda q, v, **k: calls.append(("iq", None)) or {}), \
              mock.patch.object(_owner("_self_on_tailnet"), "_self_on_tailnet", lambda: None), \
              contextlib.redirect_stdout(io.StringIO()), exits() as cm:
-            wz.cmd_lease_verify([])
+            call(wz.cmd_lease_verify, [])
         self.assertEqual(cm.code, 0)
         self.assertIn("ts", [c[0] for c in calls])   # the Tailscale API was actually reached
         self.assertIn("iq", [c[0] for c in calls])
@@ -2438,7 +2460,7 @@ class LeaseDevAccess(unittest.TestCase):
              mock.patch.object(_owner("_ts"), "_ts", dead_ts), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
              exits() as cm:
-            wz.cmd_lease_verify([])
+            call(wz.cmd_lease_verify, [])
         self.assertEqual(cm.code, 3)
 
     def test_an_api_access_token_is_never_a_sweepable_lease_key(self):
@@ -2472,7 +2494,7 @@ class RunnerFloor(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as out, \
              contextlib.redirect_stderr(io.StringIO()) as err, \
              exits() as cm:
-            wz.cmd_session_verify(args)
+            call(wz.cmd_session_verify, args)
         return cm.code, out.getvalue(), err.getvalue()
 
     def test_version_compares_as_ints_not_lexicographically(self):
@@ -2496,7 +2518,7 @@ class RunnerFloor(unittest.TestCase):
         with mock.patch.dict(wz.os.environ, {"TE_RUNNER_TAG": "v0.1.29"}, clear=False), \
              mock.patch.object(_owner("token_and_dc"), "token_and_dc") as tok, \
              contextlib.redirect_stderr(io.StringIO()), exits() as cm:
-            wz.cmd_session_verify(["--min-runner", "v0.1.33"])
+            call(wz.cmd_session_verify, ["--min-runner", "v0.1.33"])
         self.assertEqual(cm.code, 2)
         tok.assert_not_called()
 

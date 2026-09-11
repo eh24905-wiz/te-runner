@@ -73,7 +73,7 @@ _CSP_REQUIRED_VARS = {
 }
 
 
-def _verify_csp(cloud, args=()):
+def _verify_csp(cloud, account_id=None):
     missing = [v for v in _CSP_REQUIRED_VARS[cloud] if not os.getenv(v)]
     if missing:
         core.die(3, f"CSP credentials missing from environment: {', '.join(missing)}")
@@ -82,9 +82,8 @@ def _verify_csp(cloud, args=()):
         account = str(ident.get("Account") or "")
         if not account:
             core.die(3, "aws sts get-caller-identity named no Account")
-        want = core._flag(args, "--account-id")
-        if want and account != want:
-            core.die(3, f"AWS credentials are for account {account}, not the {want} this lease grades")
+        if account_id and account != account_id:
+            core.die(3, f"AWS credentials are for account {account}, not the {account_id} this lease grades")
     elif cloud == "gcp":
         accounts = core._csp_json(core._gcp("auth", "list", "--format=json"), "gcloud auth list") or []
         if not [a for a in accounts if a.get("status") == "ACTIVE"]:
@@ -98,18 +97,15 @@ def _verify_csp(cloud, args=()):
 
 def cmd_session_verify(args):
     # The floor first: it needs no credential, and a mispinned image is the cheaper fault to name.
-    floor = core._flag(args, "--min-runner")
+    floor = args.min_runner
     if floor:
         _require_runner(floor)
     _tok, dc, tid = core.token_and_dc()
     # `viewer` is not a Wiz root field (returns "Resource not found"); `connectors` is. This confirms
     # the token is accepted by the API, not just minted by auth.
     core.api("query { connectors(first: 1) { totalCount } }", {})
-    cloud = core._flag(args, "--cloud")
-    if cloud:
-        if cloud not in _CSP_REQUIRED_VARS:
-            core.die(2, f"session verify --cloud: unknown value {cloud!r}; choose aws, gcp, azure")
-        _verify_csp(cloud, args)
+    if args.cloud:
+        _verify_csp(args.cloud, args.account_id)
     # Name the runner on every check-1 line: it is the only record of what a play actually ran, since
     # the tag in a repo is what main held at import, not what this container is.
     tag, rev = _runner_id()

@@ -90,10 +90,8 @@ def cmd_workflow_inspect(args):
     `versions` read null/0 on every workflow of a live tenant, so a version-based assertion fails
     everyone. `steps` distinguishes a bare trigger from a built flow if a lab needs it."""
     name = _workflow_stem(args)
-    require = core._flag(args, "--require") or "exists"
-    if require not in ("exists", "published"):
-        core.die(2, f"--require must be exists|published, got {require}")
-    node = _resolve_workflow(name, exact="--exact-name" in args)
+    require = args.require
+    node = _resolve_workflow(name, exact=args.exact_name)
     if not node:
         print(f"no workflow named {name}*")
         sys.exit(1)
@@ -107,9 +105,9 @@ def cmd_workflow_inspect(args):
 def _workflow_definition(args):
     """The definition, with the fields wizlab owns injected over the file: `name` on the session stem so
     the reap sweep finds it, and `enabled` true because that IS published here."""
-    definition = core._read_json_flag(args, "--definition")
+    definition = core._read_json(args.definition, "--definition")
     definition["name"] = _workflow_stem(args)
-    project = core._flag(args, "--project-id")
+    project = args.project_id
     if project:
         definition["projectId"] = project
     definition.setdefault("enabled", True)
@@ -142,12 +140,12 @@ def cmd_workflow_ensure(args):
     issues = _validate_definition(definition)
     for i in issues:
         print(_issue_line(i))
-    if "--dry-run" in args:
+    if args.dry_run:
         print(f"{len(issues)} validation issue(s); nothing submitted")
         sys.exit(1 if issues else 0)
     if issues:
         core.die(2, f"definition has {len(issues)} validation issue(s); not submitted")
-    live = _resolve_workflows(name, exact="--exact-name" in args)
+    live = _resolve_workflows(name, exact=args.exact_name)
     for stale in live[1:]:
         core.api(DELETE_WORKFLOW, {"input": {"id": stale["id"]}})
         print(f"deleted duplicate workflow {stale['name']} ({stale['id']})")
@@ -169,7 +167,7 @@ def _run_filter(args, wf_ids):
     # TEST by default: a lab fires test runs, and an AUTOMATIC run from a real event would grade a
     # learner on someone else's Threat. --run-type widens it.
     return {"workflowId": {"equals": wf_ids},
-            "type": {"equals": [core._flag(args, "--run-type") or "TEST"]},
+            "type": {"equals": [args.run_type]},
             "status": {"equals": ["COMPLETED"]}}
 
 
@@ -184,7 +182,7 @@ def cmd_workflowrun_inspect(args):
     grades an arbitrary attempt."""
     require, branch = _run_require(args)
     stem = _workflow_stem(args)
-    nodes = _resolve_workflows(stem, exact="--exact-name" in args)
+    nodes = _resolve_workflows(stem, exact=args.exact_name)
     if not nodes:
         print(f"no workflow named {stem}*; cannot scope runs")
         sys.exit(1)
@@ -200,10 +198,8 @@ def cmd_workflowrun_inspect(args):
 
 
 def _run_require(args):
-    require = core._flag(args, "--require") or "completed"
-    if require not in ("completed", "branch", "error-path"):
-        core.die(2, f"--require must be completed|branch|error-path, got {require}")
-    branch = core._flag(args, "--branch") if require == "branch" else None
+    require = args.require
+    branch = args.branch if require == "branch" else None
     if require == "branch" and not branch:
         core.die(2, "--require branch needs --branch <branchName>")
     return require, branch
@@ -245,7 +241,7 @@ def _wait_for_run(run_id, timeout, interval):
 def _initial_step(args, node):
     """customData.initialSteps is non-optional and step ids are minted per create, so a lab names the
     step and it resolves here."""
-    step_name = core._flag(args, "--initial-step") or core.die(2, "needs --initial-step <step name>")
+    step_name = args.initial_step or core.die(2, "needs --initial-step <step name>")
     step = next((s for s in (node.get("steps") or []) if s.get("name") == step_name), None)
     if not step:
         core.die(2, f"workflow {node['name']} has no step named {step_name!r}; "
@@ -256,18 +252,17 @@ def _initial_step(args, node):
 def cmd_workflowrun_ensure(args):
     """Fire a test run of the session's workflow with the synthetic trigger payload in --data
     <file.json>, then wait for that run to reach COMPLETED."""
-    node = _resolve_workflow(_workflow_stem(args), exact="--exact-name" in args)
+    node = _resolve_workflow(_workflow_stem(args), exact=args.exact_name)
     if not node:
         core.die(3, f"no workflow named {_workflow_stem(args)}*; nothing to test-run")
     step_name, step = _initial_step(args, node)
-    payload = core._read_json_flag(args, "--data")
+    payload = core._read_json(args.data, "--data")
     data, _ = core.api(RUN_WORKFLOW_TEST, {"input": {
-        "workflowId": node["id"], "triggerType": core._flag(args, "--trigger-type") or "EVENT",
+        "workflowId": node["id"], "triggerType": args.trigger_type,
         "customData": {"initialSteps": [step["id"]], "data": payload}}})
     run = (data.get("runAutomationWorkflowTest") or {}).get("workflowRun") or {}
     if not run.get("id"):
         core.die(3, "runAutomationWorkflowTest returned no workflowRun")
     print(f"test run {run['id']} fired on {node['name']} entering at {step_name!r}")
-    _wait_for_run(run["id"], int(core._flag(args, "--timeout") or "60"),
-                  float(core._flag(args, "--interval") or "2"))
+    _wait_for_run(run["id"], args.timeout, args.interval)
     print(f"test run {run['id']} reached COMPLETED")

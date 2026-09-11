@@ -31,13 +31,11 @@ def cmd_codescan_inspect(args):
     """Assert a Wiz CLI scan for this session. --require published (>=1 scan tagged session=<stem>) or
     pass (latest scan verdict PASSED_BY_POLICY). Polls every --interval up to --timeout (default 180s)
     because publish latency is unmeasured; a definitive FAILED_BY_POLICY exits 1 without waiting."""
-    require = core._flag(args, "--require") or "published"
-    if require not in ("published", "pass"):
-        core.die(2, f"--require must be published|pass, got {require}")
-    tag_key = core._flag(args, "--tag-key") or "session"
-    tag_value = core._flag(args, "--tag-value") or core._lab_stem(core._session_id(args))
-    timeout = int(core._flag(args, "--timeout") or "180")
-    interval = int(core._flag(args, "--interval") or "10")
+    require = args.require
+    tag_key = args.tag_key
+    tag_value = args.tag_value or core._lab_stem(core._session_id(args))
+    timeout = args.timeout
+    interval = args.interval
     deadline = time.monotonic() + timeout
     while True:
         node = _cicd_latest(tag_key, tag_value)
@@ -90,7 +88,7 @@ ROOT_DOCKERFILE_CONTROL = "Last User Is 'root'"  # builtin, HIGH, matcher DOCKER
 
 
 def _policy_name(args):
-    return core._flag(args, "--name") or core.die(2, "policy needs --name <policy-name>")
+    return args.name or core.die(2, "policy needs --name <policy-name>")
 
 
 def _find_policy(name):
@@ -124,19 +122,18 @@ def cmd_policy_ensure(args):
     if existing:
         # Only a flag the caller named can differ: the defaults never argue with a live fixture.
         live = existing.get("params") or {}
-        count = core._flag(args, "--count-threshold")
-        rule_id = core._flag(args, "--rule-id")
+        rule_id = args.rule_id
         core._drift(f"cicd scan policy {name} ({existing['id']})", [
-            ("severityThreshold", live.get("severityThreshold"), core._flag(args, "--severity")),
-            ("countThreshold", live.get("countThreshold"), int(count) if count else None),
+            ("severityThreshold", live.get("severityThreshold"), args.severity),
+            ("countThreshold", live.get("countThreshold"), args.count_threshold),
             ("cloudConfigurationRules", sorted(r["id"] for r in live.get("cloudConfigurationRules") or []),
              [rule_id] if rule_id else None),
         ])
         print(f"cicd scan policy {name} exists ({existing['id']})")
         return
-    rule_id = core._flag(args, "--rule-id")
+    rule_id = args.rule_id
     if not rule_id:
-        ctl = _resolve_dockerfile_control(core._flag(args, "--control-search") or "Last User Is")
+        ctl = _resolve_dockerfile_control(args.control_search)
         if not ctl:
             core.die(3, f"no DOCKER_FILE control matching {ROOT_DOCKERFILE_CONTROL!r} in this tenant")
         rule_id = ctl["id"]
@@ -148,8 +145,8 @@ def cmd_policy_ensure(args):
         # countThreshold must be positive (0 is rejected live). 1 fails on the first HIGH hit from the
         # scoped control; scoping to the one control means no unrelated IaC finding trips it.
         "iacParams": {
-            "severityThreshold": core._flag(args, "--severity") or "HIGH",
-            "countThreshold": int(core._flag(args, "--count-threshold") or "1"),
+            "severityThreshold": args.severity or "HIGH",
+            "countThreshold": args.count_threshold or 1,
             "cloudConfigurationRules": [rule_id],
         },
     }
@@ -162,9 +159,6 @@ def cmd_policy_ensure(args):
 
 def cmd_policy_inspect(args):
     """Assert the CI/CD scan policy named --name exists (--require exists) — setup verification."""
-    require = core._flag(args, "--require") or "exists"
-    if require != "exists":
-        core.die(2, f"--require must be exists, got {require}")
     name = _policy_name(args)
     node = _find_policy(name)
     if not node:
