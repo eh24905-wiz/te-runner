@@ -36,11 +36,10 @@ verb cannot make that true it exits 3 naming the difference and mutates nothing.
 | noun | object exists | rule |
 |---|---|---|
 | sensor, serviceaccount | any | delete, re-mint, emit credentials: the secret is shown once and not re-fetchable |
-| connector (aws), workflow, user, lease | drifted | patch / reset / rotate to the requested state |
+| connector (aws), workflow, user | drifted | patch / reset / rotate to the requested state |
 | connector (gcp, azure) | any | left as found, exit 0: nothing in it can drift |
 | policy | flags differ from the live params | exit 3, no mutation: a shared tenant fixture other labs grade against changes deliberately |
 | outpost | `--role-arn`/`--region` differ | exit 3, no mutation: a role change is a knowing delete-and-recreate |
-| lease inspect `--require reachable` | node fresh, local key missing | exit 3: reachable promises usable ssh, not freshness |
 
 ### Runner identity, and the floor `session verify` enforces
 The image carries its own `TE_RUNNER_TAG` + `TE_RUNNER_REV`, baked from the git tag and sha CI built
@@ -65,9 +64,9 @@ health under `verify`, not a new noun — a floor is not an API fact and would f
 below as `runner inspect`.
 
 ## Nouns
-`session`, `connector`, `role`, `instance`, `user`, `wiz`, `audit`, `outpost`, for connectorless
-Runtime-Sensor labs `sensor` and `detection`, for Wiz Code labs `serviceaccount` and `code-scan`, for
-Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
+`session`, `connector`, `role`, `instance`, `user`, `wiz`, `outpost`, for connectorless
+Runtime-Sensor labs `sensor` and `detection`, for Wiz Code labs `serviceaccount` and `code-scan`, and for
+Workflows labs `workflow` and `workflow-run`:
 - `outpost ensure|delete|inspect` — a Wiz Outpost (Automated deploy in the customer account). `ensure`
   createsOutpost named on the session stem, given `--role-arn` (the orchestrator TF module output Wiz
   assumes); `inspect --require exists|initialized|connected` asserts the `OutpostStatus` enum and
@@ -159,35 +158,6 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
   No `delete` verb: `AutomationWorkflow` is already a `_SWEEP_TYPES` member, so the generic prefix sweep
   reaches it and a second path would be two places holding one fact. Never `TRIGGER_BLUE_AGENT` in a lab
   flow: manual Blue Agent runs are 5/day/tenant and a cohort exhausts them on learner two.
-- `lease verify|ensure|inspect|delete --lab N` — the operator's dev-access path to a grader over the
-  tailnet. Authoring-side: reads `TAILSCALE_API_KEY` + `INSTRUQT_API` from the operator, never from a
-  lab, so in a grader it is inert. `verify` SPENDS both tokens — a
-  present-but-revoked one passes every local check and fails at mint, and this is the only place that
-  costs nothing — plus this
-  host's own tailnet membership (`tailscale status` → `BackendState`, the only local answer) — the
-  precheck that stops an unreachable grader from grading as a broken lab. `ensure` provisions **both**
-  halves of dev access, fresh per play: one ephemeral, reusable, preauthorized tailnet key
-  (`expirySeconds` = the lab's `timelimit` + 3600) under `TS_AUTHKEY_<LAB>`, and an ed25519 keypair
-  whose public half goes under `TE_DEV_SSH_PUBKEY_<LAB>`, private half left in
-  `~/.cache/wizlab/lease/<lab>/`. Both values **base64** (a raw one errors `illegal base64 data`);
-  both names per-lab, because 2.0's `startLab` takes no `runtimeParameters` to bind a per-run name
-  (`te-labkit-v2/authoring/instruqt-2.0.md`). This lab's prior key is revoked first — that bounds live
-  keys to one per lab and kills a crashed run's orphan, the only orphan nameable without guessing
-  which play a key belongs to — and a failed upsert rolls the whole set back, since a live key with
-  no reference is worse than no key. It then joins **this host** on that same key (what `reusable` is
-  for) via `sudo -n tailscale up --auth-key=file:…` — a path, never argv, since `/proc/<pid>/cmdline`
-  is world-readable and `tailscale up` echoes the flag into its own errors. A host already `Running`
-  is left alone; a `sudo` that needs a password is a warning naming the command, not a failure, since
-  the lease itself is already real. Key auth is not optional and the tailnet is not the perimeter:
-  grader and learner containers share `resource.network.lab` and stock sshd binds `0.0.0.0`
-  (`PermitRootLogin prohibit-password`), so the pubkey is the only thing keeping a learner terminal
-  off the container holding every operator secret. `inspect --require reachable` resolves the
-  session's node by `lastSeen` freshness — the devices API exposes no `online` field and an ephemeral
-  node lingers ~30 min past its play — and emits `GRADER_IP` + `LEASE_SSH_KEY`; two fresh matches is
-  exit 3 naming both, never the freshest. `delete` revokes by
-  key id, THEN drops both secrets and the private key: a crash that order strands a dead string, the
-  reverse strands a live key. Between plays the team store holds no dev credential at all, so a lab
-  shipped with the dev block live references names that do not exist.
 - `policy ensure|inspect|delete --name N` — the BLOCK CI/CD IaC scan policy a code-scan gate needs.
   `ensure` is idempotent by name (§What `ensure` promises); absent, it creates a `type:IAC` policy with `enforcementMethod
   BLOCK` on `deploymentLifecycle CLI`, scoped (`iacParams.cloudConfigurationRules`) to the builtin
@@ -205,9 +175,9 @@ Workflows labs `workflow` and `workflow-run`, and authoring-side `lease`:
 ## What may be added
 A change qualifies only if ALL hold:
 1. **General** — reused across labs, not bespoke to one scenario.
-2. **API-level** — a Wiz or CSP read/assert/mutation (`api()` / `_aws`), or a Tailscale/Instruqt one
-   the lab runtime itself depends on (`lease`). Not a third cloud: the bar is an API no lab may hold
-   credentials for.
+2. **API-level** — a Wiz or CSP read/assert/mutation (`api()` / `_aws`) a lab runs. Not a third cloud,
+   and not an operator credential: what needs `TAILSCALE_API_KEY` or `INSTRUQT_API` lives in
+   `te-labkit-v2/wizops`.
 3. **Fits the grammar** — a noun + one of the verbs above, at that verb's meaning.
 
 ## What may NOT

@@ -2,15 +2,9 @@
 
 Every finding from the code-level and design-level reviews, one row each, ranked by payoff per unit
 of work. Effort: S = under a day, M = days, L = a week or cross-repo. Baseline: `ruff` clean, radon
-average A with 13 functions at C, 233 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
+average A with 13 functions at C, 202 tests in `test_wizlab.py` green (plus 5 reaper, 1 entrypoint).
 Symbols name the `wizlab` package unless a path is given. The last column is the blast radius: what the fix
 touches, what depends on it (tests, labs, other repos), and where the fixing agent looks next.
-
-## Tier 3 — cross-repo or operator-facing
-
-| # | Finding | Do | Effort | Blast radius → guidance |
-|---|---|---|---|---|
-| 22 | `lease` (~320 lines), `wiz queries`, `wiz type`, `audit user` run only on an operator machine, yet each fix is an image tag and a repin in 13 repos; `te-labkit-v2/scripts/dev-access.py` (108 lines) holds the other half of dev access | move them to labkit; image keeps only the entrypoint's `TS_AUTHKEY` path | M | Moves `_ts`, `_iq`, `_scrub`, `_keypair_dir`, `_owned_keys` and the `LeaseDevAccess` tests with them; `_post` and `_submissions` are shared, so the moved code imports or copies them. Labkit docs naming `wizlab lease`: `CLAUDE.md`, `authoring/pipeline.md`, track `research.md` files. The `SPEC.md` lease section moves too. |
 
 ## Tier 4 — measure before deciding
 
@@ -26,5 +20,4 @@ Every measurement carrying its reproducer. One pinned image per lab.
 
 ## Next actions
 
-1. #22 needs a labkit PR and a repin round; batch it with the next verb release.
-2. #30: read the `audit-only` count off the `reap.yml` summary lines once v0.1.48 has run for two weeks.
+1. #30: read the `audit-only` count off the `reap.yml` summary lines once v0.1.48 has run for two weeks.

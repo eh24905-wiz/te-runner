@@ -17,7 +17,6 @@ from . import (
     codescan,
     connector,
     core,
-    lease,
     outpost,
     reap,
     role,
@@ -30,6 +29,6 @@ from . import (
 )
 
 MODULES = (core, session, wiz, connector, sensor, serviceaccount, codescan, workflow, outpost, role, user,
-           reap, lease, cli)
+           reap, cli)
 for _m in MODULES:
     globals().update({k: v for k, v in vars(_m).items() if not k.startswith("__")})

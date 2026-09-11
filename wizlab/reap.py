@@ -4,7 +4,7 @@ import re
 import sys
 from collections import Counter
 
-from . import core, outpost, serviceaccount, wiz
+from . import core, outpost, serviceaccount
 
 # reap: delete a lab user's Wiz footprint from the audit log. Delete is uniform delete<Type>(input:{id})
 # across ~34 of 36 create types; correlation (find by name) is per-type — the generic handler
@@ -115,10 +115,22 @@ def _input_name(d):
     return None
 
 
+def _audit_entries(send, minutes, mutations_only=True):
+    """Every audit entry in the window, newest page first, via `send` (api or _gql). Returns (entries,
+    alert). The filter is a literal: `minutes` is an int and MUTATION an enum, neither user text."""
+    scope = "actionType: MUTATION, " if mutations_only else ""
+    qy = ("query Audit($after: String) { auditLogEntries(first: 100, after: $after, filterBy: { " + scope
+          + f"timestamp: {{ inLast: {{ amount: {int(minutes)}, unit: DurationFilterValueUnitMinutes }} }} }}) "
+          "{ nodes { action actionType status timestamp performer { id name } actionParameters } "
+          "pageInfo { hasNextPage endCursor } } }")
+    entries, alert = core._paged(send, qy, {}, "auditLogEntries")
+    return entries, (f"audit enumeration {alert}" if alert else None)
+
+
 def _reap_enumerate(tok, dc, email, minutes):
     """(SUCCESS Create* actions by `email` as (action, input name), alert). A partial list with an alert
     is what the caller turns into FAILED."""
-    entries, alert = wiz._audit_entries(lambda q, v: core._gql(tok, dc, q, v), minutes)
+    entries, alert = _audit_entries(lambda q, v: core._gql(tok, dc, q, v), minutes)
     out = [(n["action"], _input_name((n.get("actionParameters") or {}).get("input") or {}))
            for n in entries
            if (n.get("performer") or {}).get("name") == email and n.get("status") == "SUCCESS"

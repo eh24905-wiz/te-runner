@@ -6,7 +6,6 @@ from . import (
     codescan,
     connector,
     core,
-    lease,
     outpost,
     reap,
     role,
@@ -49,14 +48,7 @@ VERBS = {
     ("user", "delete"): user.cmd_user_delete,
     ("user", "login-url"): user.cmd_user_login_url,
     ("wiz", "tenant"): wiz.cmd_wiz_tenant,
-    ("wiz", "queries"): wiz.cmd_wiz_queries,
-    ("wiz", "type"): wiz.cmd_wiz_type,
-    ("audit", "user"): wiz.cmd_audit_user,
     ("user", "reap"): reap.cmd_reap,
-    ("lease", "verify"): lease.cmd_lease_verify,
-    ("lease", "ensure"): lease.cmd_lease_ensure,
-    ("lease", "inspect"): lease.cmd_lease_inspect,
-    ("lease", "delete"): lease.cmd_lease_delete,
 }
 
 
@@ -129,14 +121,7 @@ FLAGS = {
     ("user", "delete"): _U,
     ("user", "login-url"): {},
     ("wiz", "tenant"): {},
-    ("wiz", "queries"): {"--match": {"default": "audit,activity,event,log,entit,delete"}},
-    ("wiz", "type"): {"--name": {}},
-    ("audit", "user"): {**_U, "--all": _SWITCH, "--email": {}, "--last-min": _int(120), "--match": {}},
     ("user", "reap"): {**_U, "--commit": _SWITCH, "--email": {}, "--last-min": _int(1440)},
-    ("lease", "verify"): {"--no-self": _SWITCH},
-    ("lease", "ensure"): {"--lab": {}, "--timelimit-seconds": _int(0)},
-    ("lease", "inspect"): {**_S, "--hostname": {}, "--lab": {}, "--require": _one_of("reachable")},
-    ("lease", "delete"): {"--key-id": {}, "--lab": {}},
 }
 
 
